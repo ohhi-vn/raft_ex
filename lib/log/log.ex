@@ -7,8 +7,6 @@ defmodule RaftEx.Log do
   defstruct [
     :cfg,
     :range,
-    last_term: 0,
-    last_written_index_term: {0, 0},
     :snapshot_state,
     :current_snapshot,
     :last_resend_time,
@@ -17,7 +15,9 @@ defmodule RaftEx.Log do
     :mem_table,
     tx: false,
     pending: [],
-    live_indexes: []
+    live_indexes: [],
+    last_term: 0,
+    last_written_index_term: {0, 0}
   ]
 
   def init(%{uid: uid, system_config: %{data_dir: data_dir, names: names}} = conf) do
@@ -140,11 +140,14 @@ defmodule RaftEx.Log do
 
   def read_config(dir) do
     path = Path.join(dir, "config")
+
     case File.read(path) do
       {:ok, contents} ->
         {term, _} = Code.eval_string(contents)
         {:ok, term}
-      err -> err
+
+      err ->
+        err
     end
   end
 

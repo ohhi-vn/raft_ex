@@ -13,21 +13,21 @@ defmodule RaftEx.Machine do
   described by `t:effect/0`.
   """
 
-  @type state        :: term()
+  @type state :: term()
   @type user_command :: term()
   @type milliseconds :: non_neg_integer()
-  @type version      :: non_neg_integer()
-  @type machine      :: {:machine, module(), map()}
-  @type effects      :: [effect()]
-  @type reply        :: term()
+  @type version :: non_neg_integer()
+  @type machine :: {:machine, module(), map()}
+  @type effects :: [effect()]
+  @type reply :: term()
 
   @type command_meta :: %{
-          system_time: integer(),
-          index: non_neg_integer(),
-          term: non_neg_integer(),
           optional(:machine_version) => version(),
           optional(:from) => term(),
-          optional(:reply_mode) => term()
+          optional(:reply_mode) => term(),
+          system_time: integer(),
+          index: non_neg_integer(),
+          term: non_neg_integer()
         }
 
   @type effect ::
@@ -122,7 +122,7 @@ defmodule RaftEx.Machine do
   def apply(mod, metadata, cmd, state) do
     case mod.apply(metadata, cmd, state) do
       {s, r, e} -> {s, r, e}
-      {s, r}    -> {s, r, []}
+      {s, r} -> {s, r, []}
     end
   end
 
@@ -157,7 +157,7 @@ defmodule RaftEx.Machine do
 
     case result do
       {:ra_seq, seq} -> seq
-      list           -> RaftEx.Seq.from_list(list)
+      list -> RaftEx.Seq.from_list(list)
     end
   end
 
@@ -205,7 +205,7 @@ defmodule RaftEx.Machine do
     |> Enum.filter(fn {name, _arity} -> name == :handle_aux end)
     |> Enum.sort()
     |> case do
-      []          -> nil
+      [] -> nil
       [{_, _} = h | _] -> h
     end
   end

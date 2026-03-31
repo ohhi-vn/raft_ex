@@ -6,13 +6,13 @@ defmodule RaftEx.Types do
   so they can be pattern-matched cleanly across the codebase.
   """
 
-  @type index        :: non_neg_integer()
-  @type term_num     :: non_neg_integer()
-  @type idxterm      :: {index(), term_num()}
-  @type server_id    :: {name :: atom(), node :: node()}
+  @type index :: non_neg_integer()
+  @type term_num :: non_neg_integer()
+  @type idxterm :: {index(), term_num()}
+  @type server_id :: {name :: atom(), node :: node()}
   @type cluster_name :: binary() | atom()
-  @type uid          :: binary()
-  @type membership   :: :voter | :promotable | :non_voter | :unknown
+  @type uid :: binary()
+  @type membership :: :voter | :promotable | :non_voter | :unknown
 
   @type ra_state ::
           :leader
@@ -42,16 +42,16 @@ defmodule RaftEx.Types do
         }
 
   @type peer_state :: %{
+          optional(:voter_status) => voter_status(),
+          optional(:machine_version) => non_neg_integer(),
           next_index: non_neg_integer(),
           match_index: non_neg_integer(),
           query_index: non_neg_integer(),
           commit_index_sent: non_neg_integer(),
-          status: peer_status(),
-          optional(:voter_status) => voter_status(),
-          optional(:machine_version) => non_neg_integer()
+          status: peer_status()
         }
 
-  @type cluster   :: %{server_id() => peer_state()}
+  @type cluster :: %{server_id() => peer_state()}
   @type log_entry :: {index(), term_num(), term()}
 
   # ---------------------------------------------------------------------------
@@ -80,8 +80,15 @@ defmodule RaftEx.Types do
 
   defmodule PreVoteRpc do
     @moduledoc "Pre-vote probe to check whether an election would succeed."
-    defstruct [version: 1, :machine_version, :term, :token,
-               :candidate_id, :last_log_index, :last_log_term]
+    defstruct [
+      :machine_version,
+      :term,
+      :token,
+      :candidate_id,
+      :last_log_index,
+      :last_log_term,
+      version: 1
+    ]
   end
 
   defmodule PreVoteResult do

@@ -8,33 +8,35 @@ defmodule RaftEx.Server.Config do
   `effective_handle_aux_fun`, which are updated when the machine is upgraded.
   """
 
-  @enforce_keys [:id, :uid, :log_id, :metrics_key, :machine, :machine_version,
-                 :effective_machine_version, :effective_machine_module, :system_config]
-
-  defstruct [
-    # Identity
+  @enforce_keys [
     :id,
     :uid,
     :log_id,
     :metrics_key,
-    metrics_labels: %{},
-
-    # Machine
     :machine,
     :machine_version,
-    machine_versions: [],
+    :effective_machine_version,
+    :effective_machine_module,
+    :system_config
+  ]
+
+  defstruct [
+    :id,
+    :uid,
+    :log_id,
+    :metrics_key,
+    :machine,
+    :machine_version,
     :effective_machine_version,
     :effective_machine_module,
     :effective_handle_aux_fun,
-
-    # Tuning
+    :counter,
+    :system_config,
+    metrics_labels: %{},
+    machine_versions: [],
     max_pipeline_count: 4096,
     max_append_entries_rpc_batch_size: 128,
-    min_recovery_checkpoint_interval: 0,
-
-    # Infrastructure
-    :counter,
-    :system_config
+    min_recovery_checkpoint_interval: 0
   ]
 
   @type t :: %__MODULE__{
