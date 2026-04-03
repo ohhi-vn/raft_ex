@@ -3,7 +3,7 @@ defmodule RaftEx.File do
 
   @retry_delay 20
 
-  def sync(fd) when is_port(fd) or is_reference(fd) do
+  def sync(fd) do
     retry_on_error(fn -> :file.sync(fd) end)
   end
 
