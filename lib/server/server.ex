@@ -213,10 +213,10 @@ defmodule RaftEx.Server do
 
   @doc false
   @spec handle_follower(term(), map()) :: {atom(), map(), list()}
-  def handle_follower(%Types.AppendEntriesRpc{} = rpc, %{cfg: %Config{id: id}} = state0) do
-    reply = build_append_entries_reply(rpc.term, true, state0)
-    effects = [{:cast, rpc.leader_id, {id, reply}}]
-    {:follower, state0, effects}
+  def handle_follower(%Types.AppendEntriesRpc{} = rpc, state0) do
+    # Delegate to RpcHandler for proper term checking, log consistency,
+    # entry appending, and commit index advancement
+    RaftEx.Server.RpcHandler.handle_append_entries_rpc(rpc, state0)
   end
 
   def handle_follower(:election_timeout, state) do
@@ -1186,5 +1186,4 @@ defmodule RaftEx.Server do
   end
 
   defp incr_counter(_, _, _), do: :ok
-
 end

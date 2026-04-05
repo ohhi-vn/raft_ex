@@ -236,18 +236,20 @@ defmodule RaftEx.Log do
         {:ok, state}
 
       _ ->
-        new_state =
-          Enum.reduce(entries, state, fn entry, acc ->
-            append(entry, acc)
-          end)
-
-        # Flush to WAL
-        case LogWal.append(new_state.wal_name, entries) do
+        # Write to WAL first (true write-ahead semantics)
+        case LogWal.append(state.wal_name, entries) do
           {:ok, _, _} ->
+            # WAL write succeeded, now update in-memory state
+            new_state =
+              Enum.reduce(entries, state, fn entry, acc ->
+                append(entry, acc)
+              end)
+
             {:ok, new_state}
 
           {:error, reason} ->
             Logger.error("RaftEx.Log: WAL write failed: #{inspect(reason)}")
+            # Return error without modifying in-memory state
             {:error, reason}
         end
     end

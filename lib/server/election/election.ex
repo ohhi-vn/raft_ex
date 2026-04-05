@@ -204,10 +204,8 @@ defmodule RaftEx.Server.Election do
         candidate_term < current_term ->
           {false, state}
 
-        # Candidate's term is greater - update our term and potentially grant vote
+        # Candidate's term is greater - check log first, then update term if granting vote
         candidate_term > current_term ->
-          state = update_term_and_voted_for(candidate_term, candidate_id, state)
-
           log_ok =
             log_is_up_to_date?(
               candidate_last_index,
@@ -217,8 +215,11 @@ defmodule RaftEx.Server.Election do
             )
 
           if log_ok do
-            {true, state}
+            # Only update term and voted_for if we're actually granting the vote
+            new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
+            {true, new_state}
           else
+            # Deny vote without updating term - prevents election livelock
             {false, state}
           end
 
@@ -232,7 +233,7 @@ defmodule RaftEx.Server.Election do
             voted_for != nil and voted_for != candidate_id ->
               {false, state}
 
-            # Haven't voted or already voted for this candidate - check log
+            # Haven't voted or already voted for this candidate - check log first
             true ->
               log_ok =
                 log_is_up_to_date?(
@@ -243,8 +244,8 @@ defmodule RaftEx.Server.Election do
                 )
 
               if log_ok do
-                state = update_term_and_voted_for(candidate_term, candidate_id, state)
-                {true, state}
+                new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
+                {true, new_state}
               else
                 {false, state}
               end
@@ -279,17 +280,23 @@ defmodule RaftEx.Server.Election do
 
   Returns `{election_result, updated_context, effects}`.
   """
-  @spec handle_vote_reply(Types.RequestVoteResult.t(), election_context(), map()) ::
+  @spec handle_vote_reply(
+          Types.RequestVoteResult.t(),
+          election_context(),
+          map(),
+          RaftEx.Types.server_id()
+        ) ::
           {election_result(), election_context(), [term()]}
   def handle_vote_reply(
         %Types.RequestVoteResult{term: term, vote_granted: true},
         %{state: :candidate, term: election_term, votes_received: votes, total_voters: total} =
           context,
-        state
+        state,
+        peer_id
       )
       when term == election_term do
-    # Add vote
-    new_votes = MapSet.put(votes, state.cfg.id)
+    # Add vote from the peer who replied
+    new_votes = MapSet.put(votes, peer_id)
     new_context = %{context | votes_received: new_votes}
 
     # Check if we won
@@ -307,7 +314,8 @@ defmodule RaftEx.Server.Election do
   def handle_vote_reply(
         %Types.RequestVoteResult{term: term, vote_granted: false},
         %{state: :candidate, term: election_term} = context,
-        _state
+        _state,
+        _peer_id
       )
       when term > election_term do
     # Peer has higher term - step down
@@ -319,7 +327,8 @@ defmodule RaftEx.Server.Election do
   def handle_vote_reply(
         %Types.RequestVoteResult{vote_granted: false},
         context,
-        _state
+        _state,
+        _peer_id
       ) do
     # Vote denied but term is OK - continue waiting
     {:ongoing, context, []}
@@ -330,17 +339,23 @@ defmodule RaftEx.Server.Election do
 
   Returns `{should_start_election, updated_context, effects}`.
   """
-  @spec handle_pre_vote_reply(Types.PreVoteResult.t(), election_context(), map()) ::
+  @spec handle_pre_vote_reply(
+          Types.PreVoteResult.t(),
+          election_context(),
+          map(),
+          RaftEx.Types.server_id()
+        ) ::
           {boolean(), election_context(), [term()]}
   def handle_pre_vote_reply(
         %Types.PreVoteResult{term: term, vote_granted: true},
         %{state: :pre_vote, term: election_term, votes_received: votes, total_voters: total} =
           context,
-        state
+        state,
+        peer_id
       )
       when term == election_term do
-    # Add vote
-    new_votes = MapSet.put(votes, state.cfg.id)
+    # Add vote from the peer who replied
+    new_votes = MapSet.put(votes, peer_id)
     new_context = %{context | votes_received: new_votes}
 
     # Check if we have enough pre-votes to start real election
@@ -358,7 +373,8 @@ defmodule RaftEx.Server.Election do
   def handle_pre_vote_reply(
         %Types.PreVoteResult{term: term},
         %{state: :pre_vote, term: election_term} = context,
-        _state
+        _state,
+        _peer_id
       )
       when term > election_term do
     # Peer has higher term - update and step down
@@ -369,7 +385,7 @@ defmodule RaftEx.Server.Election do
     {false, context, [{:become, :follower}, {:update_term, term}]}
   end
 
-  def handle_pre_vote_reply(%Types.PreVoteResult{vote_granted: false}, context, _state) do
+  def handle_pre_vote_reply(%Types.PreVoteResult{vote_granted: false}, context, _state, _peer_id) do
     # Pre-vote denied
     {false, context, []}
   end

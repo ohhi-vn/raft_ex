@@ -27,7 +27,7 @@ defmodule RaftEx.LogMeta do
 
   # Field positions in the {uid, current_term, voted_for, last_applied} tuple.
   @pos_current_term 2
-  @pos_voted_for    3
+  @pos_voted_for 3
   @pos_last_applied 4
 
   # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ defmodule RaftEx.LogMeta do
   @doc "Fetch a single metadata field, returning `nil` if absent."
   @spec fetch(atom(), binary(), :current_term | :voted_for | :last_applied) :: term() | nil
   def fetch(meta_name, uid, :current_term), do: ets_lookup(meta_name, uid, @pos_current_term)
-  def fetch(meta_name, uid, :voted_for),    do: ets_lookup(meta_name, uid, @pos_voted_for)
+  def fetch(meta_name, uid, :voted_for), do: ets_lookup(meta_name, uid, @pos_voted_for)
   def fetch(meta_name, uid, :last_applied), do: ets_lookup(meta_name, uid, @pos_last_applied)
 
   @doc "Fetch a metadata field, returning `default` when absent."
@@ -74,7 +74,7 @@ defmodule RaftEx.LogMeta do
   def fetch(meta_name, uid, key, default) do
     case fetch(meta_name, uid, key) do
       nil -> default
-      v   -> v
+      v -> v
     end
   end
 
@@ -89,20 +89,21 @@ defmodule RaftEx.LogMeta do
     :ok = File.mkdir_p!(dir)
     meta_file = Path.join(dir, "meta.dets") |> String.to_charlist()
 
-    {:ok, ^tbl_name} = :dets.open_file(tbl_name,
-      file:      meta_file,
-      auto_save: 5_000
-    )
+    {:ok, ^tbl_name} =
+      :dets.open_file(tbl_name,
+        file: meta_file,
+        auto_save: 5_000
+      )
 
     :ets.new(tbl_name, [:named_table, :public, {:read_concurrency, true}])
     ^tbl_name = :dets.to_ets(tbl_name, tbl_name)
 
     Logger.info(
       "ra: meta data store initialised for #{system}. " <>
-      "#{:ets.info(tbl_name, :size)} record(s)"
+        "#{:ets.info(tbl_name, :size)} record(s)"
     )
 
-    {:ok, %{table: tbl_name}}
+    {:ok, %{table: tbl_name, ets_table: tbl_name}}
   end
 
   @impl GenServer
@@ -128,9 +129,11 @@ defmodule RaftEx.LogMeta do
   end
 
   @impl GenServer
-  def terminate(_reason, %{table: tbl}) do
+  def terminate(_reason, %{table: tbl, ets_table: ets_tbl}) do
     :dets.sync(tbl)
     :dets.close(tbl)
+    # Clean up ETS table to prevent resource leak
+    :ets.delete(ets_tbl)
   end
 
   # ---------------------------------------------------------------------------
@@ -140,7 +143,7 @@ defmodule RaftEx.LogMeta do
   defp write_meta(tbl, uid, key, value, sync) do
     current =
       case :ets.lookup(tbl, uid) do
-        []    -> {uid, nil, nil, nil}
+        [] -> {uid, nil, nil, nil}
         [row] -> row
       end
 
@@ -167,7 +170,7 @@ defmodule RaftEx.LogMeta do
     end
   end
 
-  defp set_field(:voted_for,    value, row), do: put_elem(row, @pos_voted_for - 1, value)
+  defp set_field(:voted_for, value, row), do: put_elem(row, @pos_voted_for - 1, value)
   defp set_field(:last_applied, value, row), do: put_elem(row, @pos_last_applied - 1, value)
 
   defp ets_lookup(meta_name, uid, pos) do

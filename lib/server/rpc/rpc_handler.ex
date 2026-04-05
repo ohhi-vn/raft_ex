@@ -547,9 +547,25 @@ defmodule RaftEx.Server.RpcHandler do
   end
 
   defp truncate_log_from(log, from_index) do
-    # In a full implementation, this would truncate the log from from_index onwards
-    # For now, we return the log as-is
-    log
+    # Remove entries from the log starting at from_index
+    # This is critical for Raft log consistency when leader sends conflicting entries
+    %{entries: entries, range: {start, _end}} = log
+
+    # Filter out entries with index >= from_index
+    new_entries =
+      entries
+      |> Enum.filter(fn {idx, _} -> idx < from_index end)
+      |> Map.new()
+
+    # Update range - new end is from_index - 1 (or start - 1 if all truncated)
+    new_end =
+      if map_size(new_entries) == 0 do
+        start - 1
+      else
+        new_entries |> Map.keys() |> Enum.max()
+      end
+
+    %{log | entries: new_entries, range: {start, new_end}}
   end
 
   defp update_commit_index(leader_commit, %{log: log, commit_index: commit_index} = state) do

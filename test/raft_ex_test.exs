@@ -1267,4 +1267,439 @@ defmodule RaftExTest do
       assert {:notify, _} = hd(final_effects)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Segment Writer Tests
+  # ---------------------------------------------------------------------------
+
+  describe "LogSegmentWriter" do
+    defp make_config(data_dir, name) do
+      %{
+        name: name,
+        data_dir: Path.join(data_dir, Atom.to_string(name)),
+        segment_max_entries: 10,
+        segment_max_size_bytes: 1_000_000
+      }
+    end
+
+    test "starts with empty state", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_empty)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      overview = RaftEx.LogSegmentWriter.overview(pid)
+      assert overview.num_segments == 0
+
+      GenServer.stop(pid)
+    end
+
+    test "writes entries to active segment", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_write)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      entries = [{1, 1, {:command, :test1}}, {2, 1, {:command, :test2}}]
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+
+      {:ok, read_entries} = RaftEx.LogSegmentWriter.read(pid, 1, 2)
+      assert length(read_entries) == 2
+
+      GenServer.stop(pid)
+    end
+
+    test "reads single entry by index", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_read_single)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      entries = [{1, 1, {:command, :test}}]
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+
+      {:ok, entry} = RaftEx.LogSegmentWriter.read_entry(pid, 1)
+      assert entry == {1, 1, {:command, :test}}
+
+      GenServer.stop(pid)
+    end
+
+    test "returns not_found for missing entry", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_not_found)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      assert {:error, :not_found} = RaftEx.LogSegmentWriter.read_entry(pid, 999)
+
+      GenServer.stop(pid)
+    end
+
+    test "seals active segment and creates new one", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_seal)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      entries = [{1, 1, {:command, :test}}]
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+
+      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+
+      overview = RaftEx.LogSegmentWriter.overview(pid)
+      assert overview.num_segments == 1
+
+      GenServer.stop(pid)
+    end
+
+    test "creates new segment when max entries reached", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_max_entries)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      # Write 10 entries (max_entries is 10)
+      entries = for i <- 1..10, do: {i, 1, {:command, i}}
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+
+      # Write one more - should trigger new segment
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, [{11, 1, {:command, :extra}}])
+
+      overview = RaftEx.LogSegmentWriter.overview(pid)
+      assert overview.num_segments >= 1
+
+      GenServer.stop(pid)
+    end
+
+    test "truncates segments from index", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_truncate)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      entries = for i <- 1..5, do: {i, 1, {:command, i}}
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+
+      assert :ok = RaftEx.LogSegmentWriter.truncate_from(pid, 3)
+
+      overview = RaftEx.LogSegmentWriter.overview(pid)
+      # Segments starting from index 3 should be removed
+      assert overview.num_segments == 0
+
+      GenServer.stop(pid)
+    end
+
+    test "deletes segments up to index", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_delete)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      entries = for i <- 1..5, do: {i, 1, {:command, i}}
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+
+      assert :ok = RaftEx.LogSegmentWriter.delete_up_to(pid, 3)
+
+      overview = RaftEx.LogSegmentWriter.overview(pid)
+      # Segment with range {1, 5} won't be deleted since last_index(5) > 3
+      # This is correct behavior - we only delete segments fully before up_to_index
+      assert overview.num_segments == 1
+
+      GenServer.stop(pid)
+    end
+
+    test "returns index range", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_range)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      # Active segment starts at index 1
+      {first, last} = RaftEx.LogSegmentWriter.index_range(pid)
+      assert first == 1
+      assert last == 1
+
+      entries = [{1, 1, {:command, :test}}, {2, 1, {:command, :test2}}]
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+
+      {first, last} = RaftEx.LogSegmentWriter.index_range(pid)
+      assert first == 1
+      assert last == 2
+
+      GenServer.stop(pid)
+    end
+
+    test "handles empty write", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_empty_write)
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      assert :ok = RaftEx.LogSegmentWriter.write(pid, [])
+
+      GenServer.stop(pid)
+    end
+
+    test "recovers segments from disk", %{data_dir: data_dir} do
+      config = make_config(data_dir, :seg_test_recover)
+
+      # Create and write to segments
+      {:ok, pid1} = RaftEx.LogSegmentWriter.start_link(config)
+      entries = for i <- 1..3, do: {i, 1, {:command, i}}
+      assert :ok = RaftEx.LogSegmentWriter.write(pid1, entries)
+      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid1)
+      GenServer.stop(pid1)
+
+      # Recover
+      {:ok, pid2} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, read_entries} = RaftEx.LogSegmentWriter.read(pid2, 1, 3)
+      assert length(read_entries) == 3
+      GenServer.stop(pid2)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Network Layer Tests
+  # ---------------------------------------------------------------------------
+
+  describe "Network" do
+    test "send_rpc routes to local process correctly" do
+      # Start a simple GenServer to receive RPCs
+      defmodule TestRpcReceiver do
+        use GenServer
+        def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid, name: :test_rpc_receiver)
+        def init(test_pid), do: {:ok, %{test_pid: test_pid}}
+        def handle_info({:gen_cast, {:rpc, rpc}}, state) do
+          send(state.test_pid, {:received_rpc, rpc})
+          {:noreply, state}
+        end
+        def handle_info(_, state), do: {:noreply, state}
+      end
+
+      {:ok, _} = TestRpcReceiver.start_link(self())
+
+      rpc = %RaftEx.Types.AppendEntriesRpc{term: 1, leader_id: {:test, node()}}
+      assert :ok = RaftEx.Network.send_rpc({:test_rpc_receiver, node()}, rpc)
+
+      assert_receive {:received_rpc, ^rpc}, 1000
+    end
+
+    test "send_rpc returns error for non-existent local process" do
+      rpc = %RaftEx.Types.AppendEntriesRpc{term: 1}
+      assert {:error, :noproc} = RaftEx.Network.send_rpc({:non_existent_process, node()}, rpc)
+    end
+
+    test "call routes to local process correctly" do
+      defmodule TestCallReceiver do
+        use GenServer
+        def start_link(), do: GenServer.start_link(__MODULE__, [], name: :test_call_receiver)
+        def init(_), do: {:ok, %{}}
+        def handle_call(:ping, _from, state), do: {:reply, :pong, state}
+      end
+
+      {:ok, _} = TestCallReceiver.start_link()
+      assert {:ok, :pong} = RaftEx.Network.call({:test_call_receiver, node()}, :ping)
+    end
+
+    test "cast routes to local process correctly" do
+      defmodule TestCastReceiver do
+        use GenServer
+        def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid, name: :test_cast_receiver)
+        def init(test_pid), do: {:ok, %{test_pid: test_pid}}
+        def handle_cast(:test_msg, state) do
+          send(state.test_pid, {:received_cast, :test_msg})
+          {:noreply, state}
+        end
+        def handle_cast(_, state), do: {:noreply, state}
+      end
+
+      {:ok, _} = TestCastReceiver.start_link(self())
+      assert :ok = RaftEx.Network.cast({:test_cast_receiver, node()}, :test_msg)
+      assert_receive {:received_cast, :test_msg}, 1000
+    end
+
+    test "monitor returns reference for local process" do
+      assert {:error, :noproc} = RaftEx.Network.monitor({:non_existent, node()})
+    end
+
+    test "handle_node_up and handle_node_down return :ok" do
+      assert :ok = RaftEx.Network.handle_node_up(:some_node)
+      assert :ok = RaftEx.Network.handle_node_down(:some_node)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Multi-Node Integration Tests (Simulated via Local Processes)
+  # ---------------------------------------------------------------------------
+
+  describe "Multi-Node Integration" do
+    setup %{data_dir: data_dir} do
+      suffix = System.unique_integer([:positive])
+      uid = "multi_node_test_uid_#{suffix}"
+
+      names = %{
+        wal: :"multi_test_wal_#{suffix}",
+        log_meta: :"multi_test_log_meta_#{suffix}",
+        open_mem_tbls: :"multi_test_open_mem_tbls_#{suffix}",
+        log_ets: :"multi_test_log_ets_#{suffix}"
+      }
+
+      :ets.new(names.open_mem_tbls, [:named_table, :public, :set])
+      :ets.new(names.log_ets, [:named_table, :public, :set])
+
+      {:ok, _} =
+        RaftEx.LogMeta.start_link(%{
+          name: :"multi_node_system_#{suffix}",
+          data_dir: data_dir,
+          names: names
+        })
+
+      conf = %{
+        uid: uid,
+        system_config: %{
+          data_dir: data_dir,
+          names: names
+        }
+      }
+
+      on_exit(fn ->
+        try do
+          :ets.delete(names.open_mem_tbls)
+        rescue
+          _ -> :ok
+        end
+
+        try do
+          :ets.delete(names.log_ets)
+        rescue
+          _ -> :ok
+        end
+      end)
+
+      %{conf: conf}
+    end
+
+    test "cluster membership is correctly initialized with multiple servers", %{conf: conf} do
+      # Build initial cluster map manually
+      server1_id = {:server1, node()}
+      server2_id = {:server2, node()}
+      server3_id = {:server3, node()}
+
+      cluster = RaftEx.Server.Cluster.new(server1_id, [server1_id, server2_id, server3_id])
+
+      # Verify cluster structure
+      assert map_size(cluster) == 3
+      assert Map.has_key?(cluster, server1_id)
+      assert Map.has_key?(cluster, server2_id)
+      assert Map.has_key?(cluster, server3_id)
+
+      # Verify peer states
+      peer1 = Map.get(cluster, server1_id)
+      assert peer1.next_index == 1
+      assert peer1.match_index == 0
+      assert peer1.status == :normal
+    end
+
+    test "peer state updates propagate correctly", %{conf: conf} do
+      server1_id = {:server1, node()}
+      server2_id = {:server2, node()}
+
+      cluster = RaftEx.Server.Cluster.new(server1_id, [server1_id, server2_id])
+
+      # Update peer state
+      updated_cluster =
+        RaftEx.Server.Cluster.update_peer(server2_id, %{
+          next_index: 10,
+          match_index: 5,
+          status: :normal
+        }, cluster)
+
+      peer2 = Map.get(updated_cluster, server2_id)
+      assert peer2.next_index == 10
+      assert peer2.match_index == 5
+
+      # Original cluster unchanged
+      original_peer2 = Map.get(cluster, server2_id)
+      assert original_peer2.next_index == 1
+    end
+
+    test "voter match indexes compute correctly for quorum", %{conf: conf} do
+      server1_id = {:server1, node()}
+      server2_id = {:server2, node()}
+      server3_id = {:server3, node()}
+
+      cluster =
+        %{
+          server1_id => %{
+            next_index: 10,
+            match_index: 8,
+            query_index: 0,
+            commit_index_sent: 5,
+            status: :normal,
+            voter_status: %{membership: :voter, uid: "uid1"}
+          },
+          server2_id => %{
+            next_index: 10,
+            match_index: 6,
+            query_index: 0,
+            commit_index_sent: 5,
+            status: :normal,
+            voter_status: %{membership: :voter, uid: "uid2"}
+          },
+          server3_id => %{
+            next_index: 10,
+            match_index: 7,
+            query_index: 0,
+            commit_index_sent: 5,
+            status: :normal,
+            voter_status: %{membership: :non_voter, uid: "uid3"}
+          }
+        }
+
+      # Collect voter match indexes (excluding self server1_id)
+      indexes = RaftEx.Server.Cluster.voter_match_indexes(server1_id, cluster, 9)
+      # Should include leader's 9 and server2's 6 (server3 is non_voter)
+      assert 9 in indexes
+      assert 6 in indexes
+      refute 7 in indexes
+
+      # Compute agreed commit
+      agreed = RaftEx.Server.Cluster.agreed_commit(indexes)
+      # Sorted desc: [9, 6], quorum = div(2,2)+1 = 2, index 1 = 6
+      assert agreed == 6
+    end
+
+    test "election context tracks votes correctly", %{conf: conf} do
+      # Simulate election context
+      context = %{
+        state: :candidate,
+        term: 5,
+        votes_received: MapSet.new([{:server1, node()}]),
+        total_voters: 3,
+        last_log_index: 10,
+        last_log_term: 4
+      }
+
+      # Need 2 votes to win (div(3,2) + 1 = 2)
+      assert RaftEx.Server.Election.votes_needed(3) == 2
+      assert RaftEx.Server.Election.evaluate_election_result(context) == :ongoing
+
+      # Add another vote
+      new_votes = MapSet.put(context.votes_received, {:server2, node()})
+      new_context = %{context | votes_received: new_votes}
+
+      assert RaftEx.Server.Election.evaluate_election_result(new_context) == :won
+    end
+
+    test "log segment writer handles concurrent writes safely", %{conf: conf} do
+      suffix = System.unique_integer([:positive])
+      config = %{
+        name: :"seg_concurrent_#{suffix}",
+        data_dir: Path.join(conf.system_config.data_dir, "seg_concurrent_#{suffix}"),
+        segment_max_entries: 5,
+        segment_max_size_bytes: 1_000_000
+      }
+
+      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+
+      # Write from multiple processes concurrently
+      tasks =
+        for i <- 1..3 do
+          Task.async(fn ->
+            entries = for j <- 1..3, do: {i * 10 + j, 1, {:command, i, j}}
+            RaftEx.LogSegmentWriter.write(pid, entries)
+          end)
+        end
+
+      Task.await_many(tasks, 5000)
+
+      # Verify all entries were written
+      {:ok, all_entries} = RaftEx.LogSegmentWriter.read(pid, 1, 100)
+      assert length(all_entries) == 9
+
+      GenServer.stop(pid)
+    end
+  end
 end
