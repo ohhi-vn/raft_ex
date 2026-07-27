@@ -9,7 +9,6 @@ defmodule RaftEx.ServerProc do
 
   require Logger
 
-  @default_broadcast_time 100
   @default_election_mult 5
   @tick_interval_ms 1_000
   @default_await_condition_timeout 30_000
@@ -38,15 +37,11 @@ defmodule RaftEx.ServerProc do
   end
 
   def command(server_loc, cmd, timeout) do
-    leader_call(server_loc, {:command, :normal, cmd}, timeout)
+    leader_call(server_loc, {:command, cmd}, timeout)
   end
 
   def cast_command(server_id, cmd) do
-    :gen_statem.cast(server_id, {:command, :low, cmd})
-  end
-
-  def cast_command(server_id, priority, cmd) do
-    :gen_statem.cast(server_id, {:command, priority, cmd})
+    :gen_statem.cast(server_id, {:command, cmd})
   end
 
   def query(server_loc, query_fun, :local, options, timeout) when map_size(options) == 0 do
@@ -142,7 +137,23 @@ defmodule RaftEx.ServerProc do
   def leader(:enter, old_state, state0) do
     {state, actions} = handle_enter(:leader, old_state, state0)
     :ok = record_cluster_change(state)
-    {:keep_state, %{state | election_timeout_set: false}, actions}
+
+    ss = Map.put(state.server_state, :cluster_change_permitted, true)
+    state = %{state | server_state: ss, election_timeout_set: false}
+
+    cluster_name = state.conf[:cluster_name]
+    leader_id = RaftEx.Server.id(state.server_state)
+    members = Map.keys(state.server_state.cluster)
+
+    if cluster_name do
+      RaftEx.Leaderboard.record(cluster_name, leader_id, members)
+    end
+
+    {:keep_state, state, actions}
+  end
+
+  def leader({:call, from}, :trigger_election, state) do
+    {:keep_state, state, [{:reply, from, {:error, :already_leader}}]}
   end
 
   def leader({:call, from}, :ping, state) do
@@ -168,8 +179,33 @@ defmodule RaftEx.ServerProc do
     {:keep_state, state2, set_tick_timer(state2, actions)}
   end
 
+  def leader({:call, from}, {:leader_call, {:command, cmd_usr}}, state0)
+      when is_tuple(cmd_usr) and elem(cmd_usr, 0) == :"$usr" do
+    {:"$usr", data, reply_mode} = cmd_usr
+    cmd = {:"$usr", %{from: from}, data, reply_mode}
+    leader({:call, from}, {:command, cmd}, state0)
+  end
+
+  def leader({:call, from}, {:leader_call, {:command, cmd}}, state0)
+      when is_tuple(cmd) and elem(cmd, 0) in [:"$ra_join", :"$ra_leave"] do
+    {tag, data, reply_mode} = cmd
+    cmd = {tag, %{from: from}, data, reply_mode}
+    leader({:call, from}, {:command, cmd}, state0)
+  end
+
+  def leader({:call, from}, {:leader_call, msg}, state0) do
+    leader({:call, from}, msg, state0)
+  end
+
   def leader(evt_type, msg, state0) do
-    case handle_leader(msg, state0) do
+    {from_pid, inner_msg} = unwrap_from(msg)
+
+    state =
+      if from_pid,
+        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        else: state0
+
+    case handle_leader(inner_msg, state) do
       {:leader, state1, effects} ->
         {state, actions} = handle_effects(:leader, effects, evt_type, state1)
         {:keep_state, state, actions}
@@ -196,10 +232,17 @@ defmodule RaftEx.ServerProc do
       if RaftEx.Server.is_new?(state.server_state) do
         actions0
       else
-        {state2, actions2} = maybe_set_election_timeout(:long, state, actions0)
-        state = state2
+        {_state2, actions2} = set_election_timeout(state, actions0)
         actions2
       end
+
+    leader_id = RaftEx.Server.leader_id(state.server_state)
+    cluster_name = state.conf[:cluster_name]
+
+    if leader_id && cluster_name do
+      members = Map.keys(state.server_state.cluster)
+      RaftEx.Leaderboard.record(cluster_name, leader_id, members)
+    end
 
     {:keep_state, state, actions}
   end
@@ -208,8 +251,30 @@ defmodule RaftEx.ServerProc do
     {:keep_state, state, [{:reply, from, {:pong, :follower}}]}
   end
 
+  def follower({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
+    state = %{state0 | server_state: RaftEx.Server.clear_leader_id(ss0)}
+    next_state(:candidate, state, [{:reply, from, :ok}])
+  end
+
+  def follower({:call, from}, {:leader_call, _msg}, state0) do
+    leader_id = RaftEx.Server.leader_id(state0.server_state)
+
+    if leader_id do
+      {:keep_state, state0, [{:reply, from, {:redirect, leader_id}}]}
+    else
+      {:keep_state, state0, [{:reply, from, {:error, :no_leader}}]}
+    end
+  end
+
   def follower(evt_type, msg, state0) do
-    case handle_follower(msg, state0) do
+    {from_pid, inner_msg} = unwrap_from(msg)
+
+    state =
+      if from_pid,
+        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        else: state0
+
+    case handle_follower(inner_msg, state) do
       {:follower, state1, effects} ->
         {state, actions} = handle_effects(:follower, effects, evt_type, state1)
         {:keep_state, state, actions}
@@ -229,14 +294,21 @@ defmodule RaftEx.ServerProc do
   end
 
   # State: pre_vote
-  def pre_vote(:enter, _old_state, state0) do
-    {state, actions} = handle_enter(:pre_vote, _old_state, state0)
+  def pre_vote(:enter, old_state, state0) do
+    {state, actions0} = handle_enter(:pre_vote, old_state, state0)
 
     {context, election_effects} =
       RaftEx.Server.Election.start_election(:pre_vote, state.server_state)
 
     state = %{state | election_context: context}
-    {state, actions ++ election_effects ++ set_election_timeout(state, [])}
+    {s, actions} = handle_effects(:pre_vote, election_effects, :cast, state, actions0)
+    {s2, timeouts} = set_election_timeout(s, [])
+    {:keep_state, s2, actions ++ timeouts}
+  end
+
+  def pre_vote({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
+    state = %{state0 | server_state: RaftEx.Server.clear_leader_id(ss0)}
+    next_state(:candidate, state, [{:reply, from, :ok}])
   end
 
   def pre_vote({:call, from}, :ping, state) do
@@ -254,7 +326,14 @@ defmodule RaftEx.ServerProc do
   end
 
   def pre_vote(evt_type, msg, state0) do
-    case handle_follower(msg, state0) do
+    {from_pid, inner_msg} = unwrap_from(msg)
+
+    state =
+      if from_pid,
+        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        else: state0
+
+    case handle_follower(inner_msg, state) do
       {:pre_vote, state1, effects} ->
         {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
         {:keep_state, state, actions}
@@ -274,14 +353,32 @@ defmodule RaftEx.ServerProc do
   end
 
   # State: candidate
-  def candidate(:enter, _old_state, state0) do
-    {state, actions} = handle_enter(:candidate, _old_state, state0)
+  def candidate(:enter, old_state, state0) do
+    {state, actions} = handle_enter(:candidate, old_state, state0)
 
     {context, election_effects} =
       RaftEx.Server.Election.start_election(:candidate, state.server_state)
 
-    state = %{state | election_context: context}
-    {state, actions ++ election_effects ++ set_election_timeout(state, [])}
+    {state1, election_actions} =
+      handle_effects(:candidate, election_effects, :cast, %{state | election_context: context})
+
+    all_actions = actions ++ election_actions
+
+    if MapSet.size(context.votes_received) > div(context.total_voters, 2) do
+      {:keep_state, state1, all_actions ++ [{:state_timeout, 0, :become_leader}]}
+    else
+      {state2, prepended} = set_election_timeout(state1, all_actions)
+      {:keep_state, state2, prepended}
+    end
+  end
+
+  def candidate({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
+    state = %{state0 | server_state: RaftEx.Server.clear_leader_id(ss0)}
+    next_state(:candidate, state, [{:reply, from, :ok}])
+  end
+
+  def candidate({:call, from}, {:leader_call, _msg}, state) do
+    {:keep_state, state, [{:reply, from, {:error, :no_leader}}]}
   end
 
   def candidate({:call, from}, :ping, state) do
@@ -298,8 +395,33 @@ defmodule RaftEx.ServerProc do
     handle_vote_reply(reply, from, state0)
   end
 
+  def candidate(:internal, :election_won, state0) do
+    Logger.info("RaftEx.ServerProc: Transitioning to leader after winning election")
+    {:next_state, :leader, state0, []}
+  end
+
+  def candidate(:state_timeout, :become_leader, state0) do
+    Logger.info("RaftEx.ServerProc: Becoming leader after winning election")
+    leader_id = RaftEx.Server.id(state0.server_state)
+    cluster_name = state0.conf[:cluster_name]
+
+    if cluster_name do
+      members = Map.keys(state0.server_state.cluster)
+      RaftEx.Leaderboard.record(cluster_name, leader_id, members)
+    end
+
+    {:next_state, :leader, state0, []}
+  end
+
   def candidate(evt_type, msg, state0) do
-    case handle_follower(msg, state0) do
+    {from_pid, inner_msg} = unwrap_from(msg)
+
+    state =
+      if from_pid,
+        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        else: state0
+
+    case handle_follower(inner_msg, state) do
       {:candidate, state1, effects} ->
         {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
         {:keep_state, state, actions}
@@ -337,9 +459,8 @@ defmodule RaftEx.ServerProc do
   end
 
   @impl :gen_statem
-  def terminate(reason, _state_name, %{server_state: ss} = state) do
+  def terminate(reason, _state_name, %{server_state: _ss} = _state) do
     Logger.debug("ra_server_proc: terminating with #{inspect(reason)}")
-    RaftEx.Server.terminate(ss, reason)
     :ok
   end
 
@@ -406,11 +527,20 @@ defmodule RaftEx.ServerProc do
 
     server_state = RaftEx.Server.init(config)
 
+    if system = config[:system] do
+      uid = config[:uid]
+      RaftEx.Directory.register_name(system, uid, self(), self(), key, cluster_name)
+    end
+
+    sys_cfg = RaftEx.Server.system_config(server_state)
+    broadcast_time = Map.get(config, :broadcast_time, Map.get(sys_cfg, :broadcast_time, 100))
+
     %__MODULE__{
       conf: %{
         log_id: RaftEx.Server.log_id(server_state),
         cluster_name: cluster_name,
         name: key,
+        broadcast_time: broadcast_time,
         tick_timeout: Map.get(config, :tick_timeout, @tick_interval_ms),
         await_condition_timeout:
           Map.get(config, :await_condition_timeout, @default_await_condition_timeout),
@@ -543,11 +673,6 @@ defmodule RaftEx.ServerProc do
     |> then(fn {s, a} -> {s, Enum.reverse(a)} end)
   end
 
-  defp handle_effect(_raft_state, {:send_rpc, to, rpc}, _, state, actions) do
-    send_rpc(to, rpc, state)
-    {state, actions}
-  end
-
   defp handle_effect(_, {:next_event, evt}, evt_type, state, actions) do
     {state, [{:next_event, evt_type, evt} | actions]}
   end
@@ -606,7 +731,6 @@ defmodule RaftEx.ServerProc do
          %{conf: conf} = state0,
          actions
        ) do
-    # Start snapshot transfer to lagging peer
     snapshot_data = %{
       snap_state: snap_state,
       leader_id: leader_id,
@@ -616,35 +740,12 @@ defmodule RaftEx.ServerProc do
       offset: 0
     }
 
-    # Send first chunk of snapshot
     {state, rpc} = build_and_send_snapshot_chunk(snapshot_data, state0)
     {state, [rpc | actions]}
   end
 
   defp handle_effect(
-         :leader,
-         {:send_snapshot, peer_id, {snap_state, leader_id, term}},
-         _evt_type,
-         %{conf: conf} = state0,
-         actions
-       ) do
-    # Start snapshot transfer to lagging peer
-    snapshot_data = %{
-      snap_state: snap_state,
-      leader_id: leader_id,
-      term: term,
-      peer_id: peer_id,
-      chunk_size: Map.get(conf, :snapshot_chunk_size, 65_536),
-      offset: 0
-    }
-
-    # Send first chunk of snapshot
-    {state, rpc} = build_and_send_snapshot_chunk(snapshot_data, state0)
-    {state, [rpc | actions]}
-  end
-
-  defp handle_effect(
-         s,
+         _s,
          {:send_rpc, peer_id, rpc},
          _evt_type,
          %{election_context: %{state: election_state}} = state,
@@ -669,7 +770,7 @@ defmodule RaftEx.ServerProc do
     if node == node() do
       case Process.whereis(name) do
         nil -> :ok
-        pid -> Process.send(pid, {:gen_cast, msg}, [:nosuspend])
+        pid -> :gen_statem.cast(pid, {self(), {:rpc, msg}})
       end
     else
       RaftEx.Network.send_rpc(to, msg)
@@ -688,7 +789,7 @@ defmodule RaftEx.ServerProc do
         pid ->
           # Track this peer for reply correlation
           Process.put({:election_peer, pid}, peer_id)
-          Process.send(pid, {:gen_cast, rpc}, [:nosuspend])
+          :gen_statem.cast(pid, {self(), {:rpc, rpc}})
       end
     else
       RaftEx.Network.send_rpc(peer_id, rpc)
@@ -749,78 +850,6 @@ defmodule RaftEx.ServerProc do
     {state, {:send_rpc, peer_id, rpc}}
   end
 
-  defp handle_snapshot_reply(
-         %RaftEx.Types.InstallSnapshotResult{
-           term: reply_term,
-           last_index: last_index,
-           last_term: last_term
-         },
-         peer_id,
-         %{server_state: ss0} = state0
-       ) do
-    # Check if we need to step down due to higher term
-    current_term = RaftEx.Server.current_term(state0.server_state)
-
-    if reply_term > current_term do
-      # Step down to follower
-      ss = RaftEx.Server.update_peer(peer_id, %{status: :normal}, ss0)
-      state = %{state0 | server_state: ss}
-      {:follower, state, [{:update_term, reply_term}]}
-    else
-      # Get snapshot transfer state
-      snap_data = Process.get({:snapshot_send, peer_id})
-
-      if snap_data && snap_data.offset < snap_data |> Map.get(:total_size, 0) do
-        # More chunks to send
-        {state, rpc} = build_and_send_snapshot_chunk(snap_data, state0)
-        {:leader, state, [rpc]}
-      else
-        # Snapshot transfer complete
-        ss =
-          RaftEx.Server.update_peer(
-            peer_id,
-            %{
-              status: :normal,
-              next_index: last_index + 1,
-              match_index: last_index
-            },
-            ss0
-          )
-
-        state = %{state0 | server_state: ss}
-        Process.delete({:snapshot_send, peer_id})
-        {:leader, state, []}
-      end
-    end
-  end
-
-  defp set_tick_timer(%{conf: %{tick_timeout: tick_timeout}}, actions) do
-    [{{:timeout, :tick}, tick_timeout, :tick_timeout} | actions]
-  end
-
-  defp cleanup_election_peer_tracking do
-    # Clean up all election peer tracking entries from process dictionary
-    Process.get_keys()
-    |> Enum.filter(fn
-      {:election_peer, _} -> true
-      _ -> false
-    end)
-    |> Enum.each(&Process.delete/1)
-  end
-
-  defp maybe_set_election_timeout(_, %{election_timeout_set: true} = state, actions),
-    do: {state, actions}
-
-  defp maybe_set_election_timeout(length, %{conf: conf} = state, actions) do
-    action = election_timeout_action(length, conf)
-    {%{state | election_timeout_set: true}, [action | actions]}
-  end
-
-  defp election_timeout_action(:long, %{broadcast_time: bt}) do
-    t = :rand.uniform(bt * @default_election_mult * 2) + 1000
-    {:state_timeout, t, :election_timeout}
-  end
-
   defp election_timeout_action(:short, %{broadcast_time: bt}) do
     t = :rand.uniform(bt * @default_election_mult) + bt
     {:state_timeout, t, :election_timeout}
@@ -846,4 +875,23 @@ defmodule RaftEx.ServerProc do
   defp id(%{server_state: ss}), do: RaftEx.Server.id(ss)
   defp record_cluster_change(_state), do: :ok
   defp incr_counter(_, _, _), do: :ok
+  defp unwrap_rpc({:rpc, msg}), do: unwrap_rpc(msg)
+  defp unwrap_rpc({:gen_cast, msg}), do: unwrap_rpc(msg)
+  defp unwrap_rpc(msg), do: msg
+
+  defp unwrap_from({:rpc, msg}), do: unwrap_from(msg)
+  defp unwrap_from({:gen_cast, msg}), do: unwrap_from(msg)
+  defp unwrap_from({from, msg}) when is_pid(from), do: {from, unwrap_rpc(msg)}
+  defp unwrap_from(msg), do: {nil, unwrap_rpc(msg)}
+
+  defp pid_to_server_id(pid) do
+    case Process.info(pid, :registered_name) do
+      [{:registered_name, name}] -> {name, node()}
+      _ -> nil
+    end
+  end
+
+  defp set_tick_timer(%{conf: %{tick_timeout: tick_timeout}}, actions) do
+    [{{:timeout, :tick}, tick_timeout, :tick_timeout} | actions]
+  end
 end

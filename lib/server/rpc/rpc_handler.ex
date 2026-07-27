@@ -55,10 +55,10 @@ defmodule RaftEx.Server.RpcHandler do
           leader_id: leader_id,
           prev_log_index: prev_log_index,
           prev_log_term: prev_log_term,
-          leader_commit: leader_commit,
-          entries: entries
+          entries: entries,
+          leader_commit: leader_commit
         },
-        %{cfg: %Config{id: id}, current_term: current_term, log: log0} = state
+        %{cfg: %Config{id: _id}, current_term: current_term, log: _log0} = state
       ) do
     cond do
       # Leader's term is behind ours - reject
@@ -99,7 +99,7 @@ defmodule RaftEx.Server.RpcHandler do
          prev_log_term,
          leader_commit,
          entries,
-         %{log: log0, cfg: %Config{id: id}} = state
+         %{log: _log0, cfg: %Config{id: _id}} = state
        ) do
     # Update leader info
     state = %{state | leader_id: leader_id}
@@ -109,7 +109,7 @@ defmodule RaftEx.Server.RpcHandler do
 
     if log_consistent do
       # Append new entries if any
-      {log, append_effects} = append_entries(entries, log0, state)
+      {log, append_effects} = append_entries(entries, state.log, state)
       state = %{state | log: log}
 
       # Update commit index
@@ -146,9 +146,9 @@ defmodule RaftEx.Server.RpcHandler do
           success: true,
           next_index: next_index,
           last_index: last_index,
-          last_term: last_term
+          last_term: _last_term
         },
-        %{cfg: %Config{id: id}, current_term: current_term, cluster: cluster0} = state
+        %{cfg: %Config{id: _id}, current_term: current_term, cluster: cluster0} = state
       ) do
     cond do
       # Reply term is ahead - step down
@@ -247,7 +247,7 @@ defmodule RaftEx.Server.RpcHandler do
           chunk_state: chunk_state,
           data: data
         },
-        %{current_term: current_term, log: log0} = state
+        %{current_term: current_term, log: _log0} = state
       ) do
     cond do
       # Leader's term is behind - reject
@@ -277,29 +277,17 @@ defmodule RaftEx.Server.RpcHandler do
     end
   end
 
-  defp handle_first_snapshot_chunk(meta, data, leader_id, %{cfg: %Config{id: id}} = state) do
+  defp handle_first_snapshot_chunk(meta, data, _leader_id, %{cfg: %Config{id: _id}} = state) do
     # Begin accepting snapshot
-    case RaftEx.LogSnapshot.begin_accept(state.cfg.system_config.data_dir, meta) do
-      {:ok, snapshot_state} ->
-        # Write first chunk
-        case RaftEx.LogSnapshot.accept_chunk(data, snapshot_state) do
-          {:ok, new_snapshot_state} ->
-            state = %{state | snapshot_state: new_snapshot_state}
-            effects = []
-            {:receive_snapshot, state, effects}
+    {:ok, snapshot_state} =
+      RaftEx.LogSnapshot.begin_accept(state.cfg.system_config.data_dir, meta)
 
-          {:error, reason} ->
-            Logger.error("Failed to write snapshot chunk: #{inspect(reason)}")
-            reply = build_install_snapshot_reply(state.current_term, state)
-            effects = [{:send_rpc, leader_id, reply}]
-            {:follower, state, effects}
-        end
-
-      {:error, reason} ->
-        Logger.error("Failed to begin snapshot accept: #{inspect(reason)}")
-        reply = build_install_snapshot_reply(state.current_term, state)
-        effects = [{:send_rpc, leader_id, reply}]
-        {:follower, state, effects}
+    # Write first chunk
+    case RaftEx.LogSnapshot.accept_chunk(data, snapshot_state) do
+      {:ok, new_snapshot_state} ->
+        state = %{state | snapshot_state: new_snapshot_state}
+        effects = []
+        {:receive_snapshot, state, effects}
     end
   end
 
@@ -323,7 +311,7 @@ defmodule RaftEx.Server.RpcHandler do
 
         case meta do
           {:ok, %{index: snap_idx, term: snap_term}} ->
-            {log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
+            {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
             state = %{state | log: log, snapshot_state: nil}
 
             {last_index, last_term} = Log.last_index_term(log)
@@ -334,10 +322,6 @@ defmodule RaftEx.Server.RpcHandler do
           _ ->
             {:follower, state, []}
         end
-
-      {:error, reason} ->
-        Logger.error("Failed to complete snapshot: #{inspect(reason)}")
-        {:follower, state, []}
     end
   end
 
@@ -346,7 +330,7 @@ defmodule RaftEx.Server.RpcHandler do
     case RaftEx.LogSnapshot.write(state.cfg.system_config.data_dir, meta, data, true) do
       {:ok, _bytes} ->
         %{index: snap_idx, term: snap_term} = meta
-        {log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
+        {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
         state = %{state | log: log}
 
         {last_index, last_term} = Log.last_index_term(log)
@@ -372,7 +356,7 @@ defmodule RaftEx.Server.RpcHandler do
         %Types.InstallSnapshotResult{
           term: reply_term,
           last_index: last_index,
-          last_term: last_term
+          last_term: _last_term
         },
         %{current_term: current_term} = state
       ) do
@@ -491,23 +475,23 @@ defmodule RaftEx.Server.RpcHandler do
           {^prev_log_term, _} ->
             {true, state}
 
-          {_, _} ->
-            # Term mismatch
-            {false, state}
-
           {nil, _} ->
             # Entry doesn't exist
+            {false, state}
+
+          {_, _} ->
+            # Term mismatch
             {false, state}
         end
     end
   end
 
-  defp append_entries([], log, state), do: {log, []}
+  defp append_entries([], _log, state), do: {state.log, []}
 
-  defp append_entries(entries, log0, state) do
+  defp append_entries(entries, _log0, state) do
     # Filter out entries we already have
     {new_entries, state} =
-      Enum.reduce(entries, {[], state}, fn {idx, term, cmd} = entry, {acc, st} ->
+      Enum.reduce(entries, {[], state}, fn {idx, term, _cmd} = entry, {acc, st} ->
         case Log.fetch_term(idx, st.log) do
           {^term, _} ->
             # Already have this entry with same term - skip
@@ -533,7 +517,7 @@ defmodule RaftEx.Server.RpcHandler do
 
       case Log.write(entries_to_write, state.log) do
         {:ok, new_log} ->
-          state = %{state | log: new_log}
+          _state = %{state | log: new_log}
           effects = [{:ra_log_event, {:written, entries_to_write}}]
           {new_log, effects}
 
@@ -547,25 +531,7 @@ defmodule RaftEx.Server.RpcHandler do
   end
 
   defp truncate_log_from(log, from_index) do
-    # Remove entries from the log starting at from_index
-    # This is critical for Raft log consistency when leader sends conflicting entries
-    %{entries: entries, range: {start, _end}} = log
-
-    # Filter out entries with index >= from_index
-    new_entries =
-      entries
-      |> Enum.filter(fn {idx, _} -> idx < from_index end)
-      |> Map.new()
-
-    # Update range - new end is from_index - 1 (or start - 1 if all truncated)
-    new_end =
-      if map_size(new_entries) == 0 do
-        start - 1
-      else
-        new_entries |> Map.keys() |> Enum.max()
-      end
-
-    %{log | entries: new_entries, range: {start, new_end}}
+    Log.truncate(from_index, log)
   end
 
   defp update_commit_index(leader_commit, %{log: log, commit_index: commit_index} = state) do

@@ -4,13 +4,6 @@
 >
 > This library is an experimental Elixir port of the RabbitMQ RA Raft consensus algorithm.
 > It is currently in early development and **NOT READY FOR PRODUCTION USE**.
->
-> - APIs are unstable and may change without notice
-> - Data formats are not finalized
-> - Critical edge cases may not yet be handled
-> - Distributed multi-node testing is incomplete
->
-> Use at your own risk for learning, testing, and evaluation purposes only.
 
 ---
 

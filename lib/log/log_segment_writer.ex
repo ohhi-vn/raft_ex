@@ -27,7 +27,7 @@ defmodule RaftEx.LogSegmentWriter do
   @magic_bytes <<0x52, 0x41, 0x53, 0x47>>
   @version 1
   @header_size 24
-  @footer_size 8
+  #  @footer_size 8
 
   @type segment_id :: non_neg_integer()
   @type segment_range :: {first_index :: non_neg_integer(), last_index :: non_neg_integer()}
@@ -214,10 +214,10 @@ defmodule RaftEx.LogSegmentWriter do
   end
 
   @impl GenServer
-  def handle_call({:write, entries}, _from, %{active_segment: nil} = state) do
+  def handle_call({:write, entries}, from, %{active_segment: nil} = state) do
     {:ok, new_active} = create_new_segment(state)
     state = %{state | active_segment: new_active}
-    handle_call({:write, entries}, _from, state)
+    handle_call({:write, entries}, from, state)
   end
 
   @impl GenServer
@@ -271,9 +271,6 @@ defmodule RaftEx.LogSegmentWriter do
       {:ok, sealed} ->
         state = %{state | segments: state.segments ++ [sealed], active_segment: nil}
         {:reply, :ok, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
     end
   end
 
@@ -476,13 +473,13 @@ defmodule RaftEx.LogSegmentWriter do
     <<@magic_bytes::binary, @version::32, first_index::64, last_index::64, entry_count::32>>
   end
 
-  defp parse_header(
-         <<@magic_bytes::binary, @version::32, first::64, last::64, count::32, _rest::binary>>
-       ) do
-    %{first_index: first, last_index: last, entry_count: count}
-  end
+  # defp parse_header(
+  #        <<@magic_bytes::binary, @version::32, first::64, last::64, count::32, _rest::binary>>
+  #      ) do
+  #   %{first_index: first, last_index: last, entry_count: count}
+  # end
 
-  defp parse_header(_), do: nil
+  # defp parse_header(_), do: nil
 
   defp serialize_entry({index, term, command}) do
     cmd_data = :erlang.term_to_binary(command)

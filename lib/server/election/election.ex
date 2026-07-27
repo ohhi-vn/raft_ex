@@ -28,7 +28,6 @@ defmodule RaftEx.Server.Election do
 
   alias RaftEx.Types
   alias RaftEx.Server.Config
-  alias RaftEx.Server.Cluster
 
   @type election_state :: :pre_vote | :candidate
   @type election_result :: :won | :lost | :ongoing
@@ -53,12 +52,12 @@ defmodule RaftEx.Server.Election do
   """
   @spec start_election(election_state(), map()) :: {election_context(), [term()]}
   def start_election(:pre_vote = state, %{
-        cfg: %Config{id: id, uid: uid},
+        cfg: %Config{id: id, uid: _uid},
         current_term: term,
         log: log,
         cluster: cluster
       }) do
-    {last_log_index, last_log_term} = Log.last_index_term(log)
+    {last_log_index, last_log_term} = RaftEx.Log.last_index_term(log)
 
     context = %{
       state: state,
@@ -91,7 +90,7 @@ defmodule RaftEx.Server.Election do
   end
 
   def start_election(:candidate = state, %{
-        cfg: %Config{id: id, uid: uid, log_id: log_id},
+        cfg: %Config{id: id, uid: _uid, log_id: _log_id},
         current_term: term,
         log: log,
         cluster: cluster
@@ -99,7 +98,7 @@ defmodule RaftEx.Server.Election do
     # Increment term for candidate phase
     new_term = term + 1
 
-    {last_log_index, last_log_term} = Log.last_index_term(log)
+    {last_log_index, last_log_term} = RaftEx.Log.last_index_term(log)
 
     context = %{
       state: state,
@@ -145,12 +144,12 @@ defmodule RaftEx.Server.Election do
           last_log_term: candidate_last_term
         },
         %{
-          cfg: %Config{id: id, uid: uid},
+          cfg: %Config{id: _id, uid: _uid},
           current_term: current_term,
           log: log
-        } = state
+        } = _state
       ) do
-    {last_log_index, last_log_term} = Log.last_index_term(log)
+    {last_log_index, last_log_term} = RaftEx.Log.last_index_term(log)
 
     # Grant pre-vote if:
     # 1. Candidate's term is >= our current term
@@ -190,12 +189,12 @@ defmodule RaftEx.Server.Election do
           last_log_term: candidate_last_term
         },
         %{
-          cfg: %Config{id: id, uid: uid},
+          cfg: %Config{id: _id, uid: uid},
           current_term: current_term,
           log: log
         } = state
       ) do
-    {last_log_index, last_log_term} = Log.last_index_term(log)
+    {last_log_index, last_log_term} = RaftEx.Log.last_index_term(log)
 
     # Determine if we should grant the vote
     {vote_granted, new_state} =
@@ -291,7 +290,7 @@ defmodule RaftEx.Server.Election do
         %Types.RequestVoteResult{term: term, vote_granted: true},
         %{state: :candidate, term: election_term, votes_received: votes, total_voters: total} =
           context,
-        state,
+        _state,
         peer_id
       )
       when term == election_term do
@@ -350,7 +349,7 @@ defmodule RaftEx.Server.Election do
         %Types.PreVoteResult{term: term, vote_granted: true},
         %{state: :pre_vote, term: election_term, votes_received: votes, total_voters: total} =
           context,
-        state,
+        _state,
         peer_id
       )
       when term == election_term do
@@ -447,7 +446,7 @@ defmodule RaftEx.Server.Election do
     end)
   end
 
-  defp build_election_rpcs(cluster, self_id, rpc, type) do
+  defp build_election_rpcs(cluster, self_id, rpc, _type) do
     cluster
     |> Map.delete(self_id)
     |> Enum.flat_map(fn {peer_id, peer_state} ->
@@ -474,7 +473,7 @@ defmodule RaftEx.Server.Election do
       (candidate_last_term == our_last_term and candidate_last_index >= our_last_index)
   end
 
-  defp update_term_and_voted_for(term, voted_for, state) do
+  defp update_term_and_voted_for(term, _voted_for, state) do
     %{state | current_term: term}
   end
 

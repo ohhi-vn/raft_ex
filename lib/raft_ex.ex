@@ -264,15 +264,15 @@ defmodule RaftEx do
 
   def pipeline_command(server_id, command, correlation \\ :no_correlation, priority \\ :low)
 
-  def pipeline_command(server_id, command, correlation, priority)
+  def pipeline_command(server_id, command, correlation, _priority)
       when correlation != :no_correlation do
     cmd = usr(command, {:notify, correlation, self()})
-    RaftEx.ServerProc.cast_command(server_id, priority, cmd)
+    RaftEx.ServerProc.cast_command(server_id, cmd)
   end
 
-  def pipeline_command(server_id, command, :no_correlation, priority) do
+  def pipeline_command(server_id, command, :no_correlation, _priority) do
     cmd = usr(command, :noreply)
-    RaftEx.ServerProc.cast_command(server_id, priority, cmd)
+    RaftEx.ServerProc.cast_command(server_id, cmd)
   end
 
   # ---- queries -----------------------------------------------------
@@ -329,7 +329,9 @@ defmodule RaftEx do
     RaftEx.ServerProc.local_state_query(server_id, :overview, timeout)
   end
 
-  def key_metrics({name, n} = server_id, _timeout \\ @default_timeout)
+  def key_metrics(server_id, timeout \\ @default_timeout)
+
+  def key_metrics({name, n} = server_id, _timeout)
       when n == node() do
     fields = [
       :last_applied,
@@ -368,7 +370,7 @@ defmodule RaftEx do
       nil ->
         :system_not_started
 
-      %{names: %{segment_writer: seg_writer, open_mem_tbls: open_tbls, wal: wal}} = _config ->
+      %{names: %{segment_writer: seg_writer, open_mem_tbls: open_tbls, wal: _wal}} = _config ->
         %{
           node: node(),
           servers: RaftEx.Directory.overview(system),
@@ -380,6 +382,54 @@ defmodule RaftEx do
         }
     end
   end
+
+  # ---- distributed cluster API ------------------------------------
+
+  @doc """
+  Form a distributed Raft cluster across multiple nodes.
+  Delegates to `RaftEx.Cluster.form_cluster/4`.
+  """
+  defdelegate form_cluster(cluster_name, machine, nodes, opts \\ []), to: RaftEx.Cluster
+
+  @doc """
+  Join an existing Raft cluster.
+  Delegates to `RaftEx.Cluster.join_cluster/5`.
+  """
+  defdelegate join_cluster(cluster_name, machine, nodes, seed_node, opts \\ []),
+    to: RaftEx.Cluster
+
+  @doc """
+  Get cluster status.
+  Delegates to `RaftEx.Cluster.status/1`.
+  """
+  defdelegate cluster_status(system \\ :default), to: RaftEx.Cluster, as: :status
+
+  @doc """
+  Start node discovery for automatic topology management.
+  """
+  def start_node_discovery(opts) do
+    RaftEx.NodeDiscovery.start_link(opts)
+  end
+
+  @doc """
+  Look up the current leader for a cluster from the local Leaderboard.
+  """
+  defdelegate find_leader(cluster_name), to: RaftEx.Cluster
+
+  @doc """
+  Get the local server ID for a cluster.
+  """
+  defdelegate local_server_id(cluster_name), to: RaftEx.Leaderboard
+
+  @doc """
+  Get overview of all clusters from the Leaderboard.
+  """
+  defdelegate leaderboard_overview, to: RaftEx.Leaderboard, as: :overview
+
+  @doc """
+  Start distributed Erlang and connect to seed nodes.
+  """
+  defdelegate start_distribution(opts \\ []), to: RaftEx.Distribution, as: :start
 
   # ---- aux ---------------------------------------------------------
 

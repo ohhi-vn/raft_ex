@@ -1,29 +1,6 @@
 defmodule RaftEx.Network do
   @moduledoc """
   Handles distributed RPC communication between Raft nodes across the cluster.
-
-  This module provides a unified interface for sending messages to local or remote
-  `RaftEx.ServerProc` instances. It manages node connections, monitors remote processes,
-  and implements routing logic to seamlessly handle both local and distributed messaging.
-
-  ## Features
-
-  - **Unified Routing**: Automatically routes messages to local or remote nodes based on server ID.
-  - **Lazy Connection**: Establishes distribution connections on-demand via `Node.connect/1`.
-  - **Process Monitoring**: Monitors remote nodes and processes to detect failures.
-  - **Backoff & Retry Ready**: Structured to support retry logic in higher-level callers.
-  - **Distribution Optimized**: Uses native Erlang distribution primitives for minimal overhead.
-
-  ## Usage
-
-      # Send an RPC to a remote server
-      RaftEx.Network.send_rpc({:server2, :"node2@host"}, rpc)
-
-      # Make a synchronous call
-      {:ok, reply} = RaftEx.Network.call({:server2, :"node2@host"}, {:ping}, 5000)
-
-      # Monitor a remote server
-      ref = RaftEx.Network.monitor({:server2, :"node2@host"})
   """
 
   require Logger
@@ -35,12 +12,40 @@ defmodule RaftEx.Network do
   @default_timeout 5_000
 
   @doc """
-  Sends an RPC message to a server, routing to local or remote node automatically.
+  Start node monitoring for Raft cluster communication.
+  Sets up monitoring of remote nodes and connects to seed nodes.
 
-  Returns `:ok` on success, `{:error, reason}` on failure.
+  ## Options
+    * `:seeds` - list of seed nodes to connect to
+    * `:cookie` - Erlang distribution cookie
+  """
+  def start_monitoring(opts \\ []) do
+    seeds = Keyword.get(opts, :seeds, [])
+    cookie = Keyword.get(opts, :cookie, :raft_ex)
+
+    if seeds != [] do
+      Node.set_cookie(cookie)
+
+      for seed <- seeds, seed != node() do
+        case Node.connect(seed) do
+          true ->
+            Logger.info("RaftEx.Network: connected to seed #{inspect(seed)}")
+
+          false ->
+            Logger.warning("RaftEx.Network: failed to connect to seed #{inspect(seed)}")
+        end
+      end
+    end
+
+    Node.monitor(:all, true)
+    :ok
+  end
+
+  @doc """
+  Sends an RPC message to a server.
   """
   @spec send_rpc(server_id(), rpc(), opts()) :: :ok | {:error, term()}
-  def send_rpc({name, node} = server_id, rpc, opts \\ []) do
+  def send_rpc({name, node} = server_id, rpc, _opts \\ []) do
     msg = {:gen_cast, {:rpc, rpc}}
 
     if node == node() do
@@ -52,8 +57,6 @@ defmodule RaftEx.Network do
 
   @doc """
   Makes a synchronous call to a server.
-
-  Returns `{:ok, reply}` on success, `{:error, reason}` on failure.
   """
   @spec call(server_id(), term(), timeout()) :: {:ok, term()} | {:error, term()}
   def call({name, node} = server_id, msg, timeout \\ @default_timeout) do
@@ -66,8 +69,6 @@ defmodule RaftEx.Network do
 
   @doc """
   Casts a message to a server asynchronously.
-
-  Returns `:ok` on success, `{:error, reason}` on failure.
   """
   @spec cast(server_id(), term()) :: :ok | {:error, term()}
   def cast({name, node} = server_id, msg) do
@@ -79,46 +80,46 @@ defmodule RaftEx.Network do
   end
 
   @doc """
-  Monitors a remote server process. Returns a monitor reference.
-
-  For remote nodes, this monitors the node connection status rather than the specific
-  process, as remote process monitors require additional infrastructure.
+  Monitors a remote server process.
   """
   @spec monitor(server_id()) :: reference() | {:error, term()}
-  def monitor({name, node} = server_id) do
+  def monitor({name, node} = _server_id) do
     if node == node() do
       case Process.whereis(name) do
         nil -> {:error, :noproc}
         pid -> Process.monitor(pid)
       end
     else
-      # Monitor the remote node connection
       Node.monitor(node, true)
       make_ref()
     end
   end
 
   @doc """
-  Handles node up events. Logs connection and triggers any necessary reconnection logic.
+  Handle node up events. Attempts to re-register with any Raft clusters
+  the local node was part of.
   """
   @spec handle_node_up(node()) :: :ok
   def handle_node_up(node) do
-    Logger.info("RaftEx.Network: Node #{inspect(node)} connected")
+    Logger.info("RaftEx.Network: node #{inspect(node)} connected")
+
+    # Attempt to re-establish Raft connections
+    notify_server_procs(node, :nodeup)
+
     :ok
   end
 
   @doc """
-  Handles node down events. Logs disconnection and notifies local state machines.
+  Handle node down events.
   """
   @spec handle_node_down(node()) :: :ok
   def handle_node_down(node) do
-    Logger.warning("RaftEx.Network: Node #{inspect(node)} disconnected")
+    Logger.warning("RaftEx.Network: node #{inspect(node)} disconnected")
+
+    notify_server_procs(node, :nodedown)
+
     :ok
   end
-
-  # ---------------------------------------------------------------------------
-  # Private Helpers
-  # ---------------------------------------------------------------------------
 
   defp do_send_local(name, msg) do
     case Process.whereis(name) do
@@ -159,7 +160,6 @@ defmodule RaftEx.Network do
   defp do_call_remote({name, node}, msg, timeout) do
     if Node.connect(node) do
       try do
-        # Use :rpc.call for synchronous remote calls with timeout propagation
         reply = :rpc.call(node, :gen_statem, :call, [{name, node}, msg, timeout], timeout)
         {:ok, reply}
       catch
@@ -185,11 +185,29 @@ defmodule RaftEx.Network do
 
   defp do_cast_remote({name, node}, msg) do
     if Node.connect(node) do
-      # Direct send is more efficient than :rpc.cast for async messages
       send({name, node}, {:gen_cast, msg})
       :ok
     else
       {:error, :noconnection}
+    end
+  end
+
+  defp notify_server_procs(node, event) do
+    try do
+      :ets.match(:ra_state, {:"$1", :"$2", :"$3"})
+    rescue
+      _ -> []
+    else
+      servers ->
+        for [name, _state, _membership] <- servers do
+          case Process.whereis(name) do
+            nil ->
+              :ok
+
+            pid ->
+              Process.send(pid, {:ra_network_event, event, node}, [:nosuspend])
+          end
+        end
     end
   end
 end

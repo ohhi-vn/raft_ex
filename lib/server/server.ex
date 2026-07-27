@@ -117,7 +117,9 @@ defmodule RaftEx.Server do
       aux_state: Machine.init_aux(mac_mod, elem(id, 0)),
       query_index: 0,
       queries_waiting_heartbeats: :queue.new(),
-      pending_consistent_queries: []
+      pending_consistent_queries: [],
+      previous_cluster: nil,
+      rpc_from: nil
     }
   end
 
@@ -179,8 +181,9 @@ defmodule RaftEx.Server do
       {:ok, idx, term, state1, effects0} ->
         force = match?({:noop, _, _}, cmd)
         {state, _, effects1} = make_pipelined_rpc_effects(state1, effects0, force)
-        effects = Effects.after_log_append_reply(cmd, idx, term, effects1)
-        {:leader, state, effects}
+        {state2, effects2} = evaluate_quorum(state, effects1)
+        effects = Effects.after_log_append_reply(cmd, idx, term, effects2)
+        {:leader, state2, effects}
 
       {:not_appended, :wal_down, state, effects0} ->
         condition = %{predicate_fun: &wal_down_condition/2, transition_to: :leader}
@@ -203,6 +206,15 @@ defmodule RaftEx.Server do
   def handle_leader({:ra_log_event, evt}, %{log: log0} = state) do
     {log, effects} = Log.handle_event(evt, log0)
     {:leader, %{state | log: log}, effects}
+  end
+
+  def handle_leader(
+        %Types.AppendEntriesReply{} = reply,
+        %{rpc_from: peer_id, cluster: cluster} = state
+      )
+      when is_map_key(cluster, peer_id) do
+    {state, effects} = RaftEx.Server.RpcHandler.handle_append_entries_reply(reply, state)
+    {:leader, state, effects}
   end
 
   def handle_leader(_msg, state), do: {:leader, state, []}
@@ -388,7 +400,7 @@ defmodule RaftEx.Server do
   def update_release_cursor(
         index,
         mac_state,
-        opts,
+        _opts,
         %{cfg: %Config{machine: machine}, log: log0, cluster: cluster} = state
       ) do
     mac_version = index_machine_version(index, state)
@@ -423,7 +435,7 @@ defmodule RaftEx.Server do
   # ---------------------------------------------------------------------------
 
   @spec terminate(map(), term()) :: :ok
-  def terminate(%{log: log} = state, _reason) do
+  def terminate(%{log: _log} = state, _reason) do
     state1 = maybe_write_recovery_checkpoint(state)
     %{log: log2} = persist_last_applied(state1)
     Log.close(log2)
@@ -491,33 +503,8 @@ defmodule RaftEx.Server do
      [{:next_event, :cast, self_vote}, {:send_vote_requests, vote_rpcs}]}
   end
 
-  defp call_for_election(
-         :candidate,
-         %{cfg: %Config{id: id, log_id: log_id} = cfg, current_term: current_term} = state0
-       ) do
-    incr_counter(cfg, :elections, 1)
-    new_term = current_term + 1
-    Logger.debug("#{log_id}: election in term #{new_term}")
-    peer_ids = Cluster.peer_ids(id, state0.cluster)
-    {last_idx, last_term} = Log.last_index_term(state0.log)
-
-    vote_rpcs =
-      Enum.map(peer_ids, fn peer_id ->
-        {peer_id,
-         %Types.RequestVoteRpc{
-           term: new_term,
-           candidate_id: id,
-           last_log_index: last_idx,
-           last_log_term: last_term
-         }}
-      end)
-
-    self_vote = %Types.RequestVoteResult{term: new_term, vote_granted: true}
-    state = update_term_and_voted_for(new_term, id, state0)
-
-    {:candidate, Map.merge(state, %{leader_id: nil, votes: 0}),
-     [{:next_event, :cast, self_vote}, {:send_vote_requests, vote_rpcs}]}
-  end
+  # This clause is never used - kept for API compatibility
+  defp call_for_election(_type, _state), do: {:error, :invalid_election_type}
 
   # ---------------------------------------------------------------------------
   # Private — term management
@@ -546,7 +533,7 @@ defmodule RaftEx.Server do
   # Private — quorum and commit advancement
   # ---------------------------------------------------------------------------
 
-  defp evaluate_quorum(%{cfg: cfg, commit_index: ci0} = state0, effects0) do
+  defp evaluate_quorum(%{cfg: _cfg, commit_index: ci0} = state0, effects0) do
     %{commit_index: ci} = state = increment_commit_index(state0)
     effects = if ci > ci0, do: [{:aux, :eval} | effects0], else: effects0
     {state1, effects1} = apply_committed_entries(ci, state, effects)
@@ -587,7 +574,7 @@ defmodule RaftEx.Server do
                machine_version: mac_ver,
                effective_machine_version: eff_mac_ver,
                effective_machine_module: mac_mod
-             } = cfg,
+             } = _cfg,
            machine_state: mac_state0,
            log: log0
          } = state0
@@ -672,7 +659,12 @@ defmodule RaftEx.Server do
           }
 
         _ ->
-          %{state0 | cluster_change_permitted: true}
+          %{
+            state0
+            | cluster: new_cluster,
+              membership: get_membership(new_cluster, state0),
+              cluster_change_permitted: true
+          }
       end
 
     {mod, idx, state, mac_st, effects, notifys, last_ts}
@@ -746,11 +738,9 @@ defmodule RaftEx.Server do
   # Private — command meta construction
   # ---------------------------------------------------------------------------
 
-  defp build_command_meta(idx, term, mac_ver, nil, cmd_meta),
-    do: build_command_meta(idx, term, mac_ver, cmd_meta)
-
-  defp build_command_meta(idx, term, mac_ver, reply_mode, cmd_meta),
-    do: build_command_meta(idx, term, mac_ver, Map.put(cmd_meta, :reply_mode, reply_mode))
+  defp build_command_meta(idx, term, mac_ver, reply_mode, cmd_meta) do
+    build_command_meta(idx, term, mac_ver, Map.put(cmd_meta, :reply_mode, reply_mode))
+  end
 
   defp build_command_meta(idx, term, mac_ver, cmd_meta) do
     Enum.reduce(cmd_meta, %{index: idx, machine_version: mac_ver, term: term}, fn
@@ -772,6 +762,25 @@ defmodule RaftEx.Server do
        do: {:not_appended, :cluster_change_not_permitted, state, effects}
 
   defp append_log_as_leader(
+         {:"$ra_join", from, joining, reply_mode},
+         cluster,
+         _cfg,
+         state,
+         effects
+       ) do
+    new_cluster =
+      Map.put(cluster, joining, %{
+        status: :normal,
+        next_index: 1,
+        query_index: 0,
+        match_index: 0,
+        commit_index_sent: 0
+      })
+
+    append_cluster_change(new_cluster, from, reply_mode, state, effects)
+  end
+
+  defp append_log_as_leader(
          {:"$ra_leave", from, leaving, reply_mode},
          cluster,
          %Config{log_id: log_id},
@@ -781,6 +790,7 @@ defmodule RaftEx.Server do
     case cluster do
       %{^leaving => _} ->
         new_cluster = Map.delete(cluster, leaving)
+        state = %{state | cluster: new_cluster}
         append_cluster_change(new_cluster, from, reply_mode, state, effects)
 
       _ ->
@@ -806,8 +816,6 @@ defmodule RaftEx.Server do
          reply_mode,
          %{
            log: log0,
-           cluster: prev_cluster,
-           cluster_index_term: {prev_ci, prev_ct},
            current_term: term
          } = state,
          effects
@@ -822,13 +830,13 @@ defmodule RaftEx.Server do
        %{
          state
          | log: log,
-           cluster: cluster,
            cluster_change_permitted: false,
-           cluster_index_term: {next_idx, term},
-           previous_cluster: {prev_ci, prev_ct, prev_cluster}
+           cluster_index_term: {next_idx, term}
        }, effects}
     rescue
-      _ -> {:not_appended, :wal_down, state, effects}
+      e ->
+        Logger.error("RaftEx.Server: append_cluster_change failed: #{inspect(e)}")
+        {:not_appended, :wal_down, state, effects}
     end
   end
 
@@ -836,7 +844,7 @@ defmodule RaftEx.Server do
   # Private — RPC effects
   # ---------------------------------------------------------------------------
 
-  defp make_pipelined_rpc_effects(state, effects, force \\ false) do
+  defp make_pipelined_rpc_effects(state, effects, _force) do
     %{
       cfg: %Config{
         id: id,
@@ -861,7 +869,7 @@ defmodule RaftEx.Server do
         in_flight = ni - mi - 1
         effective_batch = max(1, min(batch_size, max_pipeline - in_flight))
 
-        if in_flight < max_pipeline or force do
+        if in_flight < max_pipeline do
           {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, [])
           peer = %{peer0 | next_index: new_ni, commit_index_sent: ci}
           new_more = more0 or (new_ni < next_log_idx and new_ni - mi - 1 < max_pipeline)
@@ -875,7 +883,7 @@ defmodule RaftEx.Server do
     end)
   end
 
-  defp make_rpc_effect(peer_id, %{next_index: next} = peer, batch_size, state, cache \\ []) do
+  defp make_rpc_effect(peer_id, %{next_index: next} = _peer, batch_size, state, cache \\ []) do
     prev_idx = next - 1
     %{log: log0} = state
 
@@ -904,9 +912,19 @@ defmodule RaftEx.Server do
               cache
             )
 
-          {snap_idx, _} ->
+          {snap_idx, _} when not is_nil(snap_idx) ->
             snap_state = Log.snapshot_state(log)
             {snap_idx, {:send_snapshot, peer_id, {snap_state, id, term}}, %{state | log: log}}
+
+          _ ->
+            make_append_entries_rpc(
+              peer_id,
+              0,
+              0,
+              batch_size,
+              %{state | log: log},
+              cache
+            )
         end
     end
   end
@@ -1121,18 +1139,18 @@ defmodule RaftEx.Server do
   # Private — misc
   # ---------------------------------------------------------------------------
 
-  defp build_append_entries_reply(term, success, %{log: log} = state) do
-    {lwi, lwt} = Log.last_written(log)
-    {last_idx, _} = Log.last_index_term(log)
+  # defp build_append_entries_reply(term, success, %{log: log} = state) do
+  #   {lwi, lwt} = Log.last_written(log)
+  #   {last_idx, _} = Log.last_index_term(log)
 
-    %Types.AppendEntriesReply{
-      term: term,
-      success: success,
-      next_index: last_idx + 1,
-      last_index: lwi,
-      last_term: lwt
-    }
-  end
+  #   %Types.AppendEntriesReply{
+  #     term: term,
+  #     success: success,
+  #     next_index: last_idx + 1,
+  #     last_index: lwi,
+  #     last_term: lwt
+  #   }
+  # end
 
   defp wal_down_condition(_msg, %{log: log} = state),
     do: {Log.can_write?(log), state}

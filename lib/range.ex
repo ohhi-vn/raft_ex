@@ -60,7 +60,7 @@ defmodule RaftEx.Range do
   def subtract(_, nil), do: []
   def subtract(nil, range), do: [range]
 
-  def subtract({sub_start, sub_end} = sub_range, {start, ending} = range) do
+  def subtract({_sub_start, _sub_end} = sub_range, {start, ending} = range) do
     case overlap(sub_range, range) do
       nil ->
         [range]

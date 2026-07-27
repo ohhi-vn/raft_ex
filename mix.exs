@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.0.2"
+  @version "0.1.0"
 
   def project do
     [

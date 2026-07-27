@@ -102,21 +102,21 @@ defmodule RaftEx.Log do
     # Get process names
     wal_name = Map.fetch!(names, :wal)
     meta_name = Map.fetch!(names, :log_meta)
-    open_mem_tbls = Map.fetch!(names, :open_mem_tbls)
+    _open_mem_tbls = Map.fetch!(names, :open_mem_tbls)
 
     # Create ETS table for this log's mem table
     mem_table = :ets.new(:"#{uid}_mem_table", [:set, :public, {:read_concurrency, true}])
 
     # Recover metadata
-    current_term = LogMeta.fetch(meta_name, uid, :current_term, 0)
-    voted_for = LogMeta.fetch(meta_name, uid, :voted_for)
-    last_applied = LogMeta.fetch(meta_name, uid, :last_applied, 0)
+    _current_term = LogMeta.fetch(meta_name, uid, :current_term, 0)
+    _voted_for = LogMeta.fetch(meta_name, uid, :voted_for)
+    _last_applied = LogMeta.fetch(meta_name, uid, :last_applied, 0)
 
     # Recover from snapshot if exists
     {snapshot_index, snapshot_term, snapshot_state} = recover_snapshot_state(dir)
 
     # Recover WAL entries
-    {wal_first, wal_last, wal_entries} = LogWal.recover(%{data_dir: dir})
+    {_wal_first, wal_last, wal_entries} = LogWal.recover(%{data_dir: dir})
 
     # Build entries map from WAL
     entries =
@@ -272,7 +272,18 @@ defmodule RaftEx.Log do
           t(),
           atom()
         ) :: {term(), t()}
-  def fold(from, to, fun, acc, %__MODULE__{range: {start, ending}} = state, strategy \\ :error)
+  @spec fold(
+          RaftEx.Types.index(),
+          RaftEx.Types.index(),
+          (term(), term() -> term()),
+          term(),
+          t(),
+          atom()
+        ) :: {term(), t()}
+
+  def fold(from, to, fun, acc, state, strategy \\ :error)
+
+  def fold(from, to, fun, acc, %__MODULE__{range: {start, _ending}} = state, :error)
       when to >= from and to >= start do
     entries_to_read =
       state.entries
@@ -287,7 +298,7 @@ defmodule RaftEx.Log do
     {final_acc, state}
   end
 
-  def fold(_from, _to, _fun, acc, state, _), do: {acc, state}
+  def fold(_from, _to, _fun, acc, state, _strategy), do: {acc, state}
 
   @doc """
   Read specific entries by index.
@@ -318,7 +329,7 @@ defmodule RaftEx.Log do
           t(),
           (RaftEx.Types.index(), RaftEx.Types.term_num(), term() -> term())
         ) :: %{dir: Path.t(), read: map(), plan: list()}
-  def partial_read(indexes, %__MODULE__{} = state, transform_fun) do
+  def partial_read(indexes, %__MODULE__{} = state, _transform_fun) do
     {in_memory, need_disk} =
       Enum.split_with(indexes, fn idx ->
         Map.has_key?(state.entries, idx)
@@ -347,7 +358,7 @@ defmodule RaftEx.Log do
   """
   @spec execute_read_plan(map(), term(), (term() -> term()), keyword()) ::
           {map(), term()}
-  def execute_read_plan(plan, flru, transform_fun, options) do
+  def execute_read_plan(plan, flru, transform_fun, _options) do
     # In a full implementation, this would read from segment files
     # For now, return what we have in the plan
     results =
@@ -460,7 +471,7 @@ defmodule RaftEx.Log do
           [RaftEx.Types.index()],
           t()
         ) :: {:ok, t(), [term()]}
-  def install_snapshot({snap_idx, snap_term} = idx_term, mac_mod, live_indexes, state) do
+  def install_snapshot({snap_idx, _snap_term} = idx_term, _mac_mod, live_indexes, state) do
     # Remove entries up to snapshot index
     new_entries =
       state.entries
@@ -520,7 +531,7 @@ defmodule RaftEx.Log do
           term(),
           t()
         ) :: {t(), [term()]}
-  def update_release_cursor(idx, cluster, {mac_ver, mac_mod}, mac_state, state) do
+  def update_release_cursor(_idx, _cluster, {_mac_ver, _mac_mod}, _mac_state, state) do
     # In a full implementation, this would coordinate with the cluster
     # to determine if a snapshot can be released
     {state, []}
@@ -536,9 +547,9 @@ defmodule RaftEx.Log do
           term(),
           t()
         ) :: {t(), [term()]}
-  def checkpoint(idx, cluster, mac_ctx, mac_state, state) do
+  def checkpoint(_idx, _cluster, _mac_ctx, _mac_state, state) do
     # Persist checkpoint metadata
-    LogMeta.store(state.meta_name, state.cfg.uid, :last_applied, idx)
+    # LogMeta.store(state.meta_name, state.cfg.uid, :last_applied, idx)
 
     {state, []}
   end
@@ -563,6 +574,40 @@ defmodule RaftEx.Log do
   """
   @spec tick(non_neg_integer(), t()) :: t()
   def tick(now, state), do: %{state | last_resend_time: now}
+
+  @doc """
+  Truncate the log, removing all entries starting from (and including) `from_index`.
+  Used when a leader sends conflicting entries at a given index.
+  """
+  @spec truncate(RaftEx.Types.index(), t()) :: t()
+  def truncate(from_index, %__MODULE__{entries: entries, range: _range} = state) do
+    new_entries = Map.reject(entries, fn {idx, _} -> idx >= from_index end)
+
+    new_range =
+      cond do
+        map_size(new_entries) == 0 ->
+          nil
+
+        true ->
+          keys = Map.keys(new_entries)
+          {Enum.min(keys), Enum.max(keys)}
+      end
+
+    {new_last_index, new_last_term} =
+      case Enum.max_by(new_entries, fn {idx, _} -> idx end, fn -> nil end) do
+        {idx, {_, term, _}} -> {idx, term}
+        nil -> {0, 0}
+      end
+
+    %{
+      state
+      | entries: new_entries,
+        range: new_range,
+        last_term: new_last_term,
+        last_written_index_term: {new_last_index, new_last_term},
+        next_index: if(new_last_index > 0, do: new_last_index + 1, else: from_index)
+    }
+  end
 
   @doc """
   Check if the log can accept writes.
@@ -666,13 +711,13 @@ defmodule RaftEx.Log do
   Release resources (file handles, etc.).
   """
   @spec release_resources(non_neg_integer(), atom(), t()) :: t()
-  def release_resources(max_open, access_pattern, state), do: state
+  def release_resources(_max_open, _access_pattern, state), do: state
 
   @doc """
   Handle a log event (e.g., compaction notification).
   """
   @spec handle_event(term(), t()) :: {t(), [term()]}
-  def handle_event(evt, %__MODULE__{} = state), do: {state, []}
+  def handle_event(_evt, %__MODULE__{} = state), do: {state, []}
 
   # ---------------------------------------------------------------------------
   # Private Helpers

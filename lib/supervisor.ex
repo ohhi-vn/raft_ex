@@ -19,6 +19,7 @@ defmodule RaftEx.Supervisor do
     children = [
       RaftEx.MachineEts,
       RaftEx.MetricsEts,
+      RaftEx.NodeMonitor,
       {RaftEx.SystemsSupervisor, []}
     ]
 

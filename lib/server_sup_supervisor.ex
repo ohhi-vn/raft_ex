@@ -48,7 +48,7 @@ defmodule RaftEx.ServerSupSupervisor do
         {:error, :system_not_started}
 
       sys_cfg ->
-        config = Map.put(config0, :system_config, sys_cfg)
+        config = config0 |> Map.put(:system_config, sys_cfg) |> Map.put(:system, system)
         {:ok, sup_name} = RaftEx.System.lookup_name(system, :server_sup)
 
         spec = %{

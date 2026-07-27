@@ -186,8 +186,8 @@ defmodule RaftEx.LogWal do
     :ok = File.mkdir_p!(wal_dir)
 
     wal_file = wal_file_path(config)
-    max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
-    sync_method = Map.get(config, :wal_sync_method, :datasync)
+    _max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
+    _sync_method = Map.get(config, :wal_sync_method, :datasync)
     compute_checksums = Map.get(config, :wal_compute_checksums, true)
 
     # Recover existing WAL entries
@@ -442,7 +442,7 @@ defmodule RaftEx.LogWal do
       end
 
     # Truncate WAL file
-    :ok = :file.truncate(state.wal_fd, 0)
+    :ok = :file.truncate(state.wal_fd)
     {:ok, 0} = :file.position(state.wal_fd, :bof)
 
     Logger.info("RaftEx.LogWal: truncated to index #{index}, new first_index=#{new_first_index}")
@@ -478,7 +478,7 @@ defmodule RaftEx.LogWal do
   end
 
   defp do_recover(fd, compute_checksums, acc) do
-    header_size = @header_size + if(compute_checksums, do: @footer_size, else: 0)
+    _header_size = @header_size + if(compute_checksums, do: @footer_size, else: 0)
 
     case :file.read(fd, @header_size) do
       {:ok, <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned>>} ->

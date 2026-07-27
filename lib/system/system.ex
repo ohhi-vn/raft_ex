@@ -42,6 +42,10 @@ defmodule RaftEx.System do
       default_max_pipeline_count: 4096,
       default_max_append_entries_rpc_batch_size: 128,
       machine_upgrade_strategy: :all,
+      broadcast_time: 100,
+      election_timeout_min: 500,
+      election_timeout_max: 2000,
+      heartbeat_interval: 100,
       names: default_names()
     }
   end

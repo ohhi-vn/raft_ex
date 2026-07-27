@@ -36,7 +36,9 @@ defmodule RaftEx.Counters do
 
   @spec new(term(), list(), map()) :: :ok
   def new(name, fields_spec, labels) do
-    if seshat_available?(), do: :seshat.new(@group, name, fields_spec, labels)
+    if seshat_available?() do
+      :seshat.new({@group, name}, fields_spec, labels)
+    end
     :ok
   end
 
@@ -57,7 +59,7 @@ defmodule RaftEx.Counters do
 
   @spec overview() :: map()
   def overview do
-    if seshat_available?(), do: :seshat.counters(@group), else: %{}
+    if seshat_available?(), do: :seshat.counters(@group, :all), else: %{}
   end
 
   @spec overview(term()) :: map()

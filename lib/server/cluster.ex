@@ -7,12 +7,11 @@ defmodule RaftEx.Server.Cluster do
   so that `RaftEx.Server` stays focused on the Raft protocol.
   """
 
-  alias RaftEx.Server.Config
   alias RaftEx.Types
 
   @type peer_state :: Types.peer_state()
-  @type cluster    :: Types.cluster()
-  @type server_id  :: Types.server_id()
+  @type cluster :: Types.cluster()
+  @type server_id :: Types.server_id()
 
   # ---------------------------------------------------------------------------
   # Construction
