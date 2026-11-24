@@ -202,7 +202,7 @@ defmodule RaftEx.App.ServerRuntime do
 
     state =
       if from_pid,
-        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
     case handle_leader(inner_msg, state) do
@@ -271,7 +271,7 @@ defmodule RaftEx.App.ServerRuntime do
 
     state =
       if from_pid,
-        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
     case handle_follower(inner_msg, state) do
@@ -330,7 +330,7 @@ defmodule RaftEx.App.ServerRuntime do
 
     state =
       if from_pid,
-        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
     case handle_follower(inner_msg, state) do
@@ -418,7 +418,7 @@ defmodule RaftEx.App.ServerRuntime do
 
     state =
       if from_pid,
-        do: put_in(state0, [:server_state, :rpc_from], pid_to_server_id(from_pid)),
+        do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
     case handle_follower(inner_msg, state) do
@@ -771,6 +771,30 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions}
   end
 
+  defp handle_effect(raft_state, {:apply_committed, idx}, evt_type, %{server_state: ss0} = state, actions) do
+    {ss, effects} = RaftEx.Domain.Server.apply_committed(idx, ss0)
+    handle_effects(raft_state, effects, evt_type, %{state | server_state: ss}, actions)
+  end
+
+  defp handle_effect(_, {:broadcast_commit, idx}, _, %{server_state: ss} = state, actions) do
+    leader = ss.cfg.id
+
+    for peer <- Map.keys(ss.cluster) -- [leader] do
+      send_rpc(
+        peer,
+        %RaftEx.Domain.Types.HeartbeatRpc{
+          leader_id: leader,
+          term: ss.current_term,
+          query_index: 0,
+          commit_index: idx
+        },
+        state
+      )
+    end
+
+    {state, actions}
+  end
+
   defp handle_effect(_, _, _, state, actions), do: {state, actions}
 
   defp send_rpc({name, node} = to, msg, state) do
@@ -895,7 +919,8 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp pid_to_server_id(pid) do
     case Process.info(pid, :registered_name) do
-      [{:registered_name, name}] -> {name, node()}
+      {:registered_name, name} when is_atom(name) -> {name, node()}
+      [{:registered_name, name}] when is_atom(name) -> {name, node()}
       _ -> nil
     end
   end

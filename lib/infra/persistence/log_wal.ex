@@ -189,7 +189,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   def init(config) do
     Process.flag(:trap_exit, true)
 
-    wal_dir = Map.get(config, :data_dir, ".")
+    wal_dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
     :ok = File.mkdir_p!(wal_dir)
 
     wal_file = wal_file_path(config)
@@ -300,7 +300,10 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # ---------------------------------------------------------------------------
 
   defp wal_file_path(config) do
-    data_dir = Map.get(config, :data_dir, ".")
+    # LogWalSupervisor builds this config with `:dir` (from the system's
+    # `:wal_data_dir`); fall back to `:data_dir` for callers that pass the
+    # full system config directly.
+    data_dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
     Path.join(data_dir, "wal.dat")
   end
 

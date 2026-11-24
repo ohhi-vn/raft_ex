@@ -357,8 +357,8 @@ defmodule RaftEx do
 
     counters =
       case RaftEx.Infra.Observability.Counters.counters(server_id, fields) do
-        nil -> %{}
-        c -> c
+        c when is_map(c) -> c
+        _ -> %{}
       end
 
     case Process.whereis(name) do

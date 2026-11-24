@@ -413,7 +413,8 @@ defmodule RaftEx.Domain.Server.RpcHandler do
         %Types.HeartbeatRpc{
           term: leader_term,
           leader_id: leader_id,
-          query_index: query_index
+          query_index: query_index,
+          commit_index: commit_index
         },
         %{current_term: current_term} = state
       ) do
@@ -428,16 +429,24 @@ defmodule RaftEx.Domain.Server.RpcHandler do
         {state, effects}
 
       leader_term >= current_term ->
-        state = update_term(state, leader_term)
-        state = %{state | leader_id: leader_id}
+        old_commit = Map.get(state, :commit_index, 0)
+        new_commit = max(old_commit, commit_index || 0)
+
+        state =
+          state
+          |> update_term(leader_term)
+          |> Map.put(:leader_id, leader_id)
+          |> Map.put(:commit_index, new_commit)
 
         reply = %Types.HeartbeatReply{
           query_index: query_index,
           term: leader_term
         }
 
-        effects = [{:send_rpc, leader_id, reply}]
-        {state, effects}
+        apply_effects =
+          if new_commit > old_commit, do: [{:apply_committed, new_commit}], else: []
+
+        {state, [{:send_rpc, leader_id, reply} | apply_effects]}
     end
   end
 
@@ -580,7 +589,11 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
     if new_commit_index > state.commit_index do
       state = %{state | commit_index: new_commit_index}
-      effects = [{:apply_committed, new_commit_index}]
+      effects = [
+        {:apply_committed, new_commit_index},
+        {:broadcast_commit, new_commit_index}
+      ]
+
       {state, effects}
     else
       {state, []}

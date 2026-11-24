@@ -19,7 +19,14 @@ defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
       type: :supervisor
     }
 
-    DynamicSupervisor.start_child(__MODULE__, spec)
+    case DynamicSupervisor.start_child(__MODULE__, spec) do
+      {:ok, pid} ->
+        :persistent_term.put(pid_key(name), pid)
+        {:ok, pid}
+
+      other ->
+        other
+    end
   end
 
   def stop_system(config) when is_map(config), do: stop_system(config.name)
@@ -27,12 +34,30 @@ defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
   def stop_system(name) when is_atom(name) do
     children = DynamicSupervisor.which_children(__MODULE__)
 
-    case Enum.find(children, fn {id, _, _, _} -> id == name end) do
-      nil -> :ok
-      {_, pid, _, _} -> DynamicSupervisor.terminate_child(__MODULE__, pid)
-    end
-    |> tap(fn _ ->
-      :persistent_term.erase({:"$ra_system", name})
-    end)
+    pid =
+      case :persistent_term.get(pid_key(name), nil) do
+        nil ->
+          case Enum.find(children, fn {id, _, _, _} -> id == name end) do
+            nil -> nil
+            {_, child_pid, _, _} -> child_pid
+          end
+
+        stored ->
+          if Enum.any?(children, fn {_, child_pid, _, _} -> child_pid == stored end),
+            do: stored,
+            else: nil
+      end
+
+    result =
+      case pid do
+        nil -> :ok
+        child_pid -> DynamicSupervisor.terminate_child(__MODULE__, child_pid)
+      end
+
+    :persistent_term.erase(pid_key(name))
+    :persistent_term.erase({:"$ra_system", name})
+    result
   end
+
+  defp pid_key(name), do: {:"$ra_system_pid", name}
 end

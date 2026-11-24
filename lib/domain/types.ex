@@ -107,8 +107,8 @@ defmodule RaftEx.Domain.Types do
   end
 
   defmodule HeartbeatRpc do
-    @moduledoc "Lightweight heartbeat used for consistent query acknowledgement."
-    defstruct [:query_index, :term, :leader_id]
+    @moduledoc "Lightweight heartbeat used for consistent query acknowledgement and commit propagation."
+    defstruct [:query_index, :term, :leader_id, :commit_index]
   end
 
   defmodule HeartbeatReply do

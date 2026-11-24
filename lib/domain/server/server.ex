@@ -281,6 +281,11 @@ defmodule RaftEx.Domain.Server do
     end
   end
 
+  def handle_follower(%Types.HeartbeatRpc{} = rpc, state) do
+    {state, effects} = RaftEx.Domain.Server.RpcHandler.handle_heartbeat_rpc(rpc, state)
+    {:follower, state, effects}
+  end
+
   def handle_follower(:election_timeout, state) do
     call_for_election(:pre_vote, state)
   end
@@ -607,6 +612,9 @@ defmodule RaftEx.Domain.Server do
   # Private — log application
   # ---------------------------------------------------------------------------
 
+  @doc false
+  def apply_committed(apply_to, state), do: apply_committed_entries(apply_to, state, [])
+
   # Apply all log entries up to `apply_to` against the state machine.
   defp apply_committed_entries(apply_to, state, effects) do
     do_apply_entries(apply_to, &apply_entry/2, %{}, effects, state)
@@ -676,14 +684,18 @@ defmodule RaftEx.Domain.Server do
     ts = Map.get(cmd_meta, :ts, last_ts)
     {next_mac_st, reply, mac_effs} = Machine.apply(module, meta, cmd, mac_st)
 
+    machine_effects = Effects.append_machine_effects(mac_effs, effects0)
+
+    # Only the leader owns the caller's reply alias. Followers applying the
+    # same committed entry must not send a second reply to the client.
+    leader? = is_nil(state.leader_id) or state.leader_id == state.cfg.id
+
     {effects, notifys} =
-      Effects.add_reply(
-        cmd_meta,
-        reply,
-        reply_mode,
-        Effects.append_machine_effects(mac_effs, effects0),
-        notifys0
-      )
+      if leader? do
+        Effects.add_reply(cmd_meta, reply, reply_mode, machine_effects, notifys0)
+      else
+        {machine_effects, notifys0}
+      end
 
     {module, idx, state, next_mac_st, effects, notifys, ts}
   end
@@ -1045,6 +1057,7 @@ defmodule RaftEx.Domain.Server do
            query_index: qi,
            queries_waiting_heartbeats: waiting0,
            current_term: term,
+           commit_index: ci,
            cfg: %Config{id: id},
            cluster: cluster
          } = state0
@@ -1056,16 +1069,24 @@ defmodule RaftEx.Domain.Server do
     else
       new_qi = qi + 1
       state = %{state0 | query_index: new_qi}
-      effects = heartbeat_rpc_effects(peer_map, id, term, new_qi)
+      effects = heartbeat_rpc_effects(peer_map, id, term, new_qi, ci)
       waiting1 = :queue.in({new_qi, query_ref}, waiting0)
       {%{state | queries_waiting_heartbeats: waiting1}, effects}
     end
   end
 
-  defp heartbeat_rpc_effects(peers_map, id, term, qi) do
+  defp heartbeat_rpc_effects(peers_map, id, term, qi, commit_index) do
     Enum.flat_map(peers_map, fn
       {peer_id, %{status: :normal, query_index: pqi}} when pqi < qi ->
-        [{:send_rpc, peer_id, %Types.HeartbeatRpc{query_index: qi, term: term, leader_id: id}}]
+        [
+          {:send_rpc, peer_id,
+           %Types.HeartbeatRpc{
+             query_index: qi,
+             term: term,
+             leader_id: id,
+             commit_index: commit_index
+           }}
+        ]
 
       _ ->
         []

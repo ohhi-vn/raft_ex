@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - Current
+## [0.3.0] - Current
+
+### Added
+- **Commit Index Propagation via Heartbeats**: Added a `:commit_index` field to `RaftEx.Domain.Types.HeartbeatRpc`. Leader heartbeats now carry the current commit index; followers advance their own commit index from it and apply newly committed entries. Leaders rebroadcast commit advances to their peers, and followers handle `HeartbeatRpc` explicitly via `RaftEx.Domain.Server.handle_follower/2`.
+- Exposed `RaftEx.Domain.Server.apply_committed/2` for applying committed log entries to the state machine.
+
+### Changed
+- **Follower Reply Ownership**: Followers applying committed entries no longer emit client replies. Only the leader owns the caller's reply alias, preventing duplicate responses when the same entry is applied across the cluster.
+- **System Lifecycle Tracking**: `RaftEx.Infra.Supervisor.SystemsSupervisor` now records started system PIDs in `:persistent_term` and uses them in `stop_system/1` to reliably terminate the correct child, falling back to child-ID lookup when no stored PID is available.
+
+### Fixed
+- **WAL Directory Config**: `RaftEx.Infra.Persistence.LogWal` now reads the `:dir` key (as built by `LogWalSupervisor` from `:wal_data_dir`), falling back to `:data_dir` for callers passing the full system config directly.
+- **RPC Sender Resolution**: `RaftEx.App.ServerRuntime.pid_to_server_id/1` now handles both the tuple and list forms returned by `Process.info(pid, :registered_name)` and guards against non-atom names.
+- **Metrics Safety**: `RaftEx.key_metrics/1` now normalizes non-map counter values (e.g. `:undefined` for unregistered servers) to an empty map instead of raising `BadMapError`.
+
+## [0.2.0] - 2026-11-24
 
 ### Added
 - **Clean Architecture Layout**: Modules reorganized into four layers — `RaftEx.Domain.*` (pure Raft logic), `RaftEx.App.*` (OTP orchestration), `RaftEx.Infra.*` (adapters), and the top-level `RaftEx` public facade. The Raft core can now be exercised without starting OTP.
