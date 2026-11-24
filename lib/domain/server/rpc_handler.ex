@@ -589,6 +589,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
     if new_commit_index > state.commit_index do
       state = %{state | commit_index: new_commit_index}
+
       effects = [
         {:apply_committed, new_commit_index},
         {:broadcast_commit, new_commit_index}

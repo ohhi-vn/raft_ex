@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - Current
+## [0.3.1] - Current
+
+### Added
+- **Per-Server WAL Isolation**: Each server (identified by its `:uid`) now owns its own WAL file at `<wal_data_dir>/<uid>/wal.dat`, with an independent buffer, index range, file handle, and pending-write set. A single WAL process can serve every server in a system without interleaving their entries. The WAL APIs now take a `uid`: `append/4`, `append_async/3`, `truncate/4`, `info/2`, and `read/4`; `overview/1` reports aggregate state across all files.
+- **Deterministic Cluster UIDs**: `RaftEx.new_uid/1` now derives a stable UID from a SHA-256 digest of the source, so restarting or re-forming a cluster with the same name recovers its existing log instead of starting from an empty directory.
+- **Leaderboard.forget_leader/1**: Added a helper that clears a stopped server's cached leader entry while retaining the cluster's member list, so `find_leader/1` can still query the remaining members.
+
+### Changed
+- **WAL Record Format v2**: WAL records now include the entries-blob byte size in the header so each record can be read back exactly. Legacy v1 records (count-only header) can no longer be decoded reliably; recovery now stops cleanly instead of returning a partial log.
+- **Synchronous `last_applied` Checkpointing**: `RaftEx.Domain.Server.persist_last_applied/1` now uses `LogMeta.store_sync/4` and is checkpointed immediately when committed entries are applied. This prevents a client-visible state change from being lost if the server is stopped in the same tick.
+- **Cross-Node RPC Routing**: Remote `safe_call/3` now uses `:erpc` to invoke a local entry point on the target node, with structured error mapping (`:noproc`, `:nodedown`, `:shutdown`, timeouts). `pid_to_server_id/1` resolves registered names on remote nodes via `:erpc`. Remote sends now wrap messages with the sender pid so the receiver can derive `rpc_from`, matching the local send path.
+- **WAL-Backed Leader Appends**: Leader command and cluster-change entries now go through `Log.write/2` (write-ahead) instead of in-memory `Log.append/2`, with graceful `{:not_appended, reason, ...}` handling when the WAL is unavailable.
+
+### Fixed
+- **Server Stop/Delete Reliability**: `stop_server/2` and `delete_server/2` now locate the server's supervisor child by walking the `DynamicSupervisor` tree and delegate termination to `stop_server_rpc/2`, which also forgets the cached leader. Deleting an already-stopped server is now idempotent instead of raising `FunctionClauseError`.
+- **Recovery Fold Strategy**: `RaftEx.Infra.Persistence.Log.fold/6` now handles the `:return` strategy used when scanning entries above the commit index during recovery.
+
+## [0.3.0] - 2026-11-24
 
 ### Added
 - **Commit Index Propagation via Heartbeats**: Added a `:commit_index` field to `RaftEx.Domain.Types.HeartbeatRpc`. Leader heartbeats now carry the current commit index; followers advance their own commit index from it and apply newly committed entries. Leaders rebroadcast commit advances to their peers, and followers handle `HeartbeatRpc` explicitly via `RaftEx.Domain.Server.handle_follower/2`.

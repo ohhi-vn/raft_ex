@@ -508,6 +508,25 @@ defmodule RaftEx.App.ServerRuntime do
     end
   end
 
+  @doc false
+  def statem_call_local(name, msg, timeout) when is_atom(name),
+    do: statem_call(name, msg, timeout)
+
+  defp safe_call({name, node}, msg, timeout) when node != node() do
+    try do
+      case :erpc.call(node, __MODULE__, :statem_call_local, [name, msg, timeout]) do
+        {:badrpc, reason} -> {:error, reason}
+        reply -> reply
+      end
+    catch
+      :exit, {:timeout, _} -> :timeout
+      :exit, {:noproc, _} -> {:error, :noproc}
+      :exit, {{:nodedown, _}, _} -> {:error, :nodedown}
+      :exit, {:shutdown, _} -> {:error, :shutdown}
+      :exit, {reason, _} -> {:error, reason}
+    end
+  end
+
   defp safe_call(server_id, msg, timeout) do
     try do
       :gen_statem.call(server_id, msg, timeout)
@@ -771,8 +790,20 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions}
   end
 
-  defp handle_effect(raft_state, {:apply_committed, idx}, evt_type, %{server_state: ss0} = state, actions) do
+  defp handle_effect(
+         raft_state,
+         {:apply_committed, idx},
+         evt_type,
+         %{server_state: ss0} = state,
+         actions
+       ) do
     {ss, effects} = RaftEx.Domain.Server.apply_committed(idx, ss0)
+
+    # Checkpoint the applied index immediately: a client may observe the
+    # state machine change in the same tick the server is stopped, leaving no
+    # subsequent message to trigger the lazy persistence in handle_leader.
+    ss = RaftEx.Domain.Server.persist_last_applied(ss)
+
     handle_effects(raft_state, effects, evt_type, %{state | server_state: ss}, actions)
   end
 
@@ -918,9 +949,22 @@ defmodule RaftEx.App.ServerRuntime do
   defp unwrap_from(msg), do: {nil, unwrap_rpc(msg)}
 
   defp pid_to_server_id(pid) do
-    case Process.info(pid, :registered_name) do
-      {:registered_name, name} when is_atom(name) -> {name, node()}
-      [{:registered_name, name}] when is_atom(name) -> {name, node()}
+    pid_node = node(pid)
+
+    info =
+      if pid_node == node() do
+        Process.info(pid, :registered_name)
+      else
+        try do
+          :erpc.call(pid_node, Process, :info, [pid, :registered_name], 2_000)
+        catch
+          _, _ -> nil
+        end
+      end
+
+    case info do
+      {:registered_name, name} when is_atom(name) -> {name, pid_node}
+      [{:registered_name, name}] when is_atom(name) -> {name, pid_node}
       _ -> nil
     end
   end

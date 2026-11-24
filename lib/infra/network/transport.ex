@@ -136,7 +136,9 @@ defmodule RaftEx.Infra.Network.Transport do
 
   defp do_send_remote({name, node}, msg) do
     if Node.connect(node) do
-      send({name, node}, msg)
+      # Include the sender pid so the receiving state machine can derive
+      # `rpc_from` and correlate replies (same shape as the local send path).
+      send({name, node}, {self(), msg})
       :ok
     else
       {:error, :noconnection}

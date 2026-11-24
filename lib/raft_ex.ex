@@ -463,9 +463,21 @@ defmodule RaftEx do
 
   # ---- uid ---------------------------------------------------------
 
+  @doc """
+  Derive a stable UID for a cluster name.
+
+  The UID is deterministic so restarting or re-forming a cluster with the same
+  name recovers its existing log instead of starting from an empty directory.
+  """
   def new_uid(source) when is_binary(source) do
     prefix = RaftEx.Domain.Utils.derive_safe_string(source, 6)
-    RaftEx.Domain.Utils.make_uid(String.upcase(prefix))
+
+    digest =
+      :crypto.hash(:sha256, source)
+      |> Base.encode16(case: :upper)
+      |> binary_part(0, 12)
+
+    String.upcase(prefix) <> digest
   end
 
   # ---- internal ----------------------------------------------------

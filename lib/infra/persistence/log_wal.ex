@@ -13,14 +13,24 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
   ## Architecture
 
-  The WAL maintains an in-memory buffer of pending entries. When a write
-  request arrives, entries are added to the buffer. A flush is triggered
+  A single WAL process serves every server in a system, but each server
+  (identified by its `:uid`) owns its own WAL file, its own buffer and its own
+  index range.  Servers may not share a WAL file: entries are only indexed by
+  their per-server log index, so interleaving two servers in one file would
+  make recovery impossible.
+
+  Files live at `<wal_data_dir>/<uid>/wal.dat`, which is exactly where
+  `RaftEx.Infra.Persistence.Log` looks when it recovers on startup.
+
+  The WAL maintains an in-memory buffer of pending entries per file. When a
+  write request arrives, entries are added to the buffer. A flush is triggered
   when:
+
   - The buffer reaches `wal_max_batch_size`
   - A synchronous write is requested
   - A periodic timer fires
 
-  Entries are written to a single WAL file with a simple binary format:
+  Entries are written to a WAL file with a simple binary format:
   ```
   <<magic::32, version::8, entry_count::32, entries::binary, crc::32>>
   ```
@@ -28,8 +38,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   ## Integration
 
   Started by `RaftEx.Infra.Persistence.LogWalSupervisor` as part of the system supervision tree.
-  The Log module sends `{:append, entries, reply_to}` messages and receives
-  `{:written, from_index, to_index}` notifications.
+  The Log module sends `{:append, uid, entries}` messages and receives
+  `{:wal_written, first_index, last_index}` notifications.
   """
 
   use GenServer
@@ -37,9 +47,9 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
   # "RAWL"
   @magic 0x5241574C
-  @version 1
-  # 4 (magic) + 1 (version) + 4 (count)
-  @header_size 9
+  # v2 adds the byte size of the entries blob to the header, so recovery can
+  # read it exactly.  v1 only stored a count and could not be read back.
+  @version 2
   # crc32
   @footer_size 4
 
@@ -52,25 +62,25 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
   defstruct [
     :config,
-    :wal_file,
-    :wal_fd,
-    :buffer,
-    :pending_writes,
-    :first_index,
-    :last_index,
-    :file_size,
+    :files,
     :flush_timer
   ]
 
-  @type state :: %__MODULE__{
+  @type file_state :: %{
+          required(:path) => Path.t(),
+          required(:fd) => :file.io_device() | nil,
+          required(:buffer) => [
+            {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}
+          ],
+          required(:pending_writes) => [{pid(), reference()}],
+          required(:first_index) => RaftEx.Domain.Types.index(),
+          required(:last_index) => RaftEx.Domain.Types.index(),
+          required(:file_size) => non_neg_integer()
+        }
+
+  @type t :: %__MODULE__{
           config: map(),
-          wal_file: Path.t(),
-          wal_fd: :file.io_device() | nil,
-          buffer: [{RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}],
-          pending_writes: [{pid(), reference()}],
-          first_index: RaftEx.Domain.Types.index(),
-          last_index: RaftEx.Domain.Types.index(),
-          file_size: non_neg_integer(),
+          files: %{optional(term()) => file_state()},
           flush_timer: reference() | nil
         }
 
@@ -84,7 +94,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   ## Options
 
   - `:names` - Map of process names including `:wal`
-  - `:data_dir` - Directory to store WAL files
+  - `:dir` / `:data_dir` - Base directory; one `wal.dat` per server uid is kept
+    under `<dir>/<uid>/`
   - `:wal_max_size_bytes` - Maximum WAL file size before rotation
   - `:wal_max_batch_size` - Maximum entries per batch write
   - `:wal_sync_method` - `:datasync`, `:fsync`, or `:none`
@@ -96,89 +107,81 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   @doc """
-  Append entries to the WAL.
+  Append entries to a server's WAL.
 
   Returns `{:ok, first_index, last_index}` when entries are durably written.
   """
   @spec append(
           atom(),
+          term(),
           [{RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}],
           timeout()
         ) ::
           {:ok, RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index()} | {:error, term()}
-  def append(wal_name, entries, timeout \\ 5_000) do
-    GenServer.call(wal_name, {:append, entries}, timeout)
+  def append(wal_name, uid, entries, timeout \\ 5_000) do
+    GenServer.call(wal_name, {:append, uid, entries}, timeout)
   end
 
   @doc """
-  Asynchronously append entries to the WAL.
+  Asynchronously append entries to a server's WAL.
 
   The caller will receive `{:wal_written, first_index, last_index}` when complete.
   """
-  @spec append_async(atom(), [
-          {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}
-        ]) :: :ok
-  def append_async(wal_name, entries) do
-    GenServer.cast(wal_name, {:append_async, entries, self()})
+  @spec append_async(
+          atom(),
+          term(),
+          [{RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}]
+        ) :: :ok
+  def append_async(wal_name, uid, entries) do
+    GenServer.cast(wal_name, {:append_async, uid, entries, self()})
   end
 
   @doc """
-  Truncate the WAL, removing all entries up to and including `index`.
+  Truncate a server's WAL, removing all entries up to and including `index`.
 
   Used after installing a snapshot to discard old entries.
   """
-  @spec truncate(atom(), RaftEx.Domain.Types.index(), timeout()) :: :ok | {:error, term()}
-  def truncate(wal_name, index, timeout \\ 5_000) do
-    GenServer.call(wal_name, {:truncate, index}, timeout)
+  @spec truncate(atom(), term(), RaftEx.Domain.Types.index(), timeout()) ::
+          :ok | {:error, term()}
+  def truncate(wal_name, uid, index, timeout \\ 5_000) do
+    GenServer.call(wal_name, {:truncate, uid, index}, timeout)
   end
 
   @doc """
-  Get the current WAL state.
+  Get a server's current WAL state.
 
   Returns `{first_index, last_index, buffer_size}`.
   """
-  @spec info(atom()) ::
+  @spec info(atom(), term()) ::
           {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index(), non_neg_integer()}
-  def info(wal_name) do
-    GenServer.call(wal_name, :info)
+  def info(wal_name, uid) do
+    GenServer.call(wal_name, {:info, uid})
   end
 
   @doc """
-  Read entries from the WAL buffer (in-memory only).
+  Read entries from a server's WAL buffer (in-memory only).
 
   Returns entries in the range `[from_index, to_index]`.
   """
-  @spec read(atom(), RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index()) ::
+  @spec read(atom(), term(), RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index()) ::
           [{RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}]
-  def read(wal_name, from_index, to_index) do
-    GenServer.call(wal_name, {:read, from_index, to_index})
+  def read(wal_name, uid, from_index, to_index) do
+    GenServer.call(wal_name, {:read, uid, from_index, to_index})
   end
 
   @doc """
-  Recover entries from the WAL file on startup.
+  Recover entries from a server's WAL file on startup.
+
+  `config` may be `%{data_dir: dir}` pointing at the *server* directory (as
+  `Log.init/1` does) or a full WAL config containing `:dir`/`:data_dir` plus a
+  `:uid`.
 
   Returns `{first_index, last_index, entries}`.
   """
   @spec recover(map()) :: {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index(), list()}
   def recover(config) do
-    wal_file = wal_file_path(config)
-
-    case :prim_file.read_file_info(wal_file) do
-      {:ok, _} ->
-        case :file.open(wal_file, [:read, :binary, :raw]) do
-          {:ok, fd} ->
-            compute_checksums = Map.get(config, :wal_compute_checksums, true)
-            entries = do_recover(fd, compute_checksums, [])
-            :file.close(fd)
-            entries
-
-          _ ->
-            {0, 0, []}
-        end
-
-      _ ->
-        {0, 0, []}
-    end
+    wal_file = recover_file_path(config)
+    do_recover_file(wal_file, Map.get(config, :wal_compute_checksums, true))
   end
 
   # ---------------------------------------------------------------------------
@@ -192,197 +195,233 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     wal_dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
     :ok = File.mkdir_p!(wal_dir)
 
-    wal_file = wal_file_path(config)
-    _max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
-    _sync_method = Map.get(config, :wal_sync_method, :datasync)
-    compute_checksums = Map.get(config, :wal_compute_checksums, true)
-
-    # Recover existing WAL entries
-    {first_index, last_index, recovered_entries} = recover_from_file(wal_file, compute_checksums)
-
-    # Open WAL file for appending
-    {:ok, fd} = :file.open(wal_file, [:append, :binary, :raw, :delayed_write])
-
-    # Get current file size
-    {:ok, file_size} = :file.position(fd, :eof)
-
-    flush_timer = start_flush_timer()
-
     state = %__MODULE__{
       config: config,
-      wal_file: wal_file,
-      wal_fd: fd,
-      buffer: recovered_entries,
-      pending_writes: [],
-      first_index: first_index,
-      last_index: last_index,
-      file_size: file_size,
-      flush_timer: flush_timer
+      files: %{},
+      flush_timer: start_flush_timer()
     }
 
-    Logger.info(
-      "RaftEx.Infra.Persistence.LogWal: initialized with #{length(recovered_entries)} recovered entries, " <>
-        "first_index=#{first_index}, last_index=#{last_index}"
-    )
+    Logger.info("RaftEx.Infra.Persistence.LogWal: started, base directory #{wal_dir}")
 
     {:ok, state}
   end
 
   @impl GenServer
-  def handle_call({:append, entries}, from, state) do
-    state = add_to_buffer(entries, state)
-    state = maybe_flush(state, from)
-    # Reply immediately - actual flush happens asynchronously
-    {:reply, {:ok, state.first_index, state.last_index}, state}
+  def handle_call({:append, uid, entries}, from, state) do
+    {file, state} = ensure_file(uid, state)
+    file = add_to_buffer(entries, file)
+    file = maybe_flush(file, from, state.config)
+    state = put_file(uid, file, state)
+    {:reply, {:ok, file.first_index, file.last_index}, state}
   end
 
-  def handle_call({:truncate, index}, _from, state) do
-    state = do_truncate(index, state)
+  def handle_call({:truncate, uid, index}, _from, state) do
+    state =
+      case Map.fetch(state.files, uid) do
+        {:ok, file} ->
+          file = do_truncate(index, file)
+          put_file(uid, file, state)
+
+        :error ->
+          state
+      end
+
     {:reply, :ok, state}
   end
 
-  def handle_call(:info, _from, state) do
-    {:reply, {state.first_index, state.last_index, length(state.buffer)}, state}
+  def handle_call({:info, uid}, _from, state) do
+    reply =
+      case Map.fetch(state.files, uid) do
+        {:ok, file} -> {file.first_index, file.last_index, length(file.buffer)}
+        :error -> {0, 0, 0}
+      end
+
+    {:reply, reply, state}
   end
 
-  def handle_call({:read, from_index, to_index}, _from, state) do
+  def handle_call(:overview, _from, state) do
+    files = state.files
+    buffers = Enum.map(files, fn {_uid, file} -> length(file.buffer) end)
+    indexes = Map.values(files)
+
+    reply = %{
+      files: map_size(files),
+      first_index: indexes |> Enum.map(& &1.first_index) |> Enum.min(fn -> 0 end),
+      last_index: indexes |> Enum.map(& &1.last_index) |> Enum.max(fn -> 0 end),
+      buffer_size: Enum.sum(buffers),
+      pending_writes: indexes |> Enum.flat_map(& &1.pending_writes) |> Enum.count()
+    }
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:read, uid, from_index, to_index}, _from, state) do
     entries =
-      state.buffer
-      |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
-      |> Enum.sort_by(fn {idx, _, _} -> idx end)
+      case Map.fetch(state.files, uid) do
+        {:ok, file} ->
+          file.buffer
+          |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
+          |> Enum.sort_by(fn {idx, _, _} -> idx end)
+
+        :error ->
+          []
+      end
 
     {:reply, entries, state}
   end
 
   @impl GenServer
-  def handle_cast({:append_async, entries, reply_to}, state) do
-    state = add_to_buffer(entries, state)
-    state = maybe_flush_async(state, reply_to)
+  def handle_cast({:append_async, uid, entries, reply_to}, state) do
+    {file, state} = ensure_file(uid, state)
+    file = add_to_buffer(entries, file)
+    file = maybe_flush_async(file, reply_to, state.config)
+    state = put_file(uid, file, state)
     {:noreply, state}
   end
 
   @impl GenServer
   def handle_info(:flush_timeout, state) do
-    state = flush_buffer(state)
+    files =
+      Map.new(state.files, fn {uid, file} ->
+        {uid, flush_buffer(file, state.config)}
+      end)
 
-    # Restart the timer
-    flush_timer = start_flush_timer()
-    state = %{state | flush_timer: flush_timer}
-
-    {:noreply, state}
+    {:noreply, %{state | files: files, flush_timer: start_flush_timer()}}
   end
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    # Remove pending write for crashed process
-    pending_writes = Enum.reject(state.pending_writes, fn {p, _} -> p == pid end)
-    {:noreply, %{state | pending_writes: pending_writes}}
+    files =
+      Map.new(state.files, fn {uid, file} ->
+        pending_writes = Enum.reject(file.pending_writes, fn {p, _} -> p == pid end)
+        {uid, %{file | pending_writes: pending_writes}}
+      end)
+
+    {:noreply, %{state | files: files}}
   end
 
   @impl GenServer
   def terminate(_reason, state) do
-    # Flush remaining entries before shutdown
-    state = flush_buffer(state)
+    Enum.each(state.files, fn {_uid, file} ->
+      file = flush_buffer(file, state.config)
 
-    if state.wal_fd do
-      sync_wal(state)
-      :file.close(state.wal_fd)
-    end
+      if file.fd do
+        sync_wal(file, state.config)
+        :file.close(file.fd)
+      end
+    end)
 
-    Logger.info(
-      "RaftEx.Infra.Persistence.LogWal: shutting down, flushed #{length(state.buffer)} entries"
-    )
+    Logger.info("RaftEx.Infra.Persistence.LogWal: shutting down")
 
     :ok
   end
 
   # ---------------------------------------------------------------------------
-  # Private Helpers
+  # File lifecycle
   # ---------------------------------------------------------------------------
 
-  defp wal_file_path(config) do
-    # LogWalSupervisor builds this config with `:dir` (from the system's
-    # `:wal_data_dir`); fall back to `:data_dir` for callers that pass the
-    # full system config directly.
-    data_dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
-    Path.join(data_dir, "wal.dat")
-  end
+  # Return the WAL file for `uid`, opening (and recovering) it on first use.
+  defp ensure_file(uid, state) do
+    case Map.fetch(state.files, uid) do
+      {:ok, file} ->
+        {file, state}
 
-  defp add_to_buffer(entries, state) do
-    new_buffer = state.buffer ++ entries
+      :error ->
+        dir = Map.get(state.config, :dir, Map.get(state.config, :data_dir, "."))
+        path = Path.join([dir, to_string(uid), "wal.dat"])
+        :ok = File.mkdir_p!(Path.dirname(path))
 
-    new_last_index =
-      case entries do
-        [] ->
-          state.last_index
+        checksums = Map.get(state.config, :wal_compute_checksums, true)
+        {first_index, last_index, _entries} = do_recover_file(path, checksums)
 
-        entries ->
-          {last_idx, _, _} = List.last(entries)
-          last_idx
-      end
+        # Entries already in the file must not be buffered again: they are
+        # recovered into the server's log state by `Log.init/1`, and rewriting
+        # them here would duplicate them on every restart.
+        {:ok, fd} = :file.open(path, [:append, :binary, :raw, :delayed_write])
+        {:ok, file_size} = :file.position(fd, :eof)
 
-    %{state | buffer: new_buffer, last_index: new_last_index}
-  end
+        file = %{
+          path: path,
+          fd: fd,
+          buffer: [],
+          pending_writes: [],
+          first_index: first_index,
+          last_index: last_index,
+          file_size: file_size
+        }
 
-  defp maybe_flush(state, from) do
-    max_batch_size = Map.get(state.config, :wal_max_batch_size, 8192)
-
-    if length(state.buffer) >= max_batch_size or from != nil do
-      state = flush_buffer(state)
-
-      if from do
-        send_reply(from, state)
-      end
-
-      state
-    else
-      state
+        {file, %{state | files: Map.put(state.files, uid, file)}}
     end
   end
 
-  defp maybe_flush_async(state, reply_to) do
-    max_batch_size = Map.get(state.config, :wal_max_batch_size, 8192)
+  defp put_file(uid, file, state), do: %{state | files: Map.put(state.files, uid, file)}
 
-    if length(state.buffer) >= max_batch_size do
-      state = flush_buffer(state)
-      send(reply_to, {:wal_written, state.first_index, state.last_index})
-      state
+  # ---------------------------------------------------------------------------
+  # Buffering and flushing
+  # ---------------------------------------------------------------------------
+
+  defp add_to_buffer([], file), do: file
+
+  defp add_to_buffer(entries, file) do
+    new_buffer = file.buffer ++ entries
+    {last_idx, _, _} = List.last(entries)
+
+    %{file | buffer: new_buffer, last_index: last_idx}
+  end
+
+  defp maybe_flush(file, from, config) do
+    max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
+
+    if length(file.buffer) >= max_batch_size or from != nil do
+      file = flush_buffer(file, config)
+
+      if from do
+        send_reply(from, file)
+      end
+
+      file
+    else
+      file
+    end
+  end
+
+  defp maybe_flush_async(file, reply_to, config) do
+    max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
+
+    if length(file.buffer) >= max_batch_size do
+      file = flush_buffer(file, config)
+      send(reply_to, {:wal_written, file.first_index, file.last_index})
+      file
     else
       # Monitor the process in case it crashes
       ref = Process.monitor(reply_to)
-      pending_writes = [{reply_to, ref} | state.pending_writes]
-      %{state | pending_writes: pending_writes}
+      pending_writes = [{reply_to, ref} | file.pending_writes]
+      %{file | pending_writes: pending_writes}
     end
   end
 
-  defp flush_buffer(state) do
-    case state.buffer do
-      [] ->
-        state
+  defp flush_buffer(%{buffer: []} = file, _config), do: file
 
-      entries ->
-        # Write entries to WAL file and get updated state
-        state = write_entries_to_wal(entries, state)
+  defp flush_buffer(file, config) do
+    entries = file.buffer
+    file = write_entries_to_wal(entries, file, config)
+    sync_wal(file, config)
+    notify_pending_writes(file)
 
-        # Sync to disk if configured
-        sync_wal(state)
-
-        # Notify pending writers
-        notify_pending_writes(state)
-
-        # Clear buffer and return updated state
-        %{state | buffer: [], pending_writes: []}
-    end
+    %{file | buffer: [], pending_writes: []}
   end
 
-  defp write_entries_to_wal(entries, state) do
-    compute_checksums = Map.get(state.config, :wal_compute_checksums, true)
+  defp write_entries_to_wal(entries, file, config) do
+    compute_checksums = Map.get(config, :wal_compute_checksums, true)
 
     # Serialize entries
     entries_binary = :erlang.term_to_binary(entries)
 
     # Build WAL record
     count = length(entries)
-    header = <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned>>
+    blob_size = byte_size(entries_binary)
+
+    header =
+      <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned, blob_size::32-unsigned>>
 
     data =
       if compute_checksums do
@@ -396,60 +435,56 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     data_size = :erlang.iolist_size(data)
 
     # Write to file
-    case :file.write(state.wal_fd, data) do
+    case :file.write(file.fd, data) do
       :ok ->
-        new_file_size = state.file_size + data_size
-        %{state | file_size: new_file_size}
+        %{file | file_size: file.file_size + data_size}
 
       error ->
         Logger.error(
           "RaftEx.Infra.Persistence.LogWal: failed to write WAL entries: #{inspect(error)}"
         )
 
-        state
+        file
     end
   end
 
-  defp sync_wal(state) do
-    sync_method = Map.get(state.config, :wal_sync_method, :datasync)
+  defp sync_wal(file, config) do
+    sync_method = Map.get(config, :wal_sync_method, :datasync)
 
     case sync_method do
       :fsync ->
-        :file.sync(state.wal_fd)
+        :file.sync(file.fd)
 
       :datasync ->
-        :file.datasync(state.wal_fd)
+        :file.datasync(file.fd)
 
       :none ->
         :ok
 
       _ ->
-        :file.datasync(state.wal_fd)
+        :file.datasync(file.fd)
     end
   end
 
-  defp notify_pending_writes(state) do
-    Enum.each(state.pending_writes, fn {pid, _ref} ->
-      send(pid, {:wal_written, state.first_index, state.last_index})
+  defp notify_pending_writes(file) do
+    Enum.each(file.pending_writes, fn {pid, _ref} ->
+      send(pid, {:wal_written, file.first_index, file.last_index})
     end)
   end
 
-  defp send_reply(from, state) do
-    case from do
-      {pid, ref} ->
-        send(pid, {:wal_written, ref, state.first_index, state.last_index})
-
-      pid when is_pid(pid) ->
-        send(pid, {:wal_written, state.first_index, state.last_index})
-
-      _ ->
-        :ok
-    end
+  defp send_reply({pid, ref}, file) do
+    send(pid, {:wal_written, ref, file.first_index, file.last_index})
   end
 
-  defp do_truncate(index, state) do
+  defp send_reply(pid, file) when is_pid(pid) do
+    send(pid, {:wal_written, file.first_index, file.last_index})
+  end
+
+  defp send_reply(_other, _file), do: :ok
+
+  defp do_truncate(index, file) do
     # Remove entries up to and including index
-    new_buffer = Enum.reject(state.buffer, fn {idx, _, _} -> idx <= index end)
+    new_buffer = Enum.reject(file.buffer, fn {idx, _, _} -> idx <= index end)
 
     new_first_index =
       case new_buffer do
@@ -458,17 +493,33 @@ defmodule RaftEx.Infra.Persistence.LogWal do
       end
 
     # Truncate WAL file
-    :ok = :file.truncate(state.wal_fd)
-    {:ok, 0} = :file.position(state.wal_fd, :bof)
+    :ok = :file.truncate(file.fd)
+    {:ok, 0} = :file.position(file.fd, :bof)
 
     Logger.info(
-      "RaftEx.Infra.Persistence.LogWal: truncated to index #{index}, new first_index=#{new_first_index}"
+      "RaftEx.Infra.Persistence.LogWal: truncated to index #{index}, " <>
+        "new first_index=#{new_first_index}"
     )
 
-    %{state | buffer: new_buffer, first_index: new_first_index, file_size: 0}
+    %{file | buffer: new_buffer, first_index: new_first_index, file_size: 0}
   end
 
-  defp recover_from_file(wal_file, compute_checksums) do
+  # ---------------------------------------------------------------------------
+  # Recovery
+  # ---------------------------------------------------------------------------
+
+  defp recover_file_path(%{uid: uid} = config) do
+    # Full WAL config: a uid selects the server's file under the base dir.
+    dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
+    Path.join([dir, to_string(uid), "wal.dat"])
+  end
+
+  defp recover_file_path(config) do
+    # Server directory, as passed by `Log.init/1`.
+    Path.join(Map.fetch!(config, :data_dir), "wal.dat")
+  end
+
+  defp do_recover_file(wal_file, compute_checksums) do
     case :prim_file.read_file_info(wal_file) do
       {:ok, _info} ->
         case :file.open(wal_file, [:read, :binary, :raw]) do
@@ -496,40 +547,48 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   defp do_recover(fd, compute_checksums, acc) do
-    _header_size = @header_size + if(compute_checksums, do: @footer_size, else: 0)
+    case :file.read(fd, 5) do
+      {:ok, <<@magic::32-unsigned, version::8-unsigned>>} ->
+        do_recover_records(fd, version, compute_checksums, acc)
 
-    case :file.read(fd, @header_size) do
-      {:ok, <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned>>} ->
-        # Estimate, will be adjusted
-        entries_size = count * 100
-        {:ok, entries_binary} = :file.read(fd, entries_size)
+      _ ->
+        # Not a WAL file (or a truncated header): stop.
+        acc
+    end
+  end
 
-        # Read footer if checksums enabled
+  defp do_recover_records(fd, @version, compute_checksums, acc) do
+    case :file.read(fd, 8) do
+      {:ok, <<_count::32-unsigned, blob_size::32-unsigned>>} ->
+        {:ok, entries_binary} = :file.read(fd, blob_size)
+
+        # Read the footer when checksums are enabled.
         if compute_checksums do
           case :file.read(fd, @footer_size) do
             {:ok, <<_crc::32-unsigned>>} ->
-              # Validate CRC
-              entries = :erlang.binary_to_term(entries_binary)
-              do_recover(fd, compute_checksums, acc ++ entries)
+              do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
 
             _ ->
               acc
           end
         else
-          entries = :erlang.binary_to_term(entries_binary)
-          do_recover(fd, compute_checksums, acc ++ entries)
+          do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
         end
-
-      {:ok, _} ->
-        # Invalid magic or version, stop recovery
-        acc
-
-      :eof ->
-        acc
 
       _ ->
         acc
     end
+  end
+
+  # v1 only stored a count, so the blob size had to be estimated and the
+  # checksum footer was effectively unreadable.  There is no reliable way to
+  # decode those files; stop instead of returning half a log.
+  defp do_recover_records(_fd, _version, _compute_checksums, acc), do: acc
+
+  defp decode(binary) do
+    :erlang.binary_to_term(binary)
+  rescue
+    ArgumentError -> []
   end
 
   defp start_flush_timer do
@@ -546,16 +605,9 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   @spec overview(atom()) :: map()
   def overview(wal_name) do
     try do
-      {first_index, last_index, buffer_size} = GenServer.call(wal_name, :info)
-
-      %{
-        first_index: first_index,
-        last_index: last_index,
-        buffer_size: buffer_size,
-        pending_writes: 0
-      }
+      GenServer.call(wal_name, :overview, 5_000)
     catch
-      _, _ -> %{first_index: 0, last_index: 0, buffer_size: 0, pending_writes: 0}
+      _, _ -> %{files: 0, first_index: 0, last_index: 0, buffer_size: 0, pending_writes: 0}
     end
   end
 end

@@ -237,8 +237,12 @@ defmodule RaftEx.Infra.Persistence.Log do
         {:ok, state}
 
       _ ->
-        # Write to WAL first (true write-ahead semantics)
-        case LogWal.append(state.wal_name, entries) do
+        # Write to WAL first (true write-ahead semantics).  Each server has its
+        # own WAL file, selected by its uid.  Fixtures may build a log without
+        # a WAL process; in that case the append is in-memory only.
+        log_uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
+
+        case do_wal_write(state.wal_name, log_uid, entries) do
           {:ok, _, _} ->
             # WAL write succeeded, now update in-memory state
             new_state =
@@ -255,6 +259,13 @@ defmodule RaftEx.Infra.Persistence.Log do
         end
     end
   end
+
+  defp do_wal_write(nil, _uid, entries) do
+    last = List.last(entries)
+    {:ok, elem(last, 0), elem(last, 0)}
+  end
+
+  defp do_wal_write(wal_name, uid, entries), do: LogWal.append(wal_name, uid, entries)
 
   # ---------------------------------------------------------------------------
   # Read Operations
@@ -297,6 +308,12 @@ defmodule RaftEx.Infra.Persistence.Log do
       end)
 
     {final_acc, state}
+  end
+
+  # `:return` folds scan the entries above the commit index during recovery.
+  # The scan function owns the accumulator, so it behaves like the plain fold.
+  def fold(from, to, fun, acc, %__MODULE__{} = state, :return) do
+    fold(from, to, fun, acc, state, :error)
   end
 
   def fold(_from, _to, _fun, acc, state, _strategy), do: {acc, state}

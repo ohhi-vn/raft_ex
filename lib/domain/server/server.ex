@@ -123,6 +123,7 @@ defmodule RaftEx.Domain.Server do
       commit_index: commit_index,
       last_applied: snap_idx,
       persisted_last_applied: last_applied,
+      commit_latency: 0,
       log: log,
       machine_state: mac_state,
       aux_state: Machine.init_aux(mac_mod, elem(id, 0)),
@@ -166,7 +167,7 @@ defmodule RaftEx.Domain.Server do
     {to_scan, _} = Log.last_index_term(log1)
 
     {{last_scanned, state3}, log2} =
-      Log.fold(from_scan, to_scan, &cluster_scan_fun/2, {commit_index, state2}, log1, :return)
+      Log.fold(from_scan, to_scan, &cluster_scan_fun/2, {commit_index, state2}, log1)
 
     state =
       if last_scanned < to_scan do
@@ -246,6 +247,10 @@ defmodule RaftEx.Domain.Server do
       when is_map_key(cluster, peer_id) do
     {state, effects} = RaftEx.Domain.Server.RpcHandler.handle_append_entries_reply(reply, state)
     {:leader, state, effects}
+  end
+
+  def handle_leader(%Types.AppendEntriesReply{}, state) do
+    {:leader, state, []}
   end
 
   def handle_leader(_msg, state), do: {:leader, state, []}
@@ -378,7 +383,7 @@ defmodule RaftEx.Domain.Server do
     pla = Map.get(state, :persisted_last_applied, 0)
 
     if la > pla do
-      :ok = LogMeta.store(meta_name(cfg), uid, :last_applied, la)
+      :ok = LogMeta.store_sync(meta_name(cfg), uid, :last_applied, la)
       Map.put(state, :persisted_last_applied, la)
     else
       state
@@ -863,10 +868,16 @@ defmodule RaftEx.Domain.Server do
 
   defp append_log_as_leader(cmd, _, _, %{log: log0, current_term: term} = state, effects) do
     next_idx = Log.next_index(log0)
+    entry = {next_idx, term, cmd}
 
     try do
-      log = Log.append({next_idx, term, cmd}, log0)
-      {:ok, next_idx, term, %{state | log: log}, effects}
+      case Log.write([entry], log0) do
+        {:ok, log} ->
+          {:ok, next_idx, term, %{state | log: log}, effects}
+
+        {:error, reason} ->
+          {:not_appended, reason, state, effects}
+      end
     rescue
       _ -> {:not_appended, :wal_down, state, effects}
     end
@@ -884,17 +895,22 @@ defmodule RaftEx.Domain.Server do
        ) do
     cmd = {:"$ra_cluster_change", from, cluster, reply_mode}
     next_idx = Log.next_index(log0)
+    entry = {next_idx, term, cmd}
 
     try do
-      log = Log.append({next_idx, term, cmd}, log0)
+      case Log.write([entry], log0) do
+        {:ok, log} ->
+          {:ok, next_idx, term,
+           %{
+             state
+             | log: log,
+               cluster_change_permitted: false,
+               cluster_index_term: {next_idx, term}
+           }, effects}
 
-      {:ok, next_idx, term,
-       %{
-         state
-         | log: log,
-           cluster_change_permitted: false,
-           cluster_index_term: {next_idx, term}
-       }, effects}
+        {:error, reason} ->
+          {:not_appended, reason, state, effects}
+      end
     rescue
       e ->
         Logger.error("RaftEx.Domain.Server: append_cluster_change failed: #{inspect(e)}")

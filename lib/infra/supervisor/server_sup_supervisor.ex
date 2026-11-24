@@ -100,10 +100,28 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
     node = RaftEx.Domain.Utils.ra_server_id_node(server_id)
     ra_name = RaftEx.Domain.Utils.ra_server_id_to_local_name(server_id)
 
-    case :rpc.call(node, __MODULE__, :prepare_server_stop_rpc, [system, ra_name]) do
-      {:ok, nil, _} -> :ok
-      {:ok, pid, srv_sup} -> Supervisor.terminate_child({srv_sup, node}, pid)
-      err -> {:error, err}
+    case :rpc.call(node, __MODULE__, :stop_server_rpc, [system, ra_name]) do
+      :ok -> :ok
+      {:error, _} = err -> err
+      other -> {:error, other}
+    end
+  end
+
+  @doc false
+  def stop_server_rpc(system, ra_name) do
+    case RaftEx.App.System.fetch(system) do
+      nil ->
+        {:error, :system_not_started}
+
+      %{names: %{server_sup: srv_sup}} ->
+        result =
+          case find_child(srv_sup, ra_name) do
+            nil -> :ok
+            pid -> DynamicSupervisor.terminate_child(srv_sup, pid)
+          end
+
+        RaftEx.Leaderboard.forget_leader({ra_name, node()})
+        result
     end
   end
 
@@ -113,10 +131,31 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
       nil ->
         {:error, :system_not_started}
 
-      %{names: %{server_sup: srv_sup} = names} ->
-        parent = RaftEx.Infra.Registry.Directory.where_is_parent(names, ra_name)
-        {:ok, parent, srv_sup}
+      %{names: %{server_sup: srv_sup}} ->
+        {:ok, find_child(srv_sup, ra_name), srv_sup}
     end
+  end
+
+  # `DynamicSupervisor` children all have the id `:undefined`; the server name
+  # is the id of the runtime child inside each `ServerSupervisor`. Walk one
+  # level down to find the supervisor that owns `ra_name`.
+  defp find_child(srv_sup, ra_name) do
+    srv_sup
+    |> DynamicSupervisor.which_children()
+    |> Enum.find_value(fn
+      {_id, pid, :supervisor, _modules} when is_pid(pid) ->
+        try do
+          case Supervisor.which_children(pid) do
+            [{^ra_name, _child, _type, _modules}] -> pid
+            _ -> nil
+          end
+        catch
+          :exit, _ -> nil
+        end
+
+      _ ->
+        nil
+    end)
   end
 
   @doc "Stop and permanently delete a server, removing its data directory."
@@ -143,7 +182,12 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
         RaftEx.Infra.Persistence.LogMeta.delete(meta, uid)
 
         dir = RaftEx.Infra.Config.Env.server_data_dir(system, uid)
-        DynamicSupervisor.terminate_child(srv_sup, uid)
+
+        case find_child(srv_sup, ra_name) do
+          nil -> :ok
+          pid -> DynamicSupervisor.terminate_child(srv_sup, pid)
+        end
+
         RaftEx.Infra.Filesystem.recursive_delete(dir)
         RaftEx.Infra.Registry.Directory.unregister_name(names, uid)
         RaftEx.Infra.Observability.Counters.delete({ra_name, node()})

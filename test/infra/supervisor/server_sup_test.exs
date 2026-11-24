@@ -51,9 +51,9 @@ defmodule RaftEx.Infra.Supervisor.ServerSupTest do
     assert :ok == RaftEx.stop_server(:default, {sname, node()}) ||
              match?({:error, _}, RaftEx.stop_server(:default, {sname, node()}))
 
-    assert_raise FunctionClauseError, fn ->
-      ServerSupSupervisor.delete_server_rpc(:default, sname)
-    end
+    # Deleting an already-stopped server is idempotent.  Older versions raised
+    # a FunctionClauseError here when the name was no longer registered.
+    assert :ok == ServerSupSupervisor.delete_server_rpc(:default, sname)
   end
 
   test "recover_config reports unregistered names" do

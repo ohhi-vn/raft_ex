@@ -42,6 +42,26 @@ defmodule RaftEx.Leaderboard do
   end
 
   @doc """
+  Forget `server_id` as the leader of any cluster it currently leads.
+
+  The members list is kept so `RaftEx.find_leader/1` can still ask the
+  remaining members for the new leader after the old one stops.
+  """
+  @spec forget_leader(RaftEx.Domain.Types.server_id()) :: :ok
+  def forget_leader(server_id) do
+    try do
+      :ets.match_object(@table, {:_, server_id, :_, :_})
+      |> Enum.each(fn {cluster, _leader, members, _ts} ->
+        :ets.insert(@table, {cluster, nil, members, DateTime.utc_now()})
+      end)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Look up the current leader for a cluster.
   """
   @spec lookup_leader(term()) :: RaftEx.Domain.Types.server_id() | nil
