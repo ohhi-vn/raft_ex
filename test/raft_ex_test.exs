@@ -15,13 +15,14 @@ defmodule RaftExTest do
   use ExUnit.Case, async: false
   doctest RaftEx
 
-  alias RaftEx.Types
-  alias RaftEx.Server.Config
-  alias RaftEx.Server.Cluster
-  alias RaftEx.Server.Effects
-  alias RaftEx.Log
-  alias RaftEx.Machine
-  alias RaftEx.Lib
+  alias RaftEx.Domain.Types
+  alias RaftEx.Domain.Server.Config
+  alias RaftEx.Domain.Server.Cluster
+  alias RaftEx.Domain.Server.Effects
+  alias RaftEx.Infra.Persistence.Log
+  alias RaftEx.Domain.Machine
+  alias RaftEx.Domain.Utils
+  alias RaftEx.Infra.Filesystem
 
   # ---------------------------------------------------------------------------
   # Setup and Teardown
@@ -228,6 +229,7 @@ defmodule RaftExTest do
       updated = Cluster.update_peer(new_peer, %{match_index: 5}, cluster)
 
       assert updated[new_peer].match_index == 5
+
       # update_peer merges with the existing map (or %{} if new), so only provided keys are present
       assert Map.get(updated[new_peer], :next_index) == nil
     end
@@ -480,7 +482,7 @@ defmodule RaftExTest do
 
       # Start LogMeta
       {:ok, _} =
-        RaftEx.LogMeta.start_link(%{
+        RaftEx.Infra.Persistence.LogMeta.start_link(%{
           name: :"test_system_#{suffix}",
           data_dir: data_dir,
           names: names
@@ -510,7 +512,8 @@ defmodule RaftExTest do
       end)
 
       # Start WAL process for tests that need it
-      {:ok, _wal_pid} = RaftEx.LogWal.start_link(%{data_dir: data_dir, names: names})
+      {:ok, _wal_pid} =
+        RaftEx.Infra.Persistence.LogWal.start_link(%{data_dir: data_dir, names: names})
 
       %{conf: conf, uid: uid, names: names, wal_started: true}
     end
@@ -725,7 +728,7 @@ defmodule RaftExTest do
       log = Log.append({4, 2, :cmd4}, log)
       log = Log.append({5, 2, :cmd5}, log)
 
-      {:ok, new_log, _} = Log.install_snapshot({3, 1}, RaftEx.MachineSimple, [], log)
+      {:ok, new_log, _} = Log.install_snapshot({3, 1}, RaftEx.Domain.Machine.Simple, [], log)
 
       assert new_log.current_snapshot == {3, 1}
       assert map_size(new_log.entries) == 2
@@ -771,7 +774,7 @@ defmodule RaftExTest do
 
       overview = Log.overview(log)
 
-      assert overview.type == RaftEx.Log
+      assert overview.type == RaftEx.Infra.Persistence.Log
       assert overview.range == {1, 2}
       assert overview.last_term == 1
       assert overview.next_index == 3
@@ -810,7 +813,7 @@ defmodule RaftExTest do
   describe "Machine" do
     test "MachineSimple init and apply work correctly" do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{
            simple_fun: fn cmd, state -> state + cmd end,
            initial_state: 0
@@ -821,7 +824,8 @@ defmodule RaftExTest do
       assert match?({:simple, _, 0}, state)
 
       # Machine.apply/4 returns {state, reply, effects}
-      {new_state, reply, effects} = Machine.apply(RaftEx.MachineSimple, %{index: 1, term: 1}, 5, state)
+      {new_state, reply, effects} =
+        Machine.apply(RaftEx.Domain.Machine.Simple, %{index: 1, term: 1}, 5, state)
 
       assert match?({:simple, _, 5}, new_state)
       assert reply == 5
@@ -830,12 +834,12 @@ defmodule RaftExTest do
 
     test "Machine.apply/4 handles effects" do
       defmodule TestMachineWithEffects do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, cmd, state) do
           {state + 1, cmd, [{:send_msg, :pid, cmd}]}
         end
@@ -850,15 +854,15 @@ defmodule RaftExTest do
 
     test "Machine.tick/3 calls optional callback" do
       defmodule TestMachineWithTick do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, _cmd, state), do: {state, :ok}
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def tick(_time, state), do: [{:aux, :tick}]
       end
 
@@ -869,12 +873,12 @@ defmodule RaftExTest do
 
     test "Machine.tick/3 returns default when not implemented" do
       defmodule TestMachineWithoutTick do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, _cmd, state), do: {state, :ok}
       end
 
@@ -885,15 +889,15 @@ defmodule RaftExTest do
 
     test "Machine.version/1 returns version or default" do
       defmodule TestMachineWithVersion do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, _cmd, state), do: {state, :ok}
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def version, do: 2
       end
 
@@ -902,28 +906,28 @@ defmodule RaftExTest do
 
     test "Machine.which_aux_fun/1 detects exported arity" do
       defmodule TestMachineWithAux5 do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, _cmd, state), do: {state, :ok}
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def handle_aux(_state, _type, _cmd, _aux, _log), do: {:no_reply, nil, nil}
       end
 
       defmodule TestMachineWithAux6 do
-        @behaviour RaftEx.Machine
+        @behaviour RaftEx.Domain.Machine
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def init(_conf), do: 0
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def apply(_meta, _cmd, state), do: {state, :ok}
 
-        @impl RaftEx.Machine
+        @impl RaftEx.Domain.Machine
         def handle_aux(_state, _type, _cmd, _aux, _log, _mac), do: {:no_reply, nil, nil}
       end
 
@@ -944,10 +948,11 @@ defmodule RaftExTest do
         log_id: "log_abc123",
         metrics_key: :metrics1,
         machine:
-          {:machine, RaftEx.MachineSimple, %{simple_fun: fn _, s -> s end, initial_state: 0}},
+          {:machine, RaftEx.Domain.Machine.Simple,
+           %{simple_fun: fn _, s -> s end, initial_state: 0}},
         machine_version: 0,
         effective_machine_version: 0,
-        effective_machine_module: RaftEx.MachineSimple,
+        effective_machine_module: RaftEx.Domain.Machine.Simple,
         system_config: %{data_dir: "/tmp"}
       }
 
@@ -964,10 +969,10 @@ defmodule RaftExTest do
         uid: "abc123",
         log_id: "log_abc123",
         metrics_key: :metrics1,
-        machine: {:machine, RaftEx.MachineSimple, %{}},
+        machine: {:machine, RaftEx.Domain.Machine.Simple, %{}},
         machine_version: 0,
         effective_machine_version: 0,
-        effective_machine_module: RaftEx.MachineSimple,
+        effective_machine_module: RaftEx.Domain.Machine.Simple,
         system_config: %{}
       }
 
@@ -985,38 +990,38 @@ defmodule RaftExTest do
 
   describe "Lib" do
     test "to_binary/1 converts various types to binary" do
-      assert Lib.to_binary("test") == "test"
-      assert Lib.to_binary(:test) == "test"
-      assert Lib.to_binary(123) == "123"
-      assert Lib.to_binary('test') == "test"
+      assert Utils.to_binary("test") == "test"
+      assert Utils.to_binary(:test) == "test"
+      assert Utils.to_binary(123) == "123"
+      assert Utils.to_binary('test') == "test"
     end
 
     test "to_atom/1 converts various types to atom" do
-      assert Lib.to_atom(:test) == :test
-      assert Lib.to_atom("test") == :test
-      assert Lib.to_atom('test') == :test
+      assert Utils.to_atom(:test) == :test
+      assert Utils.to_atom("test") == :test
+      assert Utils.to_atom('test') == :test
     end
 
     test "to_list/1 converts various types to charlist" do
-      assert Lib.to_list(:test) == ~c"test"
-      assert Lib.to_list("test") == ~c"test"
-      assert Lib.to_list(123) == ~c"123"
-      assert Lib.to_list(~c"test") == ~c"test"
+      assert Utils.to_list(:test) == ~c"test"
+      assert Utils.to_list("test") == ~c"test"
+      assert Utils.to_list(123) == ~c"123"
+      assert Utils.to_list(~c"test") == ~c"test"
     end
 
     test "ra_server_id_to_local_name/1 extracts name from server id" do
-      assert Lib.ra_server_id_to_local_name({:server1, :node1@host}) == :server1
-      assert Lib.ra_server_id_to_local_name(:server1) == :server1
+      assert Utils.ra_server_id_to_local_name({:server1, :node1@host}) == :server1
+      assert Utils.ra_server_id_to_local_name(:server1) == :server1
     end
 
     test "ra_server_id_node/1 extracts node from server id" do
-      assert Lib.ra_server_id_node({:server1, :node1@host}) == :node1@host
-      assert Lib.ra_server_id_node(:server1) == node()
+      assert Utils.ra_server_id_node({:server1, :node1@host}) == :node1@host
+      assert Utils.ra_server_id_node(:server1) == node()
     end
 
     test "make_uid/0 generates unique uid" do
-      uid1 = Lib.make_uid()
-      uid2 = Lib.make_uid()
+      uid1 = Utils.make_uid()
+      uid2 = Utils.make_uid()
 
       assert is_binary(uid1)
       assert is_binary(uid2)
@@ -1025,20 +1030,20 @@ defmodule RaftExTest do
     end
 
     test "make_uid/1 generates uid with prefix" do
-      uid = Lib.make_uid("TEST")
+      uid = Utils.make_uid("TEST")
 
       assert String.starts_with?(uid, "TEST")
       assert String.length(uid) == 16
     end
 
     test "validate_base64uri/1 validates base64uri strings" do
-      assert Lib.validate_base64uri("ABC123_-")
-      refute Lib.validate_base64uri("")
-      refute Lib.validate_base64uri("invalid!@#")
+      assert Utils.validate_base64uri("ABC123_-")
+      refute Utils.validate_base64uri("")
+      refute Utils.validate_base64uri("invalid!@#")
     end
 
     test "derive_safe_string/2 derives safe string" do
-      result = Lib.derive_safe_string("Hello World!@#", 10)
+      result = Utils.derive_safe_string("Hello World!@#", 10)
 
       assert String.length(result) <= 10
       refute String.contains?(result, " ")
@@ -1048,7 +1053,7 @@ defmodule RaftExTest do
     test "make_dir/1 creates directory" do
       dir = Path.join(System.tmp_dir!(), "raft_ex_test_dir_#{System.unique_integer()}")
 
-      assert :ok == Lib.make_dir(dir)
+      assert :ok == Filesystem.make_dir(dir)
       assert File.dir?(dir)
 
       File.rm_rf!(dir)
@@ -1057,24 +1062,24 @@ defmodule RaftExTest do
     test "write_file/3 writes file" do
       file = Path.join(System.tmp_dir!(), "raft_ex_test_file_#{System.unique_integer()}")
 
-      :ok = Lib.write_file(file, "test content")
+      :ok = Filesystem.write_file(file, "test content")
       assert File.read!(file) == "test content"
 
       File.rm!(file)
     end
 
     test "zpad_hex/1 zero-pads hex string" do
-      assert Lib.zpad_hex(255) == "00000000000000FF"
-      assert Lib.zpad_hex(0) == "0000000000000000"
+      assert Utils.zpad_hex(255) == "00000000000000FF"
+      assert Utils.zpad_hex(0) == "0000000000000000"
     end
 
     test "cons/2 prepends item to list" do
-      assert Lib.cons(1, [2, 3]) == [1, 2, 3]
+      assert Utils.cons(1, [2, 3]) == [1, 2, 3]
     end
 
     test "lists_shuffle/1 shuffles list" do
       list = Enum.to_list(1..100)
-      shuffled = Lib.lists_shuffle(list)
+      shuffled = Utils.lists_shuffle(list)
 
       assert length(shuffled) == length(list)
       assert Enum.sort(shuffled) == Enum.sort(list)
@@ -1084,7 +1089,7 @@ defmodule RaftExTest do
       fun = fn x -> x > 5 end
       elements = Enum.to_list(1..10)
 
-      {:ok, successes, failures} = Lib.partition_parallel(fun, elements, 5000)
+      {:ok, successes, failures} = Utils.partition_parallel(fun, elements, 5000)
 
       assert Enum.sort(successes) == [6, 7, 8, 9, 10]
       assert Enum.sort(failures) == [1, 2, 3, 4, 5]
@@ -1113,7 +1118,7 @@ defmodule RaftExTest do
 
       # Start LogMeta
       {:ok, _} =
-        RaftEx.LogMeta.start_link(%{
+        RaftEx.Infra.Persistence.LogMeta.start_link(%{
           name: :"int_test_system_#{suffix}",
           data_dir: data_dir,
           names: names
@@ -1164,7 +1169,7 @@ defmodule RaftExTest do
       assert length(read_entries) == 3
 
       # Install snapshot
-      {:ok, log, _} = Log.install_snapshot({5, 1}, RaftEx.MachineSimple, [], log)
+      {:ok, log, _} = Log.install_snapshot({5, 1}, RaftEx.Domain.Machine.Simple, [], log)
 
       assert log.current_snapshot == {5, 1}
       assert map_size(log.entries) == 5
@@ -1284,9 +1289,9 @@ defmodule RaftExTest do
 
     test "starts with empty state", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_empty)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
-      overview = RaftEx.LogSegmentWriter.overview(pid)
+      overview = RaftEx.Infra.Persistence.LogSegmentWriter.overview(pid)
       assert overview.num_segments == 0
 
       GenServer.stop(pid)
@@ -1294,12 +1299,12 @@ defmodule RaftExTest do
 
     test "writes entries to active segment", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_write)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       entries = [{1, 1, {:command, :test1}}, {2, 1, {:command, :test2}}]
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
 
-      {:ok, read_entries} = RaftEx.LogSegmentWriter.read(pid, 1, 2)
+      {:ok, read_entries} = RaftEx.Infra.Persistence.LogSegmentWriter.read(pid, 1, 2)
       assert length(read_entries) == 2
 
       GenServer.stop(pid)
@@ -1307,12 +1312,12 @@ defmodule RaftExTest do
 
     test "reads single entry by index", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_read_single)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       entries = [{1, 1, {:command, :test}}]
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
 
-      {:ok, entry} = RaftEx.LogSegmentWriter.read_entry(pid, 1)
+      {:ok, entry} = RaftEx.Infra.Persistence.LogSegmentWriter.read_entry(pid, 1)
       assert entry == {1, 1, {:command, :test}}
 
       GenServer.stop(pid)
@@ -1320,23 +1325,23 @@ defmodule RaftExTest do
 
     test "returns not_found for missing entry", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_not_found)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
-      assert {:error, :not_found} = RaftEx.LogSegmentWriter.read_entry(pid, 999)
+      assert {:error, :not_found} = RaftEx.Infra.Persistence.LogSegmentWriter.read_entry(pid, 999)
 
       GenServer.stop(pid)
     end
 
     test "seals active segment and creates new one", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_seal)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       entries = [{1, 1, {:command, :test}}]
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
 
-      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.seal_active_segment(pid)
 
-      overview = RaftEx.LogSegmentWriter.overview(pid)
+      overview = RaftEx.Infra.Persistence.LogSegmentWriter.overview(pid)
       assert overview.num_segments == 1
 
       GenServer.stop(pid)
@@ -1344,16 +1349,17 @@ defmodule RaftExTest do
 
     test "creates new segment when max entries reached", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_max_entries)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       # Write 10 entries (max_entries is 10)
       entries = for i <- 1..10, do: {i, 1, {:command, i}}
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
 
       # Write one more - should trigger new segment
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, [{11, 1, {:command, :extra}}])
+      assert :ok =
+               RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, [{11, 1, {:command, :extra}}])
 
-      overview = RaftEx.LogSegmentWriter.overview(pid)
+      overview = RaftEx.Infra.Persistence.LogSegmentWriter.overview(pid)
       assert overview.num_segments >= 1
 
       GenServer.stop(pid)
@@ -1361,15 +1367,15 @@ defmodule RaftExTest do
 
     test "truncates segments from index", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_truncate)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       entries = for i <- 1..5, do: {i, 1, {:command, i}}
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
-      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.seal_active_segment(pid)
 
-      assert :ok = RaftEx.LogSegmentWriter.truncate_from(pid, 3)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.truncate_from(pid, 3)
 
-      overview = RaftEx.LogSegmentWriter.overview(pid)
+      overview = RaftEx.Infra.Persistence.LogSegmentWriter.overview(pid)
       # Segments starting from index 3 should be removed
       assert overview.num_segments == 0
 
@@ -1378,15 +1384,15 @@ defmodule RaftExTest do
 
     test "deletes segments up to index", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_delete)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       entries = for i <- 1..5, do: {i, 1, {:command, i}}
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
-      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.seal_active_segment(pid)
 
-      assert :ok = RaftEx.LogSegmentWriter.delete_up_to(pid, 3)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.delete_up_to(pid, 3)
 
-      overview = RaftEx.LogSegmentWriter.overview(pid)
+      overview = RaftEx.Infra.Persistence.LogSegmentWriter.overview(pid)
       # Segment with range {1, 5} won't be deleted since last_index(5) > 3
       # This is correct behavior - we only delete segments fully before up_to_index
       assert overview.num_segments == 1
@@ -1396,17 +1402,17 @@ defmodule RaftExTest do
 
     test "returns index range", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_range)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       # Active segment starts at index 1
-      {first, last} = RaftEx.LogSegmentWriter.index_range(pid)
+      {first, last} = RaftEx.Infra.Persistence.LogSegmentWriter.index_range(pid)
       assert first == 1
       assert last == 1
 
       entries = [{1, 1, {:command, :test}}, {2, 1, {:command, :test2}}]
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
 
-      {first, last} = RaftEx.LogSegmentWriter.index_range(pid)
+      {first, last} = RaftEx.Infra.Persistence.LogSegmentWriter.index_range(pid)
       assert first == 1
       assert last == 2
 
@@ -1415,9 +1421,9 @@ defmodule RaftExTest do
 
     test "handles empty write", %{data_dir: data_dir} do
       config = make_config(data_dir, :seg_test_empty_write)
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
-      assert :ok = RaftEx.LogSegmentWriter.write(pid, [])
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, [])
 
       GenServer.stop(pid)
     end
@@ -1426,15 +1432,15 @@ defmodule RaftExTest do
       config = make_config(data_dir, :seg_test_recover)
 
       # Create and write to segments
-      {:ok, pid1} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid1} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
       entries = for i <- 1..3, do: {i, 1, {:command, i}}
-      assert :ok = RaftEx.LogSegmentWriter.write(pid1, entries)
-      assert :ok = RaftEx.LogSegmentWriter.seal_active_segment(pid1)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.write(pid1, entries)
+      assert :ok = RaftEx.Infra.Persistence.LogSegmentWriter.seal_active_segment(pid1)
       GenServer.stop(pid1)
 
       # Recover
-      {:ok, pid2} = RaftEx.LogSegmentWriter.start_link(config)
-      {:ok, read_entries} = RaftEx.LogSegmentWriter.read(pid2, 1, 3)
+      {:ok, pid2} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
+      {:ok, read_entries} = RaftEx.Infra.Persistence.LogSegmentWriter.read(pid2, 1, 3)
       assert length(read_entries) == 3
       GenServer.stop(pid2)
     end
@@ -1449,26 +1455,33 @@ defmodule RaftExTest do
       # Start a simple GenServer to receive RPCs
       defmodule TestRpcReceiver do
         use GenServer
-        def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid, name: :test_rpc_receiver)
+
+        def start_link(test_pid),
+          do: GenServer.start_link(__MODULE__, test_pid, name: :test_rpc_receiver)
+
         def init(test_pid), do: {:ok, %{test_pid: test_pid}}
+
         def handle_info({:gen_cast, {:rpc, rpc}}, state) do
           send(state.test_pid, {:received_rpc, rpc})
           {:noreply, state}
         end
+
         def handle_info(_, state), do: {:noreply, state}
       end
 
       {:ok, _} = TestRpcReceiver.start_link(self())
 
-      rpc = %RaftEx.Types.AppendEntriesRpc{term: 1, leader_id: {:test, node()}}
-      assert :ok = RaftEx.Network.send_rpc({:test_rpc_receiver, node()}, rpc)
+      rpc = %RaftEx.Domain.Types.AppendEntriesRpc{term: 1, leader_id: {:test, node()}}
+      assert :ok = RaftEx.Infra.Network.Transport.send_rpc({:test_rpc_receiver, node()}, rpc)
 
       assert_receive {:received_rpc, ^rpc}, 1000
     end
 
     test "send_rpc returns error for non-existent local process" do
-      rpc = %RaftEx.Types.AppendEntriesRpc{term: 1}
-      assert {:error, :noproc} = RaftEx.Network.send_rpc({:non_existent_process, node()}, rpc)
+      rpc = %RaftEx.Domain.Types.AppendEntriesRpc{term: 1}
+
+      assert {:error, :noproc} =
+               RaftEx.Infra.Network.Transport.send_rpc({:non_existent_process, node()}, rpc)
     end
 
     test "call routes to local process correctly" do
@@ -1480,33 +1493,40 @@ defmodule RaftExTest do
       end
 
       {:ok, _} = TestCallReceiver.start_link()
-      assert {:ok, :pong} = RaftEx.Network.call({:test_call_receiver, node()}, :ping)
+
+      assert {:ok, :pong} =
+               RaftEx.Infra.Network.Transport.call({:test_call_receiver, node()}, :ping)
     end
 
     test "cast routes to local process correctly" do
       defmodule TestCastReceiver do
         use GenServer
-        def start_link(test_pid), do: GenServer.start_link(__MODULE__, test_pid, name: :test_cast_receiver)
+
+        def start_link(test_pid),
+          do: GenServer.start_link(__MODULE__, test_pid, name: :test_cast_receiver)
+
         def init(test_pid), do: {:ok, %{test_pid: test_pid}}
+
         def handle_cast(:test_msg, state) do
           send(state.test_pid, {:received_cast, :test_msg})
           {:noreply, state}
         end
+
         def handle_cast(_, state), do: {:noreply, state}
       end
 
       {:ok, _} = TestCastReceiver.start_link(self())
-      assert :ok = RaftEx.Network.cast({:test_cast_receiver, node()}, :test_msg)
+      assert :ok = RaftEx.Infra.Network.Transport.cast({:test_cast_receiver, node()}, :test_msg)
       assert_receive {:received_cast, :test_msg}, 1000
     end
 
     test "monitor returns reference for local process" do
-      assert {:error, :noproc} = RaftEx.Network.monitor({:non_existent, node()})
+      assert {:error, :noproc} = RaftEx.Infra.Network.Transport.monitor({:non_existent, node()})
     end
 
     test "handle_node_up and handle_node_down return :ok" do
-      assert :ok = RaftEx.Network.handle_node_up(:some_node)
-      assert :ok = RaftEx.Network.handle_node_down(:some_node)
+      assert :ok = RaftEx.Infra.Network.Transport.handle_node_up(:some_node)
+      assert :ok = RaftEx.Infra.Network.Transport.handle_node_down(:some_node)
     end
   end
 
@@ -1530,7 +1550,7 @@ defmodule RaftExTest do
       :ets.new(names.log_ets, [:named_table, :public, :set])
 
       {:ok, _} =
-        RaftEx.LogMeta.start_link(%{
+        RaftEx.Infra.Persistence.LogMeta.start_link(%{
           name: :"multi_node_system_#{suffix}",
           data_dir: data_dir,
           names: names
@@ -1567,7 +1587,7 @@ defmodule RaftExTest do
       server2_id = {:server2, node()}
       server3_id = {:server3, node()}
 
-      cluster = RaftEx.Server.Cluster.new(server1_id, [server1_id, server2_id, server3_id])
+      cluster = RaftEx.Domain.Server.Cluster.new(server1_id, [server1_id, server2_id, server3_id])
 
       # Verify cluster structure
       assert map_size(cluster) == 3
@@ -1586,15 +1606,19 @@ defmodule RaftExTest do
       server1_id = {:server1, node()}
       server2_id = {:server2, node()}
 
-      cluster = RaftEx.Server.Cluster.new(server1_id, [server1_id, server2_id])
+      cluster = RaftEx.Domain.Server.Cluster.new(server1_id, [server1_id, server2_id])
 
       # Update peer state
       updated_cluster =
-        RaftEx.Server.Cluster.update_peer(server2_id, %{
-          next_index: 10,
-          match_index: 5,
-          status: :normal
-        }, cluster)
+        RaftEx.Domain.Server.Cluster.update_peer(
+          server2_id,
+          %{
+            next_index: 10,
+            match_index: 5,
+            status: :normal
+          },
+          cluster
+        )
 
       peer2 = Map.get(updated_cluster, server2_id)
       assert peer2.next_index == 10
@@ -1639,14 +1663,14 @@ defmodule RaftExTest do
         }
 
       # Collect voter match indexes (excluding self server1_id)
-      indexes = RaftEx.Server.Cluster.voter_match_indexes(server1_id, cluster, 9)
+      indexes = RaftEx.Domain.Server.Cluster.voter_match_indexes(server1_id, cluster, 9)
       # Should include leader's 9 and server2's 6 (server3 is non_voter)
       assert 9 in indexes
       assert 6 in indexes
       refute 7 in indexes
 
       # Compute agreed commit
-      agreed = RaftEx.Server.Cluster.agreed_commit(indexes)
+      agreed = RaftEx.Domain.Server.Cluster.agreed_commit(indexes)
       # Sorted desc: [9, 6], quorum = div(2,2)+1 = 2, index 1 = 6
       assert agreed == 6
     end
@@ -1663,18 +1687,19 @@ defmodule RaftExTest do
       }
 
       # Need 2 votes to win (div(3,2) + 1 = 2)
-      assert RaftEx.Server.Election.votes_needed(3) == 2
-      assert RaftEx.Server.Election.evaluate_election_result(context) == :ongoing
+      assert RaftEx.Domain.Server.Election.votes_needed(3) == 2
+      assert RaftEx.Domain.Server.Election.evaluate_election_result(context) == :ongoing
 
       # Add another vote
       new_votes = MapSet.put(context.votes_received, {:server2, node()})
       new_context = %{context | votes_received: new_votes}
 
-      assert RaftEx.Server.Election.evaluate_election_result(new_context) == :won
+      assert RaftEx.Domain.Server.Election.evaluate_election_result(new_context) == :won
     end
 
     test "log segment writer handles concurrent writes safely", %{conf: conf} do
       suffix = System.unique_integer([:positive])
+
       config = %{
         name: :"seg_concurrent_#{suffix}",
         data_dir: Path.join(conf.system_config.data_dir, "seg_concurrent_#{suffix}"),
@@ -1682,21 +1707,21 @@ defmodule RaftExTest do
         segment_max_size_bytes: 1_000_000
       }
 
-      {:ok, pid} = RaftEx.LogSegmentWriter.start_link(config)
+      {:ok, pid} = RaftEx.Infra.Persistence.LogSegmentWriter.start_link(config)
 
       # Write from multiple processes concurrently
       tasks =
         for i <- 1..3 do
           Task.async(fn ->
             entries = for j <- 1..3, do: {i * 10 + j, 1, {:command, i, j}}
-            RaftEx.LogSegmentWriter.write(pid, entries)
+            RaftEx.Infra.Persistence.LogSegmentWriter.write(pid, entries)
           end)
         end
 
       Task.await_many(tasks, 5000)
 
       # Verify all entries were written
-      {:ok, all_entries} = RaftEx.LogSegmentWriter.read(pid, 1, 100)
+      {:ok, all_entries} = RaftEx.Infra.Persistence.LogSegmentWriter.read(pid, 1, 100)
       assert length(all_entries) == 9
 
       GenServer.stop(pid)

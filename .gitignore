@@ -24,3 +24,5 @@ raft_ex-*.tar
 
 .expert
 wal.dat
+priv/plts
+.dexter.db*

@@ -91,7 +91,7 @@ RaftEx.start_in("/tmp/raft_data")
 
 # Define a simple state machine
 defmodule CounterMachine do
-  @behaviour RaftEx.Machine
+  @behaviour RaftEx.Domain.Machine
 
   @impl RaftEx.Machine
   def init(_conf), do: 0
@@ -121,7 +121,7 @@ IO.inspect(reply) # => 1
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        RaftEx.Server                        │
+│                    RaftEx.Domain.Server                     │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
 │  │   Leader    │  │  Follower    │  │    Candidate       │ │
 │  │   State     │  │  State       │  │    State           │ │
@@ -148,14 +148,14 @@ IO.inspect(reply) # => 1
 ### Key Components
 
 - **`RaftEx`**: Main public API for cluster and server management
-- **`RaftEx.ServerProc`**: `gen_statem` process managing server lifecycle
-- **`RaftEx.Server`**: Core Raft protocol logic (state transitions, RPC handling)
-- **`RaftEx.Log`**: Persistent replicated log with WAL + mem table
-- **`RaftEx.LogWal`**: Write-ahead log GenServer with batched fsync
-- **`RaftEx.LogMeta`**: DETS + ETS backed metadata store
-- **`RaftEx.Machine`**: Behaviour for pluggable state machines
-- **`RaftEx.Server.Election`**: Leader election with pre-vote support
-- **`RaftEx.Server.RpcHandler`**: AppendEntries, InstallSnapshot, Heartbeat handlers
+- **`RaftEx.App.ServerRuntime`**: `gen_statem` process managing server lifecycle
+- **`RaftEx.Domain.Server`**: Core Raft protocol logic (state transitions, RPC handling)
+- **`RaftEx.Infra.Persistence.Log`**: Persistent replicated log with WAL + mem table
+- **`RaftEx.Infra.Persistence.LogWal`**: Write-ahead log GenServer with batched fsync
+- **`RaftEx.Infra.Persistence.LogMeta`**: DETS + ETS backed metadata store
+- **`RaftEx.Domain.Machine`**: Behaviour for pluggable state machines
+- **`RaftEx.Domain.Server.Election`**: Leader election with pre-vote support
+- **`RaftEx.Domain.Server.RpcHandler`**: AppendEntries, InstallSnapshot, Heartbeat handlers
 
 ## Configuration
 
@@ -181,6 +181,27 @@ IO.inspect(reply) # => 1
   machine: {:machine, MyMachine, %{}}
 }
 ```
+
+## Plug-style Middleware Pipelines
+
+RaftEx supports composable Plug-style middleware around command and RPC processing:
+
+```elixir
+defmodule MyPlug do
+  @behaviour RaftEx.Domain.Plug
+  def init(opts), do: opts
+  def call(conn, _opts), do: RaftEx.Domain.Conn.assign(conn, :started_at, System.monotonic_time())
+end
+
+# Configure via system config
+config = RaftEx.App.System.default_config()
+  |> Map.put(:command_plugs, [MyPlug])
+  |> Map.put(:rpc_plugs, [MyPlug])
+
+RaftEx.start(config)
+```
+
+Plugs receive a `RaftEx.Domain.Conn` context and may call `RaftEx.Domain.Conn.halt/1` to short-circuit processing.
 
 ## Development
 

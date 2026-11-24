@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.1.0"
+  @version "0.2.0"
 
   def project do
     [
@@ -45,11 +45,11 @@ defmodule RaftEx.MixProject do
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/fixtures"]
+  defp elixirc_paths(:test), do: ["lib", "test/fixtures", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
   def application do
-    [extra_applications: [:logger, :crypto], mod: {RaftEx.Application, []}]
+    [extra_applications: [:logger, :crypto], mod: {RaftEx.OTPApplication, []}]
   end
 
   defp deps do

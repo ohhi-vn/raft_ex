@@ -7,18 +7,20 @@ defmodule RaftEx.MultiNodeTest do
     data_dir = Path.join(System.tmp_dir!(), "raft_ex_multi_#{System.unique_integer()}")
     File.mkdir_p!(data_dir)
 
-    RaftEx.System.stop_default()
+    RaftEx.App.System.stop_default()
     :persistent_term.erase({:"$ra_system", :default})
     RaftEx.start_in(data_dir)
 
     on_exit(fn ->
       File.rm_rf!(data_dir)
+
       for [name] <- :ets.match(:ra_state, {:"$1", :_, :_}) do
         case Process.whereis(name) do
           nil -> :ok
           pid -> :gen_statem.stop(pid)
         end
       end
+
       :ets.match_delete(:ra_state, {:_, :_, :_})
     end)
 
@@ -27,30 +29,30 @@ defmodule RaftEx.MultiNodeTest do
 
   describe "node distribution" do
     test "build_server_ids/2 creates correct server id tuples" do
-      nodes = [:"node1@host", :"node2@host", :"node3@host"]
-      server_ids = RaftEx.Distribution.build_server_ids(nodes)
+      nodes = [:node1@host, :node2@host, :node3@host]
+      server_ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes)
 
       assert length(server_ids) == 3
-      assert {:server1, :"node1@host"} in server_ids
-      assert {:server2, :"node2@host"} in server_ids
-      assert {:server3, :"node3@host"} in server_ids
+      assert {:server1, :node1@host} in server_ids
+      assert {:server2, :node2@host} in server_ids
+      assert {:server3, :node3@host} in server_ids
     end
 
     test "connect_to_seeds/2 handles empty seed list" do
-      connected = RaftEx.Distribution.connect_to_seeds([], @test_cookie)
+      connected = RaftEx.Infra.Network.Distribution.connect_to_seeds([], @test_cookie)
       assert connected == []
     end
 
     test "cluster_nodes/0 includes self" do
-      nodes = RaftEx.Distribution.cluster_nodes()
+      nodes = RaftEx.Infra.Network.Distribution.cluster_nodes()
       assert node() in nodes
     end
 
     test "build_server_ids/2 uses custom prefix" do
-      nodes = [:"n1@host", :"n2@host"]
-      ids = RaftEx.Distribution.build_server_ids(nodes, :raft)
-      assert {:raft1, :"n1@host"} in ids
-      assert {:raft2, :"n2@host"} in ids
+      nodes = [:n1@host, :n2@host]
+      ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes, :raft)
+      assert {:raft1, :n1@host} in ids
+      assert {:raft2, :n2@host} in ids
     end
   end
 
@@ -79,7 +81,7 @@ defmodule RaftEx.MultiNodeTest do
       RaftEx.Leaderboard.record(
         :cluster_a,
         {:s1, node()},
-        [{:s1, node()}, {:s2, :"other@host"}]
+        [{:s1, node()}, {:s2, :other@host}]
       )
 
       assert RaftEx.Leaderboard.local_server_id(:cluster_a) == {:s1, node()}
@@ -89,8 +91,8 @@ defmodule RaftEx.MultiNodeTest do
     test "local_server_id returns nil when node not in cluster" do
       RaftEx.Leaderboard.record(
         :cluster_b,
-        {:s1, :"other@host"},
-        [{:s1, :"other@host"}]
+        {:s1, :other@host},
+        [{:s1, :other@host}]
       )
 
       assert RaftEx.Leaderboard.local_server_id(:cluster_b) == nil
@@ -114,7 +116,7 @@ defmodule RaftEx.MultiNodeTest do
   describe "cluster API" do
     test "form_cluster with single node starts servers", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_single_#{System.unique_integer([:positive])}"
@@ -129,7 +131,7 @@ defmodule RaftEx.MultiNodeTest do
 
     test "process_command works after forming cluster", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_cmd_#{System.unique_integer([:positive])}"
@@ -143,10 +145,11 @@ defmodule RaftEx.MultiNodeTest do
 
     test "cluster_status returns server info", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_status_#{System.unique_integer([:positive])}"
+
       {:ok, [_sid | _]} =
         RaftEx.form_cluster(cluster_name, machine, [node()], timeout: 5_000)
 
@@ -158,10 +161,11 @@ defmodule RaftEx.MultiNodeTest do
 
     test "find_leader returns leader via leaderboard", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_leader_find_#{System.unique_integer([:positive])}"
+
       {:ok, [{sname, _} | _]} =
         RaftEx.form_cluster(cluster_name, machine, [node()], timeout: 5_000)
 
@@ -173,7 +177,7 @@ defmodule RaftEx.MultiNodeTest do
 
     test "members retrieved after cluster formation", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_members_#{System.unique_integer([:positive])}"
@@ -187,10 +191,11 @@ defmodule RaftEx.MultiNodeTest do
 
     test "leaderboard_overview returns formatted data", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_lb_#{System.unique_integer([:positive])}"
+
       {:ok, _} =
         RaftEx.form_cluster(cluster_name, machine, [node()], timeout: 5_000)
 
@@ -206,7 +211,7 @@ defmodule RaftEx.MultiNodeTest do
   describe "cluster membership changes" do
     test "add_member works on single node", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_add_#{System.unique_integer([:positive])}"
@@ -226,7 +231,7 @@ defmodule RaftEx.MultiNodeTest do
 
     test "remove_member works on single node", %{data_dir: _dd} do
       machine =
-        {:machine, RaftEx.MachineSimple,
+        {:machine, RaftEx.Domain.Machine.Simple,
          %{simple_fun: fn cmd, s -> {s, cmd} end, initial_state: 0}}
 
       cluster_name = :"test_remove_#{System.unique_integer([:positive])}"
