@@ -158,6 +158,11 @@ defmodule RaftEx.Domain.SeqTest do
       refute Seq.has_overlap?({2, 4}, [])
       refute Seq.has_overlap?(nil, [1, 2])
     end
+
+    test "recurses past out-of-range entries to the empty tail" do
+      refute Seq.has_overlap?({2, 4}, [9, 8])
+      refute Seq.has_overlap?({2, 4}, [{9, 11}, {8, 10}])
+    end
   end
 
   describe "iterator/1, next_iter/1, remove_prefix/2" do
@@ -177,6 +182,10 @@ defmodule RaftEx.Domain.SeqTest do
       assert Seq.remove_prefix([2, 1], [3, 2, 1]) == {:ok, [3]}
       assert Seq.remove_prefix([2, 1], [5, 4, 3]) == {:ok, [{3, 5}]}
       assert Seq.remove_prefix([3, 4], [3, 2, 1]) == {:error, :not_prefix}
+    end
+
+    test "remove_prefix returns an empty sequence when the prefix consumes the whole seq" do
+      assert Seq.remove_prefix([3, 2, 1], [2, 1]) == {:ok, []}
     end
   end
 end

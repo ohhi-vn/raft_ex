@@ -6,6 +6,8 @@ defmodule RaftEx.Infra.Network.NodeDiscovery do
   use GenServer
   require Logger
 
+  alias RaftEx.Infra.Network.Distribution
+
   @default_discovery_interval 5_000
 
   defstruct [
@@ -36,8 +38,8 @@ defmodule RaftEx.Infra.Network.NodeDiscovery do
     machine = opts[:machine]
     callback_module = opts[:callback_module] || RaftEx.App.Cluster
 
-    RaftEx.Infra.Network.Distribution.start(cookie: cookie)
-    connected = RaftEx.Infra.Network.Distribution.connect_to_seeds(seeds, cookie)
+    Distribution.start(cookie: cookie)
+    connected = Distribution.connect_to_seeds(seeds, cookie)
 
     timer_ref = schedule_discovery(discovery_interval)
 
@@ -64,11 +66,11 @@ defmodule RaftEx.Infra.Network.NodeDiscovery do
 
   @impl GenServer
   def handle_info(:discover, state) do
-    previous_nodes = RaftEx.Infra.Network.Distribution.cluster_nodes()
+    previous_nodes = Distribution.cluster_nodes()
 
-    _connected = RaftEx.Infra.Network.Distribution.connect_to_seeds(state.seeds, state.cookie)
+    _connected = Distribution.connect_to_seeds(state.seeds, state.cookie)
 
-    current_nodes = RaftEx.Infra.Network.Distribution.cluster_nodes()
+    current_nodes = Distribution.cluster_nodes()
 
     new_nodes = current_nodes -- previous_nodes
     gone_nodes = previous_nodes -- current_nodes
@@ -96,7 +98,7 @@ defmodule RaftEx.Infra.Network.NodeDiscovery do
 
     if state.cluster_name != nil and state.machine != nil do
       state.callback_module.handle_topology_change(
-        RaftEx.Infra.Network.Distribution.cluster_nodes(),
+        Distribution.cluster_nodes(),
         state.cluster_name,
         state.machine
       )
@@ -110,7 +112,7 @@ defmodule RaftEx.Infra.Network.NodeDiscovery do
 
     if state.cluster_name != nil and state.machine != nil do
       state.callback_module.handle_topology_change(
-        RaftEx.Infra.Network.Distribution.cluster_nodes(),
+        Distribution.cluster_nodes(),
         state.cluster_name,
         state.machine
       )

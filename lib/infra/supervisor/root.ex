@@ -1,5 +1,12 @@
 defmodule RaftEx.Infra.Supervisor.Root do
+  @moduledoc """
+  Top-level supervisor that initialises shared ETS tables and starts the
+  application's long-lived children.
+  """
+
   use Supervisor
+
+  alias RaftEx.Infra.Config.Env
 
   @tables [:ra_state, :ra_open_file_metrics, :ra_io_metrics]
 
@@ -14,7 +21,7 @@ defmodule RaftEx.Infra.Supervisor.Root do
     end
 
     logger = Application.get_env(:ra, :logger_module, Logger)
-    RaftEx.Infra.Config.Env.configure_logger(logger)
+    Env.configure_logger(logger)
 
     children = [
       RaftEx.Infra.Process.MachineEts,

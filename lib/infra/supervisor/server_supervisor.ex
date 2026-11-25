@@ -1,5 +1,11 @@
 defmodule RaftEx.Infra.Supervisor.ServerSupervisor do
+  @moduledoc """
+  Supervisor for a single Raft server process and its runtime children.
+  """
+
   use Supervisor
+
+  alias RaftEx.Domain.Utils
 
   def start_link(config) do
     Supervisor.start_link(__MODULE__, config)
@@ -7,7 +13,7 @@ defmodule RaftEx.Infra.Supervisor.ServerSupervisor do
 
   @impl Supervisor
   def init(%{id: id} = config) do
-    name = RaftEx.Domain.Utils.ra_server_id_to_local_name(id)
+    name = Utils.ra_server_id_to_local_name(id)
 
     children = [
       %{

@@ -1,4 +1,12 @@
 defmodule RaftEx.Domain.LruCache do
+  @moduledoc """
+  A small LRU cache backed by a list of `{key, value}` entries.
+
+  The most recently used entry is kept at the head of the list. When the cache
+  is full, the least recently used entry is evicted and passed to an optional
+  handler function.
+  """
+
   @max_size 5
 
   defstruct max_size: @max_size, items: [], handler: nil

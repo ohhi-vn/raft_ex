@@ -1,4 +1,12 @@
 defmodule RaftEx.Domain.Range do
+  @moduledoc """
+  Helpers for working with inclusive integer index ranges.
+
+  A range is either `nil` or a `{start, ending}` tuple. Functions here provide
+  construction, membership testing, merging, subtraction, and folding
+  operations used by the Raft log machinery.
+  """
+
   @type t :: nil | {non_neg_integer(), non_neg_integer()}
 
   def new(start) when is_integer(start), do: {start, start}

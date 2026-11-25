@@ -1,7 +1,7 @@
 defmodule RaftEx.PlugPipelineTest do
   use ExUnit.Case, async: true
 
-  alias RaftEx.Domain.{Conn, Plug, Pipeline}
+  alias RaftEx.Domain.{Conn, Pipeline, Plug, Server}
 
   defmodule NoopPlug do
     @behaviour Plug
@@ -111,7 +111,7 @@ defmodule RaftEx.PlugPipelineTest do
         system_config: sys
       }
 
-      state = RaftEx.Domain.Server.init(config)
+      state = Server.init(config)
       assert state.cfg.command_plugs != []
     end
   end

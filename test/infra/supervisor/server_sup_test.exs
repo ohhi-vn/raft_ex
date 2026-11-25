@@ -2,6 +2,8 @@ defmodule RaftEx.Infra.Supervisor.ServerSupTest do
   use ExUnit.Case, async: false
 
   alias RaftEx.Domain.Machine
+  alias RaftEx.Infra.Config.Env
+  alias RaftEx.Infra.Registry.Directory
   alias RaftEx.Infra.Supervisor.ServerSupSupervisor
 
   setup do
@@ -62,5 +64,34 @@ defmodule RaftEx.Infra.Supervisor.ServerSupTest do
                :default,
                :"never_registered_#{System.unique_integer()}"
              )
+  end
+
+  test "restart_server_rpc recovers a stored config and starts the server" do
+    sname = :"restart_srv_#{System.unique_integer([:positive])}"
+    uid = "restart_uid_#{System.unique_integer([:positive])}"
+    cfg = config(sname, uid)
+
+    dir = Env.server_data_dir(:default, uid)
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "config"), :erlang.term_to_binary(cfg))
+    Directory.register_name(:default, uid, nil, nil, sname, nil)
+
+    assert {:ok, pid} =
+             ServerSupSupervisor.restart_server_rpc(:default, {sname, node()}, %{
+               max_pipeline_count: 32
+             })
+
+    assert is_pid(pid)
+    assert Process.alive?(pid)
+  end
+
+  test "delete_server_rpc terminates a running server and is idempotent" do
+    sname = :"delete_srv_#{System.unique_integer([:positive])}"
+    uid = "delete_uid_#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} = ServerSupSupervisor.start_server_rpc(:default, uid, config(sname, uid))
+
+    assert :ok = ServerSupSupervisor.delete_server_rpc(:default, sname)
+    assert :ok = ServerSupSupervisor.delete_server_rpc(:default, sname)
   end
 end

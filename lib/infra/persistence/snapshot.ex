@@ -1,4 +1,12 @@
 defmodule RaftEx.Infra.Persistence.Snapshot do
+  @moduledoc """
+  Behaviour implemented by snapshot storage backends.
+
+  Defines the lifecycle for writing, streaming and recovering snapshots:
+  prepare/write/sync on the writer side and begin_read/read_chunk plus
+  begin_accept/accept_chunk/complete_accept on the reader side.
+  """
+
   @callback prepare(index :: non_neg_integer(), state :: term()) :: ref :: term()
   @callback write(location :: String.t(), meta :: map(), ref :: term(), sync :: boolean()) ::
               :ok | {:ok, bytes :: non_neg_integer()} | {:error, term()}

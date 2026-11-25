@@ -26,3 +26,4 @@ raft_ex-*.tar
 wal.dat
 priv/plts
 .dexter.db*
+mise.toml

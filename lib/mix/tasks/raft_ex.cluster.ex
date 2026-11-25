@@ -16,6 +16,8 @@ defmodule Mix.Tasks.RaftEx.Cluster do
 
   use Mix.Task
 
+  alias RaftEx.Infra.Network.Distribution
+
   @shortdoc "Manage RaftEx distributed clusters"
   @impl Mix.Task
   def run(args) do
@@ -79,7 +81,7 @@ defmodule Mix.Tasks.RaftEx.Cluster do
     RaftEx.start_distribution(cookie: String.to_atom(cookie))
 
     connected =
-      RaftEx.Infra.Network.Distribution.connect_to_seeds(node_names, String.to_atom(cookie))
+      Distribution.connect_to_seeds(node_names, String.to_atom(cookie))
 
     if connected == [] do
       Mix.shell().warn("No seed nodes connected")
@@ -87,9 +89,7 @@ defmodule Mix.Tasks.RaftEx.Cluster do
       Mix.shell().info("Connected to: #{inspect(connected)}")
     end
 
-    Mix.shell().info(
-      "Cluster nodes: #{inspect(RaftEx.Infra.Network.Distribution.cluster_nodes())}"
-    )
+    Mix.shell().info("Cluster nodes: #{inspect(Distribution.cluster_nodes())}")
   end
 
   defp cmd_leader(cluster_name, _cookie, _timeout) do

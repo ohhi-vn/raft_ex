@@ -129,6 +129,23 @@ defmodule RaftEx.Domain.Server.Cluster do
   # Private
   # ---------------------------------------------------------------------------
 
+  @doc "Return the list of server ids whose membership role is `:voter`."
+  @spec voters(cluster()) :: [server_id()]
+  def voters(cluster) do
+    cluster
+    |> Enum.filter(fn {_id, peer} ->
+      case peer do
+        %{voter_status: %{membership: :voter}} -> true
+        _ -> false
+      end
+    end)
+    |> Enum.map(fn {id, _} -> id end)
+  end
+
+  @doc "Count the voters in `cluster`."
+  @spec voter_count(cluster()) :: non_neg_integer()
+  def voter_count(cluster), do: length(voters(cluster))
+
   defp ensure_self(cluster, self) do
     if Map.has_key?(cluster, self), do: cluster, else: Map.put(cluster, self, new_peer())
   end
@@ -140,7 +157,8 @@ defmodule RaftEx.Domain.Server.Cluster do
       match_index: 0,
       commit_index_sent: 0,
       query_index: 0,
-      status: :normal
+      status: :normal,
+      voter_status: %{membership: :voter, uid: nil}
     }
   end
 

@@ -172,16 +172,16 @@ defmodule RaftEx.Domain.MachineTest do
     end
   end
 
-  describe "version/1, is_versioned/1" do
+  describe "version/1, versioned?/1" do
     test "version defaults to zero" do
       assert Machine.version(MinimalMachine) == 0
       assert Machine.version(FullMachine) == 3
       assert Machine.version({:machine, FullMachine, %{}}) == 3
     end
 
-    test "is_versioned reflects the callback" do
-      refute Machine.is_versioned({:machine, MinimalMachine, %{}})
-      assert Machine.is_versioned({:machine, FullMachine, %{}})
+    test "versioned? reflects the callback" do
+      refute Machine.versioned?({:machine, MinimalMachine, %{}})
+      assert Machine.versioned?({:machine, FullMachine, %{}})
     end
   end
 

@@ -33,8 +33,9 @@ defmodule RaftEx.Domain.Server do
 
   require Logger
 
-  alias RaftEx.Domain.Server.{Cluster, Config, Effects}
-  alias RaftEx.Domain.{Types, Machine, Pipeline, Conn}
+  alias RaftEx.Domain.{Conn, Machine, Pipeline, Types}
+  alias RaftEx.Domain.Server.{Cluster, Config, Effects, Election, RpcHandler}
+  alias RaftEx.Domain.Utils
   alias RaftEx.Infra.Persistence.{Log, LogMeta}
 
   # ---------------------------------------------------------------------------
@@ -60,8 +61,8 @@ defmodule RaftEx.Domain.Server do
       Map.get(config, :command_plugs, Map.get(system_config, :command_plugs, []))
 
     raw_rpc_plugs = Map.get(config, :rpc_plugs, Map.get(system_config, :rpc_plugs, []))
-    command_plugs = RaftEx.Domain.Pipeline.init_plugs(raw_command_plugs)
-    rpc_plugs = RaftEx.Domain.Pipeline.init_plugs(raw_rpc_plugs)
+    command_plugs = Pipeline.init_plugs(raw_command_plugs)
+    rpc_plugs = Pipeline.init_plugs(raw_rpc_plugs)
     machine = normalise_machine(machine_conf)
     snap_module = Machine.snapshot_module(machine)
     counter = Map.get(config, :counter)
@@ -96,8 +97,7 @@ defmodule RaftEx.Domain.Server do
       id: id,
       uid: uid,
       log_id: log_id,
-      metrics_key:
-        Map.get(config, :metrics_key, RaftEx.Domain.Utils.ra_server_id_to_local_name(id)),
+      metrics_key: Map.get(config, :metrics_key, Utils.ra_server_id_to_local_name(id)),
       machine: machine,
       machine_version: latest_mac_ver,
       machine_versions: [{snap_idx, eff_mac_ver}],
@@ -131,7 +131,8 @@ defmodule RaftEx.Domain.Server do
       queries_waiting_heartbeats: :queue.new(),
       pending_consistent_queries: [],
       previous_cluster: nil,
-      rpc_from: nil
+      rpc_from: nil,
+      initial_members: initial_nodes
     }
   end
 
@@ -231,8 +232,14 @@ defmodule RaftEx.Domain.Server do
   def handle_leader({:ra_log_event, {:written, _, _} = evt}, %{log: log0} = state0) do
     {log, effects0} = Log.handle_event(evt, log0)
     {state1, effects1} = evaluate_quorum(%{state0 | log: log}, effects0)
-    {state, effects} = process_pending_consistent_queries(state1, effects1)
+    {state2, effects2} = process_pending_consistent_queries(state1, effects1)
+    {state, effects} = process_pending_read_queries(state2, effects2)
     {:leader, state, [{:next_event, :info, :pipeline_rpcs} | effects]}
+  end
+
+  def handle_leader({:ra_log_event, :major_compaction}, state) do
+    {state, effects} = maybe_checkpoint(state)
+    {:leader, state, effects}
   end
 
   def handle_leader({:ra_log_event, evt}, %{log: log0} = state) do
@@ -245,7 +252,7 @@ defmodule RaftEx.Domain.Server do
         %{rpc_from: peer_id, cluster: cluster} = state
       )
       when is_map_key(cluster, peer_id) do
-    {state, effects} = RaftEx.Domain.Server.RpcHandler.handle_append_entries_reply(reply, state)
+    {state, effects} = RpcHandler.handle_append_entries_reply(reply, state)
     {:leader, state, effects}
   end
 
@@ -253,7 +260,85 @@ defmodule RaftEx.Domain.Server do
     {:leader, state, []}
   end
 
+  def handle_leader(
+        %Types.HeartbeatReply{} = reply,
+        %{rpc_from: peer_id, cluster: cluster} = state
+      )
+      when is_map_key(cluster, peer_id) do
+    cluster = Cluster.update_peer(peer_id, %{query_index: reply.query_index}, cluster)
+    state = %{state | cluster: cluster}
+    {state, effects} = evaluate_consistent_heartbeats(state)
+    {:leader, state, effects}
+  end
+
+  def handle_leader(%Types.HeartbeatReply{}, state) do
+    {:leader, state, []}
+  end
+
+  def handle_leader(
+        %Types.InstallSnapshotResult{} = reply,
+        %{rpc_from: peer_id, cluster: cluster} = state
+      )
+      when is_map_key(cluster, peer_id) do
+    if reply.term > state.current_term do
+      {new_state, effects} = adopt_term(reply.term, state, nil)
+      {:follower, new_state, effects}
+    else
+      cluster =
+        Cluster.update_peer(
+          peer_id,
+          %{match_index: reply.last_index, next_index: reply.last_index + 1},
+          state.cluster
+        )
+
+      state = %{state | cluster: cluster}
+      {:leader, state, [{:clear_snapshot_send, peer_id}, {:next_event, :info, :pipeline_rpcs}]}
+    end
+  end
+
+  def handle_leader({:local_query, query_fun}, state) do
+    local_query_result(query_fun, state, :leader)
+  end
+
+  def handle_leader({:local_query, query_fun, _opts}, state) do
+    local_query_result(query_fun, state, :leader)
+  end
+
+  def handle_leader({:consistent_query, query_fun}, state) do
+    consistent_query_admit(query_fun, state)
+  end
+
+  def handle_leader({:consistent_aux, aux_cmd}, state) do
+    consistent_aux_admit(aux_cmd, state)
+  end
+
+  def handle_leader({:aux_command, cmd}, state) do
+    {_, state, effects} = handle_aux(:leader, :call, cmd, state)
+    {:leader, state, effects}
+  end
+
+  def handle_leader({:aux_command, cmd, _opts}, state) do
+    {_, state, effects} = handle_aux(:leader, :call, cmd, state)
+    {:leader, state, effects}
+  end
+
+  def handle_leader({:transfer_leadership, target}, state) do
+    transfer_leadership(target, state)
+  end
+
   def handle_leader(_msg, state), do: {:leader, state, []}
+
+  @doc "Adopt a higher term and optionally record a vote, returning durable store_meta effects."
+  @spec adopt_term(RaftEx.Domain.Types.term_num(), map(), term()) :: {map(), [term()]}
+  def adopt_term(term, %{current_term: cur} = state, voted_for \\ nil) do
+    if term > cur do
+      effects = [{:store_meta, :current_term, term}, {:store_meta, :voted_for, voted_for}]
+      state = %{state | current_term: term, voted_for: voted_for, leader_id: nil}
+      {state, effects}
+    else
+      {state, []}
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Follower message handlers
@@ -282,12 +367,60 @@ defmodule RaftEx.Domain.Server do
       {:follower, state0, [{:send_rpc, rpc.leader_id, reply}]}
     else
       rpc = Map.get(conn.request, :rpc, rpc)
-      RaftEx.Domain.Server.RpcHandler.handle_append_entries_rpc(rpc, state0)
+      RpcHandler.handle_append_entries_rpc(rpc, state0)
+    end
+  end
+
+  def handle_follower(%Types.PreVoteRpc{} = rpc, state) do
+    {granted, effects0} = Election.handle_pre_vote_request(rpc, state)
+
+    reply = %Types.PreVoteResult{
+      term: state.current_term,
+      token: rpc.token,
+      vote_granted: granted
+    }
+
+    {:follower, state, effects0 ++ [{:send_rpc, rpc.candidate_id, reply}]}
+  end
+
+  def handle_follower(%Types.RequestVoteRpc{} = rpc, state) do
+    {granted, new_state, effects} =
+      Election.handle_vote_request(rpc, state)
+
+    reply = %Types.RequestVoteResult{
+      term: new_state.current_term,
+      vote_granted: granted
+    }
+
+    {:follower, new_state, effects ++ [{:send_rpc, rpc.candidate_id, reply}]}
+  end
+
+  def handle_follower(%Types.InstallSnapshotRpc{} = rpc, state) do
+    RpcHandler.handle_install_snapshot_rpc(rpc, state)
+  end
+
+  def handle_follower(%Types.TimeoutNowRpc{} = rpc, state) do
+    if rpc.term >= state.current_term do
+      state =
+        if rpc.term > state.current_term do
+          %{state | current_term: rpc.term, voted_for: nil, leader_id: nil}
+        else
+          %{state | leader_id: nil}
+        end
+
+      {:candidate, state, []}
+    else
+      {:follower, state, []}
     end
   end
 
   def handle_follower(%Types.HeartbeatRpc{} = rpc, state) do
-    {state, effects} = RaftEx.Domain.Server.RpcHandler.handle_heartbeat_rpc(rpc, state)
+    {state, effects} = RpcHandler.handle_heartbeat_rpc(rpc, state)
+    {:follower, state, effects}
+  end
+
+  def handle_follower({:ra_log_event, :major_compaction}, state) do
+    {state, effects} = maybe_checkpoint(state)
     {:follower, state, effects}
   end
 
@@ -295,7 +428,159 @@ defmodule RaftEx.Domain.Server do
     call_for_election(:pre_vote, state)
   end
 
+  def handle_follower({:local_query, query_fun}, state) do
+    local_query_result(query_fun, state, :follower)
+  end
+
+  def handle_follower({:local_query, query_fun, _opts}, state) do
+    local_query_result(query_fun, state, :follower)
+  end
+
+  def handle_follower({:aux_command, cmd}, state) do
+    {_, state, effects} = handle_aux(:follower, :call, cmd, state)
+    {:follower, state, effects}
+  end
+
+  def handle_follower({:aux_command, cmd, _opts}, state) do
+    {_, state, effects} = handle_aux(:follower, :call, cmd, state)
+    {:follower, state, effects}
+  end
+
   def handle_follower(_msg, state), do: {:follower, state, []}
+
+  # ---------------------------------------------------------------------------
+  # Private — query helpers
+  # ---------------------------------------------------------------------------
+
+  defp local_query_result(query_fun, state, raft_state) do
+    %{
+      cfg: %Config{id: id, machine: {_, mac_mod, _}, effective_machine_version: mac_ver},
+      machine_state: mac_state,
+      last_applied: last,
+      current_term: term
+    } = state
+
+    ctx = %{index: last, term: term, machine_version: mac_ver}
+    result = Machine.query(mac_mod, query_fun, mac_state, ctx)
+    {raft_state, state, [{:reply, {:ok, result, id}}]}
+  end
+
+  defp consistent_query_admit(query_fun, state) do
+    qr = {:query, Map.get(state, :query_from), query_fun, state.commit_index}
+    peer_map = Cluster.peers(state.cfg.id, state.cluster)
+
+    if map_size(peer_map) == 0 do
+      effects = apply_consistent_queries_effects([qr], state)
+      {:leader, state, effects}
+    else
+      {new_state, effects} = make_heartbeat_rpc_effects(qr, state)
+      {:leader, new_state, effects}
+    end
+  end
+
+  defp consistent_aux_admit(aux_cmd, state) do
+    qr = {:aux, Map.get(state, :query_from), aux_cmd, state.commit_index}
+    peer_map = Cluster.peers(state.cfg.id, state.cluster)
+
+    if map_size(peer_map) == 0 do
+      effects = apply_consistent_queries_effects([qr], state)
+      {:leader, state, effects}
+    else
+      {new_state, effects} = make_heartbeat_rpc_effects(qr, state)
+      {:leader, new_state, effects}
+    end
+  end
+
+  # credo:disable-for-lines:60
+  defp evaluate_consistent_heartbeats(state) do
+    waiting = state.queries_waiting_heartbeats
+    list = :queue.to_list(waiting)
+
+    {remaining, state, effects} =
+      Enum.reduce(list, {[], state, []}, fn {qi, qr}, {acc, st, effs} ->
+        read_ci = elem(qr, 3)
+        voter_total = Cluster.voter_count(st.cluster)
+
+        count =
+          Enum.count(st.cluster, fn {id, peer} ->
+            is_voter =
+              case peer do
+                %{voter_status: %{membership: :voter}} -> true
+                _ -> id == st.cfg.id and st.membership == :voter
+              end
+
+            is_voter and
+              (id == st.cfg.id or Map.get(peer, :query_index, 0) >= qi)
+          end)
+
+        majority = div(voter_total, 2) + 1
+
+        if count >= majority do
+          if st.last_applied >= read_ci do
+            reply_eff = process_consistent_query(qr, st)
+            {acc, st, [reply_eff | effs]}
+          else
+            st = %{st | pending_consistent_queries: st.pending_consistent_queries ++ [qr]}
+            {acc, st, effs}
+          end
+        else
+          {[{qi, qr} | acc], st, effs}
+        end
+      end)
+
+    new_waiting = :queue.from_list(Enum.reverse(remaining))
+    state = %{state | queries_waiting_heartbeats: new_waiting}
+    {state, effects}
+  end
+
+  defp process_pending_read_queries(%{pending_consistent_queries: []} = state, effects),
+    do: {state, effects}
+
+  defp process_pending_read_queries(state, effects) do
+    {ready, rest} =
+      Enum.split_with(state.pending_consistent_queries, fn qr ->
+        elem(qr, 3) <= state.last_applied
+      end)
+
+    state = %{state | pending_consistent_queries: rest}
+    new_effects = Enum.map(ready, &process_consistent_query(&1, state))
+    {state, new_effects ++ effects}
+  end
+
+  defp transfer_leadership(target, state) do
+    id = state.cfg.id
+
+    cond do
+      target == id ->
+        {:leader, state, [{:reply, {:error, :self}}]}
+
+      not Map.has_key?(state.cluster, target) ->
+        {:leader, state, [{:reply, {:error, :not_member}}]}
+
+      true ->
+        peer = Map.get(state.cluster, target)
+
+        is_voter =
+          case peer do
+            %{voter_status: %{membership: :voter}} -> true
+            _ -> false
+          end
+
+        caught_up = Map.get(peer, :match_index, 0) >= state.commit_index
+
+        if not is_voter or not caught_up do
+          {:leader, state, [{:reply, {:error, :not_caught_up}}]}
+        else
+          # send TimeoutNowRpc
+          rpc = %Types.TimeoutNowRpc{term: state.current_term, leader_id: id}
+          effects = [{:send_rpc, target, rpc}]
+          state = Map.put(state, :transfer_leadership, target)
+
+          {:leader, state,
+           effects ++ [{:transfer_leadership_timeout, target}, {:reply, {:ok, target}}]}
+        end
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Public state accessors
@@ -311,8 +596,12 @@ defmodule RaftEx.Domain.Server do
   def machine_version(%{cfg: %Config{machine_version: mv}}), do: mv
   def machine(%{cfg: %Config{machine: m}}), do: m
 
-  def is_new?(%{log: log}), do: Log.next_index(log) == 1
-  def is_fully_persisted?(%{log: log}), do: Log.last_written(log) == Log.last_index_term(log)
+  def new?(%{log: log}), do: Log.next_index(log) == 1
+  def fully_persisted?(%{log: log}), do: Log.last_written(log) == Log.last_index_term(log)
+
+  def get_membership(%{membership: membership})
+      when is_atom(membership) and membership != nil,
+      do: membership
 
   def get_membership(%{cfg: %Config{id: id, uid: uid}, cluster: cluster} = state) do
     Cluster.get_membership(cluster, id, uid, Map.get(state, :membership, :voter))
@@ -337,7 +626,10 @@ defmodule RaftEx.Domain.Server do
   def state_query(:leader, state), do: Map.get(state, :leader_id)
   def state_query(:machine, %{machine_state: ms}), do: ms
   def state_query(:last_applied, state), do: Map.get(state, :last_applied)
-  def state_query(:initial_members, %{cluster: c}), do: Map.keys(c)
+
+  def state_query(:initial_members, %{cluster: c} = state),
+    do: Map.get(state, :initial_members, Map.keys(c))
+
   def state_query(:overview, state), do: overview(state)
   def state_query(_, state), do: state
 
@@ -442,6 +734,27 @@ defmodule RaftEx.Domain.Server do
     end
   end
 
+  def handle_aux(
+        raft_state,
+        type,
+        cmd,
+        %{
+          cfg: %Config{
+            effective_machine_module: mac_mod,
+            effective_handle_aux_fun: {:handle_aux, 6}
+          },
+          aux_state: aux0,
+          log: log0,
+          machine_state: mac_state0
+        }
+      ) do
+    case Machine.handle_aux(mac_mod, raft_state, type, cmd, aux0, log0, mac_state0) do
+      {:reply, reply, aux, state} -> {raft_state, put_aux(state, aux), [{:reply, reply}]}
+      {:no_reply, aux, state} -> {raft_state, put_aux(state, aux), []}
+      {:no_reply, aux, state, effects} -> {raft_state, put_aux(state, aux), effects}
+    end
+  end
+
   @spec tick(map()) :: list()
   def tick(%{cfg: %Config{effective_machine_module: mac_mod}, machine_state: mac_state}) do
     Machine.tick(mac_mod, :erlang.system_time(:millisecond), mac_state)
@@ -497,7 +810,8 @@ defmodule RaftEx.Domain.Server do
   @spec terminate(map(), term()) :: :ok
   def terminate(%{log: _log} = state, _reason) do
     state1 = maybe_write_recovery_checkpoint(state)
-    %{log: log2} = persist_last_applied(state1)
+    {state2, _effects} = maybe_checkpoint(state1)
+    %{log: log2} = persist_last_applied(state2)
     Log.close(log2)
     :ok
   end
@@ -825,26 +1139,103 @@ defmodule RaftEx.Domain.Server do
   end
 
   defp append_log_as_leader({tag, _, _, _}, _, _, state, effects)
-       when tag in [:"$ra_join", :"$ra_leave"] and not state.cluster_change_permitted,
+       when tag in [:"$ra_join", :"$ra_leave", :"$ra_promote", :"$ra_demote"] and
+              not state.cluster_change_permitted,
        do: {:not_appended, :cluster_change_not_permitted, state, effects}
 
   defp append_log_as_leader(
-         {:"$ra_join", from, joining, reply_mode},
+         {:"$ra_join", from, {joining, membership}, reply_mode},
          cluster,
          _cfg,
          state,
          effects
        ) do
-    new_cluster =
-      Map.put(cluster, joining, %{
-        status: :normal,
-        next_index: 1,
-        query_index: 0,
-        match_index: 0,
-        commit_index_sent: 0
-      })
+    if Map.has_key?(cluster, joining) do
+      {:not_appended, :already_member, state, effects}
+    else
+      peer =
+        Cluster.new_peer()
+        |> Map.put(:voter_status, %{membership: membership, uid: nil})
 
-    append_cluster_change(new_cluster, from, reply_mode, state, effects)
+      new_cluster = Map.put(cluster, joining, peer)
+      append_cluster_change(new_cluster, from, reply_mode, state, effects)
+    end
+  end
+
+  defp append_log_as_leader(
+         {:"$ra_join", from, joining, reply_mode},
+         cluster,
+         cfg,
+         state,
+         effects
+       ) do
+    append_log_as_leader(
+      {:"$ra_join", from, {joining, :voter}, reply_mode},
+      cluster,
+      cfg,
+      state,
+      effects
+    )
+  end
+
+  defp append_log_as_leader(
+         {:"$ra_promote", from, target, reply_mode},
+         cluster,
+         _cfg,
+         state,
+         effects
+       ) do
+    case Map.fetch(cluster, target) do
+      :error ->
+        {:not_appended, :not_member, state, effects}
+
+      {:ok, peer} ->
+        membership = get_in(peer, [:voter_status, :membership]) || :voter
+
+        cond do
+          membership == :voter ->
+            {:not_appended, :already_voter, state, effects}
+
+          Map.get(peer, :match_index, 0) < state.commit_index ->
+            {:not_appended, :not_caught_up, state, effects}
+
+          true ->
+            new_cluster =
+              put_in(cluster, [target, :voter_status], %{membership: :voter, uid: nil})
+
+            append_cluster_change(new_cluster, from, reply_mode, state, effects)
+        end
+    end
+  end
+
+  defp append_log_as_leader(
+         {:"$ra_demote", from, target, reply_mode},
+         cluster,
+         _cfg,
+         state,
+         effects
+       ) do
+    case Map.fetch(cluster, target) do
+      :error ->
+        {:not_appended, :not_member, state, effects}
+
+      {:ok, peer} ->
+        membership = get_in(peer, [:voter_status, :membership]) || :voter
+
+        cond do
+          membership != :voter ->
+            {:not_appended, :not_voter, state, effects}
+
+          Cluster.voter_count(cluster) <= 1 ->
+            {:not_appended, :last_voter, state, effects}
+
+          true ->
+            new_cluster =
+              put_in(cluster, [target, :voter_status], %{membership: :non_voter, uid: nil})
+
+            append_cluster_change(new_cluster, from, reply_mode, state, effects)
+        end
+    end
   end
 
   defp append_log_as_leader(
@@ -1130,8 +1521,14 @@ defmodule RaftEx.Domain.Server do
     {:reply, from, {:ok, result, id}}
   end
 
-  defp process_consistent_query({:aux, from, aux_cmd, _}, _state),
-    do: {:next_event, {:call, from}, {:aux_command, {:"$wrap_reply", aux_cmd}}}
+  defp process_consistent_query({:aux, from, aux_cmd, _}, state) do
+    {_, _state, effects} = handle_aux(:leader, :call, aux_cmd, state)
+
+    Enum.map(effects, fn
+      {:reply, reply} -> {:reply, from, reply}
+      eff -> eff
+    end)
+  end
 
   # ---------------------------------------------------------------------------
   # Private — release cursor / checkpoint
@@ -1152,6 +1549,29 @@ defmodule RaftEx.Domain.Server do
   end
 
   defp maybe_emit_pending_release_cursor(state, effects), do: {state, effects}
+
+  defp maybe_checkpoint(%{log: log0, last_applied: idx, cfg: %Config{machine: machine}} = state)
+       when idx > 0 do
+    snap_idx =
+      case Log.snapshot_index_term(log0) do
+        {i, _} -> i
+        nil -> 0
+      end
+
+    if idx > snap_idx do
+      mac_ver = index_machine_version(idx, state)
+      mac_mod = Machine.which_module(machine, mac_ver)
+
+      {log, effects} =
+        Log.checkpoint(idx, state.cluster, {mac_ver, mac_mod}, state.machine_state, log0)
+
+      {%{state | log: log}, effects}
+    else
+      {state, []}
+    end
+  end
+
+  defp maybe_checkpoint(state), do: {state, []}
 
   defp do_update_release_cursor(
          index,
@@ -1257,9 +1677,15 @@ defmodule RaftEx.Domain.Server do
         cluster = Cluster.new(id, initial_nodes)
         {cluster, initial_mac_ver, mac_state, {0, 0}}
 
-      {%{index: idx, term: term, cluster: cluster_nodes, machine_version: mac_ver}, mac_st} ->
-        cluster = Cluster.new(id, cluster_nodes)
-        {cluster, mac_ver, mac_st, {idx, term}}
+      mac_st ->
+        {idx, term} =
+          case Log.snapshot_index_term(log) do
+            {i, t} -> {i, t}
+            nil -> {0, 0}
+          end
+
+        cluster = Cluster.new(id, initial_nodes)
+        {cluster, initial_mac_ver, mac_st, {idx, term}}
     end
   end
 
@@ -1276,8 +1702,18 @@ defmodule RaftEx.Domain.Server do
   defp put_peer(peer_id, peer, %{cluster: cluster} = state),
     do: %{state | cluster: Map.put(cluster, peer_id, peer)}
 
-  defp meta_name(%Config{system_config: %{names: %{log_meta: name}}}), do: name
-  defp meta_name(%{names: %{log_meta: name}}), do: name
+  def meta_name(%Config{system_config: %{names: %{log_meta: name}}}), do: name
+  def meta_name(%{names: %{log_meta: name}}), do: name
+
+  def meta_name(%Config{system_config: %{names: names}}) when is_map(names) do
+    names[:log_meta] || :ra_log_meta
+  end
+
+  def meta_name(%{names: names}) when is_map(names) do
+    names[:log_meta] || :ra_log_meta
+  end
+
+  def meta_name(_), do: :ra_log_meta
 
   defp maybe_write_recovery_checkpoint(state), do: state
 

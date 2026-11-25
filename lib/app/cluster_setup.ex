@@ -9,6 +9,9 @@ defmodule RaftEx.App.ClusterSetup do
 
   require Logger
 
+  alias RaftEx.App.Cluster
+  alias RaftEx.Infra.Network.Distribution
+
   @doc """
   Full cluster bootstrap on the current node.
 
@@ -46,9 +49,9 @@ defmodule RaftEx.App.ClusterSetup do
       start_system("/tmp/raft_ex/#{self_node}")
     end
 
-    case RaftEx.App.Cluster.form_cluster(cluster_name, machine, all_nodes, opts) do
+    case Cluster.form_cluster(cluster_name, machine, all_nodes, opts) do
       {:ok, local_ids} ->
-        all_ids = RaftEx.Infra.Network.Distribution.build_server_ids(all_nodes)
+        all_ids = Distribution.build_server_ids(all_nodes)
         Logger.info("RaftEx.App.ClusterSetup: cluster #{inspect(cluster_name)} ready")
         {:ok, local_ids, all_ids}
 

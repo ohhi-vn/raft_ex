@@ -33,7 +33,10 @@ defmodule RaftEx.Infra.Persistence.Log do
 
   require Logger
 
+  alias RaftEx.Domain.LruCache
+  alias RaftEx.Infra.Filesystem
   alias RaftEx.Infra.Persistence.LogMeta
+  alias RaftEx.Infra.Persistence.LogSnapshot
   alias RaftEx.Infra.Persistence.LogWal
 
   # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ defmodule RaftEx.Infra.Persistence.Log do
   @spec init(map()) :: t()
   def init(%{uid: uid, system_config: %{data_dir: data_dir, names: names}} = conf) do
     dir = server_data_dir(data_dir, uid)
-    RaftEx.Infra.Filesystem.make_dir(dir)
+    Filesystem.make_dir(dir)
 
     # Get process names
     wal_name = Map.fetch!(names, :wal)
@@ -125,41 +128,9 @@ defmodule RaftEx.Infra.Persistence.Log do
       |> Enum.into(%{}, fn {idx, term, cmd} -> {idx, {idx, term, cmd}} end)
 
     # Determine range
-    range =
-      cond do
-        snapshot_index > 0 and map_size(entries) > 0 ->
-          {snapshot_index + 1, wal_last}
-
-        snapshot_index > 0 ->
-          {snapshot_index, snapshot_index}
-
-        map_size(entries) > 0 ->
-          {1, wal_last}
-
-        true ->
-          nil
-      end
-
-    next_index =
-      cond do
-        snapshot_index > 0 and map_size(entries) > 0 -> wal_last + 1
-        snapshot_index > 0 -> snapshot_index + 1
-        map_size(entries) > 0 -> wal_last + 1
-        true -> 1
-      end
-
-    last_term =
-      cond do
-        map_size(entries) > 0 ->
-          {_, {_, term, _}} = Enum.max_by(entries, fn {idx, _} -> idx end)
-          term
-
-        snapshot_term > 0 ->
-          snapshot_term
-
-        true ->
-          0
-      end
+    range = compute_range(snapshot_index, entries, wal_last)
+    next_index = compute_next_index(snapshot_index, entries, wal_last)
+    last_term = compute_last_term(snapshot_term, entries)
 
     %__MODULE__{
       cfg: conf,
@@ -181,6 +152,45 @@ defmodule RaftEx.Infra.Persistence.Log do
       entries: entries,
       next_index: next_index
     }
+  end
+
+  defp compute_range(snapshot_index, entries, wal_last) do
+    cond do
+      snapshot_index > 0 and map_size(entries) > 0 ->
+        {snapshot_index + 1, wal_last}
+
+      snapshot_index > 0 ->
+        {snapshot_index, snapshot_index}
+
+      map_size(entries) > 0 ->
+        {1, wal_last}
+
+      true ->
+        nil
+    end
+  end
+
+  defp compute_next_index(snapshot_index, entries, wal_last) do
+    cond do
+      snapshot_index > 0 and map_size(entries) > 0 -> wal_last + 1
+      snapshot_index > 0 -> snapshot_index + 1
+      map_size(entries) > 0 -> wal_last + 1
+      true -> 1
+    end
+  end
+
+  defp compute_last_term(snapshot_term, entries) do
+    cond do
+      map_size(entries) > 0 ->
+        {_, {_, term, _}} = Enum.max_by(entries, fn {idx, _} -> idx end)
+        term
+
+      snapshot_term > 0 ->
+        snapshot_term
+
+      true ->
+        0
+    end
   end
 
   @doc """
@@ -233,30 +243,26 @@ defmodule RaftEx.Infra.Persistence.Log do
           {:ok, t()} | {:error, term()}
   def write(entries, %__MODULE__{} = state) do
     case entries do
-      [] ->
-        {:ok, state}
+      [] -> {:ok, state}
+      _ -> write_entries(entries, state)
+    end
+  end
 
-      _ ->
-        # Write to WAL first (true write-ahead semantics).  Each server has its
-        # own WAL file, selected by its uid.  Fixtures may build a log without
-        # a WAL process; in that case the append is in-memory only.
-        log_uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
+  defp write_entries(entries, state) do
+    # Write to WAL first (true write-ahead semantics).  Each server has its
+    # own WAL file, selected by its uid.  Fixtures may build a log without
+    # a WAL process; in that case the append is in-memory only.
+    log_uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
 
-        case do_wal_write(state.wal_name, log_uid, entries) do
-          {:ok, _, _} ->
-            # WAL write succeeded, now update in-memory state
-            new_state =
-              Enum.reduce(entries, state, fn entry, acc ->
-                append(entry, acc)
-              end)
+    case do_wal_write(state.wal_name, log_uid, entries) do
+      {:ok, _, _} ->
+        # WAL write succeeded, now update in-memory state
+        {:ok, Enum.reduce(entries, state, &append/2)}
 
-            {:ok, new_state}
-
-          {:error, reason} ->
-            Logger.error("RaftEx.Infra.Persistence.Log: WAL write failed: #{inspect(reason)}")
-            # Return error without modifying in-memory state
-            {:error, reason}
-        end
+      {:error, reason} ->
+        Logger.error("RaftEx.Infra.Persistence.Log: WAL write failed: #{inspect(reason)}")
+        # Return error without modifying in-memory state
+        {:error, reason}
     end
   end
 
@@ -391,7 +397,7 @@ defmodule RaftEx.Infra.Persistence.Log do
         end
       end)
 
-    {results, flru || RaftEx.Domain.LruCache.new(1, nil)}
+    {results, flru || LruCache.new(1, nil)}
   end
 
   @doc """
@@ -471,7 +477,14 @@ defmodule RaftEx.Infra.Persistence.Log do
   Get the size of the current snapshot.
   """
   @spec snapshot_size(t()) :: non_neg_integer() | nil
-  def snapshot_size(%__MODULE__{} = _state), do: nil
+  def snapshot_size(%__MODULE__{} = state) do
+    file = Path.join(Path.join(state.data_dir, "snapshot"), "snapshot.dat")
+
+    case File.stat(file) do
+      {:ok, stat} -> stat.size
+      {:error, _} -> nil
+    end
+  end
 
   @doc """
   Set the snapshot state.
@@ -491,6 +504,16 @@ defmodule RaftEx.Infra.Persistence.Log do
           t()
         ) :: {:ok, t(), [term()]}
   def install_snapshot({snap_idx, _snap_term} = idx_term, _mac_mod, live_indexes, state) do
+    uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
+
+    if uid != nil and state.wal_name != nil do
+      try do
+        LogWal.truncate(state.wal_name, uid, snap_idx)
+      catch
+        _, _ -> :ok
+      end
+    end
+
     # Remove entries up to snapshot index
     new_entries =
       state.entries
@@ -551,10 +574,8 @@ defmodule RaftEx.Infra.Persistence.Log do
           term(),
           t()
         ) :: {t(), [term()]}
-  def update_release_cursor(_idx, _cluster, {_mac_ver, _mac_mod}, _mac_state, state) do
-    # In a full implementation, this would coordinate with the cluster
-    # to determine if a snapshot can be released
-    {state, []}
+  def update_release_cursor(idx, cluster, mac_ctx, mac_state, state) do
+    checkpoint(idx, cluster, mac_ctx, mac_state, state)
   end
 
   @doc """
@@ -567,11 +588,90 @@ defmodule RaftEx.Infra.Persistence.Log do
           term(),
           t()
         ) :: {t(), [term()]}
-  def checkpoint(_idx, _cluster, _mac_ctx, _mac_state, state) do
-    # Persist checkpoint metadata
-    # LogMeta.store(state.meta_name, state.cfg.uid, :last_applied, idx)
+  def checkpoint(_idx, _cluster, _mac_ctx, _mac_state, %__MODULE__{cfg: cfg} = state)
+      when not is_map(cfg),
+      do: {state, []}
 
-    {state, []}
+  def checkpoint(_idx, _cluster, _mac_ctx, _mac_state, %__MODULE__{data_dir: dir} = state)
+      when not is_binary(dir),
+      do: {state, []}
+
+  def checkpoint(idx, _cluster, {mac_ver, _mac_mod}, mac_state, %__MODULE__{} = state) do
+    snap_mod = Map.get(state.cfg, :snapshot_module, LogSnapshot)
+    snap_dir = Path.join(state.data_dir, "snapshot")
+    :ok = Filesystem.make_dir(snap_dir)
+
+    {term, _} = fetch_term(idx, state)
+    snap_term = if is_integer(term), do: term, else: Map.get(state, :last_term, 0)
+
+    meta = %{
+      index: idx,
+      term: snap_term,
+      cluster: %{},
+      machine_version: mac_ver
+    }
+
+    case snap_mod.write(snap_dir, meta, mac_state, true) do
+      {:ok, _bytes} ->
+        compact_after_snapshot(idx, snap_term, mac_state, state)
+
+      {:error, reason} ->
+        Logger.error("RaftEx.Log: checkpoint failed: #{inspect(reason)}")
+        {state, []}
+    end
+  end
+
+  defp compact_after_snapshot(idx, snap_term, mac_state, state) do
+    new_entries =
+      state.entries
+      |> Enum.reject(fn {i, _} -> i <= idx end)
+      |> Enum.into(%{})
+
+    if state.mem_table do
+      :ets.select_delete(state.mem_table, [{{:"$1", :_, :_}, [{:"=<", :"$1", idx}], [true]}])
+    end
+
+    new_range = range_from_entries_or(new_entries, {idx, idx})
+
+    {last_idx, last_term} =
+      case Enum.max_by(new_entries, fn {i, _} -> i end, fn -> nil end) do
+        {i, {_, t, _}} -> {i, t}
+        nil -> {idx, snap_term}
+      end
+
+    uid = Map.get(state.cfg, :uid)
+
+    if uid != nil and state.wal_name != nil do
+      safe_truncate(state.wal_name, uid, idx)
+    end
+
+    new_state = %{
+      state
+      | current_snapshot: {idx, snap_term},
+        snapshot_state: mac_state,
+        entries: new_entries,
+        range: new_range,
+        last_term: last_term,
+        last_written_index_term: {last_idx, last_term},
+        next_index: max(idx, last_idx) + 1
+    }
+
+    {new_state, []}
+  end
+
+  defp range_from_entries_or(entries, fallback) do
+    if map_size(entries) == 0 do
+      fallback
+    else
+      keys = Map.keys(entries)
+      {Enum.min(keys), Enum.max(keys)}
+    end
+  end
+
+  defp safe_truncate(wal_name, uid, index) do
+    LogWal.truncate(wal_name, uid, index)
+  catch
+    _, _ -> :ok
   end
 
   @doc """
@@ -601,17 +701,10 @@ defmodule RaftEx.Infra.Persistence.Log do
   """
   @spec truncate(RaftEx.Domain.Types.index(), t()) :: t()
   def truncate(from_index, %__MODULE__{entries: entries, range: _range} = state) do
+    truncate_wal_from(state, from_index)
+
     new_entries = Map.reject(entries, fn {idx, _} -> idx >= from_index end)
-
-    new_range =
-      cond do
-        map_size(new_entries) == 0 ->
-          nil
-
-        true ->
-          keys = Map.keys(new_entries)
-          {Enum.min(keys), Enum.max(keys)}
-      end
+    new_range = range_from_entries_or(new_entries, nil)
 
     {new_last_index, new_last_term} =
       case Enum.max_by(new_entries, fn {idx, _} -> idx end, fn -> nil end) do
@@ -627,6 +720,21 @@ defmodule RaftEx.Infra.Persistence.Log do
         last_written_index_term: {new_last_index, new_last_term},
         next_index: if(new_last_index > 0, do: new_last_index + 1, else: from_index)
     }
+  end
+
+  defp truncate_wal_from(state, from_index) do
+    uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
+    wal_name = state.wal_name
+
+    if uid != nil and wal_name != nil do
+      safe_truncate_from(wal_name, uid, from_index)
+    end
+  end
+
+  defp safe_truncate_from(wal_name, uid, from_index) do
+    LogWal.truncate_from(wal_name, uid, from_index)
+  catch
+    _, _ -> :ok
   end
 
   @doc """
@@ -683,7 +791,7 @@ defmodule RaftEx.Infra.Persistence.Log do
     config_path = Path.join(dir, "config")
     clean = Map.drop(config, [:parent, :counter, :has_changed, :system_config])
     # Use :erlang.term_to_binary for reliable serialization
-    RaftEx.Infra.Filesystem.write_file(config_path, :erlang.term_to_binary(clean), false)
+    Filesystem.write_file(config_path, :erlang.term_to_binary(clean), false)
   end
 
   @doc """
@@ -724,7 +832,7 @@ defmodule RaftEx.Infra.Persistence.Log do
   def delete_everything(%__MODULE__{cfg: %{uid: uid}} = state) do
     close(state)
     dir = server_data_dir(state.data_dir, uid)
-    RaftEx.Infra.Filesystem.recursive_delete(dir)
+    Filesystem.recursive_delete(dir)
     :ok
   end
 
@@ -754,7 +862,7 @@ defmodule RaftEx.Infra.Persistence.Log do
 
     case :prim_file.read_file_info(snapshot_dir) do
       {:ok, _} ->
-        case RaftEx.Infra.Persistence.LogSnapshot.recover(snapshot_dir) do
+        case LogSnapshot.recover(snapshot_dir) do
           {:ok, meta, mac_state} ->
             snap_idx = Map.get(meta, :index, 0)
             snap_term = Map.get(meta, :term, 0)

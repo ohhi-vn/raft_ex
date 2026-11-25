@@ -1,5 +1,12 @@
 defmodule RaftEx.App.System do
+  @moduledoc """
+  Manages the lifecycle and configuration of a RaftEx system.
+  """
+
   require Logger
+
+  alias RaftEx.Infra.Config.Env
+  alias RaftEx.Infra.Supervisor.SystemsSupervisor
 
   @type names :: %{
           wal: atom(),
@@ -19,13 +26,13 @@ defmodule RaftEx.App.System do
 
   def start(%{name: name} = config) do
     Logger.info("ra: starting system #{name}")
-    RaftEx.Infra.Supervisor.SystemsSupervisor.start_system(config)
+    SystemsSupervisor.start_system(config)
   end
 
   def start_default, do: start(default_config())
 
   def default_config do
-    data_dir = RaftEx.Infra.Config.Env.data_dir()
+    data_dir = Env.data_dir()
 
     %{
       name: :default,
@@ -107,7 +114,7 @@ defmodule RaftEx.App.System do
   end
 
   def stop(system) do
-    RaftEx.Infra.Supervisor.SystemsSupervisor.stop_system(system)
+    SystemsSupervisor.stop_system(system)
   end
 
   def stop_default do

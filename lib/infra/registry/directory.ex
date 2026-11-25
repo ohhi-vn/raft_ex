@@ -1,5 +1,11 @@
 defmodule RaftEx.Infra.Registry.Directory do
+  @moduledoc """
+  ETS/DETS-backed registry mapping server names and UIDs to processes.
+  """
+
   require Logger
+
+  alias RaftEx.Infra.Filesystem
 
   def init(system) when is_atom(system) do
     case RaftEx.App.System.fetch(system) do
@@ -10,7 +16,7 @@ defmodule RaftEx.Infra.Registry.Directory do
 
   def init(dir, %{directory: name, directory_rev: name_rev}) do
     :ets.new(name, [:named_table, :public, {:read_concurrency, true}])
-    RaftEx.Infra.Filesystem.make_dir(dir)
+    Filesystem.make_dir(dir)
 
     dets_file = Path.join(dir, "names.dets") |> String.to_charlist()
 

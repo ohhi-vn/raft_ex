@@ -1,10 +1,23 @@
 defmodule RaftEx.Infra.Config.Env do
+  @moduledoc """
+  Resolves RaftEx runtime configuration from the application environment.
+
+  In particular, it computes the per-node data directory and configures the
+  logger module used by the underlying `ra` library.
+  """
+
   def data_dir do
     base =
-      case Application.get_env(:ra, :data_dir) do
+      case Application.get_env(:raft_ex, :data_dir) do
         nil ->
-          {:ok, cwd} = File.cwd()
-          cwd
+          case Application.get_env(:ra, :data_dir) do
+            nil ->
+              {:ok, cwd} = File.cwd()
+              cwd
+
+            dir ->
+              dir
+          end
 
         dir ->
           dir

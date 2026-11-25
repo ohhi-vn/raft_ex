@@ -1,4 +1,9 @@
 defmodule RaftEx.Infra.Process.Worker do
+  @moduledoc """
+  A simple GenServer worker that executes queued functions or MFAs and reports
+  errors back through a callback.
+  """
+
   use GenServer
   require Logger
 

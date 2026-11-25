@@ -54,4 +54,21 @@ defmodule RaftEx.App.SystemTest do
                {:error, :system_not_started}
     end
   end
+
+  describe "fetch/2" do
+    test "reads a stored config from the given node" do
+      name = :"system_fetch_node_#{:erlang.unique_integer([:positive])}"
+      config = %{name: name, names: %{wal: :remote_wal}}
+      System.store(config)
+
+      on_exit(fn -> :persistent_term.erase({:"$ra_system", name}) end)
+
+      assert System.fetch(name, node()) == config
+    end
+
+    test "returns nil for an unknown system on the given node" do
+      name = :"system_fetch_missing_#{:erlang.unique_integer([:positive])}"
+      assert System.fetch(name, node()) == nil
+    end
+  end
 end

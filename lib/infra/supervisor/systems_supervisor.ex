@@ -1,4 +1,8 @@
 defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
+  @moduledoc """
+  Dynamic supervisor that owns one `SystemSupervisor` per RaftEx system.
+  """
+
   use DynamicSupervisor
   require Logger
 
@@ -34,19 +38,8 @@ defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
   def stop_system(name) when is_atom(name) do
     children = DynamicSupervisor.which_children(__MODULE__)
 
-    pid =
-      case :persistent_term.get(pid_key(name), nil) do
-        nil ->
-          case Enum.find(children, fn {id, _, _, _} -> id == name end) do
-            nil -> nil
-            {_, child_pid, _, _} -> child_pid
-          end
-
-        stored ->
-          if Enum.any?(children, fn {_, child_pid, _, _} -> child_pid == stored end),
-            do: stored,
-            else: nil
-      end
+    stored = :persistent_term.get(pid_key(name), nil)
+    pid = find_child_pid(children, name, stored)
 
     result =
       case pid do
@@ -57,6 +50,19 @@ defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
     :persistent_term.erase(pid_key(name))
     :persistent_term.erase({:"$ra_system", name})
     result
+  end
+
+  defp find_child_pid(children, name, nil) do
+    case Enum.find(children, fn {id, _, _, _} -> id == name end) do
+      nil -> nil
+      {_, child_pid, _, _} -> child_pid
+    end
+  end
+
+  defp find_child_pid(children, _name, stored) do
+    if Enum.any?(children, fn {_, child_pid, _, _} -> child_pid == stored end),
+      do: stored,
+      else: nil
   end
 
   defp pid_key(name), do: {:"$ra_system_pid", name}

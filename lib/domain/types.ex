@@ -60,26 +60,41 @@ defmodule RaftEx.Domain.Types do
 
   defmodule AppendEntriesRpc do
     @moduledoc "Leader → follower: replicate log entries (or heartbeat when entries: [])."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :leader_id, :leader_commit, :prev_log_index, :prev_log_term, entries: []]
   end
 
   defmodule AppendEntriesReply do
     @moduledoc "Follower → leader: response to an AppendEntries RPC."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :success, :next_index, :last_index, :last_term]
   end
 
   defmodule RequestVoteRpc do
     @moduledoc "Candidate → peers: request a vote in an election."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :candidate_id, :last_log_index, :last_log_term]
   end
 
   defmodule RequestVoteResult do
     @moduledoc "Peer → candidate: vote grant/deny."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :vote_granted]
   end
 
   defmodule PreVoteRpc do
     @moduledoc "Pre-vote probe to check whether an election would succeed."
+
+    @type t :: %__MODULE__{}
+
     defstruct [
       :machine_version,
       :term,
@@ -93,36 +108,65 @@ defmodule RaftEx.Domain.Types do
 
   defmodule PreVoteResult do
     @moduledoc "Peer → pre-vote candidate: pre-vote result."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :token, :vote_granted]
   end
 
   defmodule InstallSnapshotRpc do
     @moduledoc "Leader → follower: transfer a snapshot."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :leader_id, :meta, :chunk_state, :data]
   end
 
   defmodule InstallSnapshotResult do
     @moduledoc "Follower → leader: snapshot installation result."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:term, :last_index, :last_term]
   end
 
   defmodule HeartbeatRpc do
     @moduledoc "Lightweight heartbeat used for consistent query acknowledgement and commit propagation."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:query_index, :term, :leader_id, :commit_index]
   end
 
   defmodule HeartbeatReply do
     @moduledoc "Follower response to a HeartbeatRpc."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:query_index, :term]
+  end
+
+  defmodule TimeoutNowRpc do
+    @moduledoc "Leader asks a follower to start an election immediately."
+
+    @type t :: %__MODULE__{}
+
+    defstruct [:term, :leader_id]
   end
 
   defmodule InfoRpc do
     @moduledoc "Generic info request between peers."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:from, :term, :keys]
   end
 
   defmodule InfoReply do
     @moduledoc "Response to an InfoRpc."
+
+    @type t :: %__MODULE__{}
+
     defstruct [:from, :term, :keys, info: %{}]
   end
 end

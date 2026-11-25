@@ -39,16 +39,13 @@ defmodule RaftEx.Domain.Pipeline do
       if acc.halted do
         {:halt, acc}
       else
-        new_conn = call_plug(plug, acc)
-
-        if new_conn.halted do
-          {:halt, new_conn}
-        else
-          {:cont, new_conn}
-        end
+        continue_or_halt(call_plug(plug, acc))
       end
     end)
   end
+
+  defp continue_or_halt(%{halted: true} = conn), do: {:halt, conn}
+  defp continue_or_halt(conn), do: {:cont, conn}
 
   defp call_plug({mod, opts}, conn) when is_atom(mod) do
     mod.call(conn, opts)

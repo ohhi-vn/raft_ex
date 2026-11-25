@@ -1,4 +1,8 @@
 defmodule RaftEx.Infra.Supervisor.SystemSupervisor do
+  @moduledoc """
+  Supervisor owning all processes that belong to one named RaftEx system.
+  """
+
   use Supervisor
   require Logger
 

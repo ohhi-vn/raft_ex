@@ -9,6 +9,30 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
       assert Env.data_dir() |> Path.basename() == node() |> Atom.to_string()
     end
 
+    test "data_dir prefers the raft_ex environment over the legacy ra key" do
+      original_raft_ex = Application.get_env(:raft_ex, :data_dir)
+      original_ra = Application.get_env(:ra, :data_dir)
+
+      on_exit(fn ->
+        case original_raft_ex do
+          nil -> Application.delete_env(:raft_ex, :data_dir)
+          val -> Application.put_env(:raft_ex, :data_dir, val)
+        end
+
+        case original_ra do
+          nil -> Application.delete_env(:ra, :data_dir)
+          val -> Application.put_env(:ra, :data_dir, val)
+        end
+      end)
+
+      Application.put_env(:ra, :data_dir, "/tmp/raft_legacy")
+      Application.put_env(:raft_ex, :data_dir, "/tmp/raft_ex_current")
+      assert Path.dirname(Env.data_dir()) == "/tmp/raft_ex_current"
+
+      Application.delete_env(:raft_ex, :data_dir)
+      assert Path.dirname(Env.data_dir()) == "/tmp/raft_legacy"
+    end
+
     test "server_data_dir uses the stored system config" do
       system = :"env_test_#{System.unique_integer([:positive])}"
       RaftEx.App.System.store(%{name: system, data_dir: "/tmp/raft_env_test"})
@@ -25,28 +49,28 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
   end
 
   describe "Filesystem" do
-    test "make_dir, is_dir and recursive_delete" do
+    test "make_dir, dir? and recursive_delete" do
       dir = RaftEx.TestSupport.tmp_dir("filesystem_test")
       nested = Path.join(dir, "a/b/c")
 
       assert :ok = Filesystem.make_dir(nested)
-      assert Filesystem.is_dir(nested)
-      refute Filesystem.is_dir(Path.join(dir, "missing"))
+      assert Filesystem.dir?(nested)
+      refute Filesystem.dir?(Path.join(dir, "missing"))
 
       assert :ok = Filesystem.recursive_delete(nested)
-      refute Filesystem.is_dir(nested)
+      refute Filesystem.dir?(nested)
     end
 
-    test "write_file, is_file, is_any_file and ensure_dir" do
+    test "write_file, file?, any_file? and ensure_dir" do
       dir = RaftEx.TestSupport.tmp_dir("filesystem_write_test")
       path = Path.join(dir, "sub/file.txt")
 
       assert :ok = Filesystem.ensure_dir(path)
       assert :ok = Filesystem.write_file(path, ["hello", " world"], false)
-      assert Filesystem.is_file(path)
-      assert Filesystem.is_any_file(path)
-      refute Filesystem.is_file(dir)
-      refute Filesystem.is_any_file(Path.join(dir, "missing"))
+      assert Filesystem.file?(path)
+      assert Filesystem.any_file?(path)
+      refute Filesystem.file?(dir)
+      refute Filesystem.any_file?(Path.join(dir, "missing"))
       assert :ok = Filesystem.ensure_dir(path)
     end
 
@@ -74,7 +98,42 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
       File.close(fd)
       assert :ok = Filesystem.sync_file(src)
       assert :ok = Filesystem.rename(src, dst)
-      assert Filesystem.is_file(dst)
+      assert Filesystem.file?(dst)
+    end
+
+    test "sync_file reports failures to open the file" do
+      dir = RaftEx.TestSupport.tmp_dir("filesystem_sync_error_test")
+      missing = Path.join(dir, "no_such_dir") |> Path.join("f")
+
+      assert {:error, :enoent} = Filesystem.sync_file(missing)
+    end
+
+    test "recursive_delete throws when the directory cannot be removed" do
+      dir = RaftEx.TestSupport.tmp_dir("filesystem_delete_error_test")
+      locked = Path.join(dir, "locked")
+      child = Path.join(locked, "child")
+      :ok = Filesystem.make_dir(child)
+      File.write!(Path.join(child, "f"), "data")
+      File.chmod!(locked, 0o500)
+      on_exit(fn -> File.chmod!(locked, 0o755) end)
+
+      assert catch_throw(Filesystem.recursive_delete(child)) == {:error, :eacces}
+
+      File.chmod!(locked, 0o755)
+    end
+
+    test "rename retries transient permission errors" do
+      dir = RaftEx.TestSupport.tmp_dir("filesystem_retry_test")
+      src = Path.join(dir, "src.txt")
+      File.write!(src, "data")
+      locked = Path.join(dir, "locked")
+      :ok = Filesystem.make_dir(locked)
+      File.chmod!(locked, 0o000)
+      on_exit(fn -> File.chmod!(locked, 0o755) end)
+
+      assert {:error, :eacces} = Filesystem.rename(src, Path.join(locked, "dst"))
+
+      File.chmod!(locked, 0o755)
     end
   end
 end

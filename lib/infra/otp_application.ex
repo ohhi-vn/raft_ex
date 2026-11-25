@@ -2,9 +2,11 @@ defmodule RaftEx.OTPApplication do
   @moduledoc false
   use Application
 
+  alias RaftEx.Infra.Supervisor.Root
+
   @impl Application
   def start(_type, _args) do
-    RaftEx.Infra.Supervisor.Root.start_link([])
+    Root.start_link([])
   end
 
   @impl Application

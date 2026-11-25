@@ -5,6 +5,7 @@ defmodule RaftEx.App.Cluster do
 
   require Logger
 
+  alias RaftEx.Infra.Network.Distribution
   alias RaftEx.Leaderboard
 
   @doc """
@@ -31,7 +32,7 @@ defmodule RaftEx.App.Cluster do
     timeout = Keyword.get(opts, :timeout, 10_000)
     seed_node = Keyword.get(opts, :seed_node, hd(Enum.sort(nodes)))
 
-    server_ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes)
+    server_ids = Distribution.build_server_ids(nodes)
     local_servers = Enum.filter(server_ids, fn {_, n} -> n == node() end)
 
     if local_servers == [] do
@@ -53,7 +54,7 @@ defmodule RaftEx.App.Cluster do
 
     ensure_distribution_started!()
 
-    server_ids = RaftEx.Infra.Network.Distribution.build_server_ids(all_nodes)
+    server_ids = Distribution.build_server_ids(all_nodes)
     local_servers = Enum.filter(server_ids, fn {_, n} -> n == node() end)
 
     for sid <- local_servers do
@@ -67,22 +68,24 @@ defmodule RaftEx.App.Cluster do
     if seed_leader == nil do
       Logger.warning("RaftEx.App.Cluster: no server found on seed node #{inspect(seed_node)}")
     else
-      for sid <- local_servers do
-        case RaftEx.add_member(seed_leader, sid, timeout) do
-          {:ok, _, leader} ->
-            Logger.info(
-              "RaftEx.App.Cluster: joined cluster as #{inspect(sid)}, leader: #{inspect(leader)}"
-            )
-
-          {:error, reason} ->
-            Logger.warning(
-              "RaftEx.App.Cluster: failed to add #{inspect(sid)}: #{inspect(reason)}"
-            )
-        end
-      end
+      add_local_members(seed_leader, local_servers, timeout)
     end
 
     {:ok, local_servers}
+  end
+
+  defp add_local_members(seed_leader, local_servers, timeout) do
+    for sid <- local_servers do
+      case RaftEx.add_member(seed_leader, sid, timeout) do
+        {:ok, _, leader} ->
+          Logger.info(
+            "RaftEx.App.Cluster: joined cluster as #{inspect(sid)}, leader: #{inspect(leader)}"
+          )
+
+        {:error, reason} ->
+          Logger.warning("RaftEx.App.Cluster: failed to add #{inspect(sid)}: #{inspect(reason)}")
+      end
+    end
   end
 
   @doc """
@@ -93,20 +96,9 @@ defmodule RaftEx.App.Cluster do
   @spec handle_topology_change([node()], term(), RaftEx.Domain.Machine.machine()) :: :ok
   def handle_topology_change(nodes, cluster_name, machine) do
     system = :default
-    server_ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes)
+    server_ids = Distribution.build_server_ids(nodes)
     local_servers = Enum.filter(server_ids, fn {_, n} -> n == node() end)
-
-    existing_members =
-      case local_servers do
-        [first_local | _] ->
-          case RaftEx.members(first_local, 2_000) do
-            {:ok, members, _leader} -> members
-            _ -> []
-          end
-
-        [] ->
-          []
-      end
+    existing_members = fetch_existing_members(local_servers)
 
     missing_servers =
       Enum.filter(server_ids, fn sid -> sid not in existing_members end)
@@ -116,30 +108,57 @@ defmodule RaftEx.App.Cluster do
         "RaftEx.App.Cluster: topology change - #{length(missing_servers)} new servers: #{inspect(missing_servers)}"
       )
 
-      for new_id <- missing_servers do
-        case RaftEx.add_member(hd(local_servers), new_id, 5_000) do
-          {:ok, _, leader} ->
-            Logger.info(
-              "RaftEx.App.Cluster: added #{inspect(new_id)}, leader: #{inspect(leader)}"
-            )
-
-            Leaderboard.record(cluster_name, leader, server_ids)
-
-          {:timeout, _} ->
-            Logger.warning("RaftEx.App.Cluster: timeout adding #{inspect(new_id)}")
-            start_local_if_needed(system, cluster_name, machine, new_id, server_ids)
-
-          {:error, reason} ->
-            Logger.warning(
-              "RaftEx.App.Cluster: error adding #{inspect(new_id)}: #{inspect(reason)}"
-            )
-
-            start_local_if_needed(system, cluster_name, machine, new_id, server_ids)
-        end
-      end
+      add_missing_members(
+        system,
+        cluster_name,
+        machine,
+        missing_servers,
+        local_servers,
+        server_ids
+      )
     end
 
     :ok
+  end
+
+  defp fetch_existing_members([]), do: []
+
+  defp fetch_existing_members([first_local | _]) do
+    case RaftEx.members(first_local, 2_000) do
+      {:ok, members, _leader} -> members
+      _ -> []
+    end
+  end
+
+  defp add_missing_members(
+         system,
+         cluster_name,
+         machine,
+         missing_servers,
+         local_servers,
+         server_ids
+       ) do
+    for new_id <- missing_servers do
+      add_missing_member(system, cluster_name, machine, new_id, hd(local_servers), server_ids)
+    end
+  end
+
+  defp add_missing_member(system, cluster_name, machine, new_id, local_id, server_ids) do
+    case RaftEx.add_member(local_id, new_id, 5_000) do
+      {:ok, _, leader} ->
+        Logger.info("RaftEx.App.Cluster: added #{inspect(new_id)}, leader: #{inspect(leader)}")
+
+        Leaderboard.record(cluster_name, leader, server_ids)
+
+      {:timeout, _} ->
+        Logger.warning("RaftEx.App.Cluster: timeout adding #{inspect(new_id)}")
+        start_local_if_needed(system, cluster_name, machine, new_id, server_ids)
+
+      {:error, reason} ->
+        Logger.warning("RaftEx.App.Cluster: error adding #{inspect(new_id)}: #{inspect(reason)}")
+
+        start_local_if_needed(system, cluster_name, machine, new_id, server_ids)
+    end
   end
 
   @doc """
@@ -246,42 +265,41 @@ defmodule RaftEx.App.Cluster do
         {:error, :unknown_cluster}
 
       members ->
-        result =
-          Enum.find_value(members, fn member ->
-            case RaftEx.members(member, 2_000) do
-              {:ok, _, leader} -> leader
-              _ -> nil
-            end
-          end)
-
-        case result do
+        case find_leader_in_members(members) do
           nil -> {:error, :no_leader_found}
           leader -> {:ok, leader}
         end
     end
   end
 
-  defp ensure_distribution_started! do
-    try do
-      case Node.start(:hidden) do
-        {:ok, _} ->
-          :ok
-
-        {:error, :already_started} ->
-          :ok
-
-        {:error, {:already_started, _}} ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("RaftEx.App.Cluster: node.start failed: #{inspect(reason)}")
-          :ok
+  defp find_leader_in_members(members) do
+    Enum.find_value(members, fn member ->
+      case RaftEx.members(member, 2_000) do
+        {:ok, _, leader} -> leader
+        _ -> nil
       end
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
+    end)
+  end
+
+  defp ensure_distribution_started! do
+    case Node.start(:hidden) do
+      {:ok, _} ->
+        :ok
+
+      {:error, :already_started} ->
+        :ok
+
+      {:error, {:already_started, _}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("RaftEx.App.Cluster: node.start failed: #{inspect(reason)}")
+        :ok
     end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   defp find_any_server_on(node, server_ids) do

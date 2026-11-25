@@ -8,6 +8,18 @@ defmodule RaftEx.Domain.Server.EffectsTest do
       assert Effects.add_reply(%{from: self()}, :reply, :"$ra_no_reply", [], %{}) == {[], %{}}
     end
 
+    test "swallows a $ra_no_reply placeholder value regardless of reply mode" do
+      notifys = %{self() => [{1, :ok}]}
+
+      assert Effects.add_reply(
+               %{from: self()},
+               :"$ra_no_reply",
+               :await_consensus,
+               [:prior],
+               notifys
+             ) == {[:prior], notifys}
+    end
+
     test "replies directly for await_consensus" do
       from = self()
       assert {effects, notifys} = Effects.add_reply(%{from: from}, :ok, :await_consensus, [], %{})

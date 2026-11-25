@@ -148,6 +148,17 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   @doc """
+  Truncate a server's WAL, removing all entries at or after `from_index`.
+
+  Used to discard a conflicting suffix after an AppendEntries rejection.
+  """
+  @spec truncate_from(atom(), term(), RaftEx.Domain.Types.index(), timeout()) ::
+          :ok | {:error, term()}
+  def truncate_from(wal_name, uid, from_index, timeout \\ 5_000) do
+    GenServer.call(wal_name, {:truncate_from, uid, from_index}, timeout)
+  end
+
+  @doc """
   Get a server's current WAL state.
 
   Returns `{first_index, last_index, buffer_size}`.
@@ -221,6 +232,39 @@ defmodule RaftEx.Infra.Persistence.LogWal do
         {:ok, file} ->
           file = do_truncate(index, file)
           put_file(uid, file, state)
+
+        :error ->
+          state
+      end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:truncate_from, uid, from_index}, _from, state) do
+    state =
+      case Map.fetch(state.files, uid) do
+        {:ok, file} ->
+          compute_checksums = Map.get(state.config, :wal_compute_checksums, true)
+          sync_wal(file, state.config)
+          {_first, _last, disk_entries} = do_recover_file(file.path, compute_checksums)
+
+          entries =
+            Enum.reject(disk_entries ++ file.buffer, fn {idx, _, _} -> idx >= from_index end)
+
+          :ok = :file.close(file.fd)
+          {:ok, fd} = :file.open(file.path, [:write, :binary, :raw, :truncate])
+
+          file = %{file | fd: fd, file_size: 0, buffer: [], pending_writes: []}
+          file = write_entries_to_wal(entries, file, state.config)
+          sync_wal(file, state.config)
+
+          {first, last} =
+            case entries do
+              [] -> {from_index, from_index - 1}
+              _ -> {hd(entries) |> elem(0), List.last(entries) |> elem(0)}
+            end
+
+          put_file(uid, %{file | first_index: first, last_index: last}, state)
 
         :error ->
           state
@@ -526,16 +570,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
           {:ok, fd} ->
             entries = do_recover(fd, compute_checksums, [])
             :file.close(fd)
-
-            case entries do
-              [] ->
-                {0, 0, []}
-
-              recovered ->
-                {first_idx, _, _} = hd(recovered)
-                {last_idx, _, _} = List.last(recovered)
-                {first_idx, last_idx, recovered}
-            end
+            recovered_range(entries)
 
           _ ->
             {0, 0, []}
@@ -544,6 +579,14 @@ defmodule RaftEx.Infra.Persistence.LogWal do
       _ ->
         {0, 0, []}
     end
+  end
+
+  defp recovered_range([]), do: {0, 0, []}
+
+  defp recovered_range(recovered) do
+    {first_idx, _, _} = hd(recovered)
+    {last_idx, _, _} = List.last(recovered)
+    {first_idx, last_idx, recovered}
   end
 
   defp do_recover(fd, compute_checksums, acc) do
@@ -561,19 +604,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     case :file.read(fd, 8) do
       {:ok, <<_count::32-unsigned, blob_size::32-unsigned>>} ->
         {:ok, entries_binary} = :file.read(fd, blob_size)
-
-        # Read the footer when checksums are enabled.
-        if compute_checksums do
-          case :file.read(fd, @footer_size) do
-            {:ok, <<_crc::32-unsigned>>} ->
-              do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
-
-            _ ->
-              acc
-          end
-        else
-          do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
-        end
+        recover_records_with_footer(fd, compute_checksums, entries_binary, acc)
 
       _ ->
         acc
@@ -584,6 +615,20 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # checksum footer was effectively unreadable.  There is no reliable way to
   # decode those files; stop instead of returning half a log.
   defp do_recover_records(_fd, _version, _compute_checksums, acc), do: acc
+
+  defp recover_records_with_footer(fd, compute_checksums, entries_binary, acc) do
+    if compute_checksums do
+      case :file.read(fd, @footer_size) do
+        {:ok, <<_crc::32-unsigned>>} ->
+          do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
+
+        _ ->
+          acc
+      end
+    else
+      do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
+    end
+  end
 
   defp decode(binary) do
     :erlang.binary_to_term(binary)
@@ -604,10 +649,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   """
   @spec overview(atom()) :: map()
   def overview(wal_name) do
-    try do
-      GenServer.call(wal_name, :overview, 5_000)
-    catch
-      _, _ -> %{files: 0, first_index: 0, last_index: 0, buffer_size: 0, pending_writes: 0}
-    end
+    GenServer.call(wal_name, :overview, 5_000)
+  catch
+    _, _ -> %{files: 0, first_index: 0, last_index: 0, buffer_size: 0, pending_writes: 0}
   end
 end

@@ -10,6 +10,8 @@ defmodule RaftEx.Infra.Network.NodeMonitor do
   use GenServer
   require Logger
 
+  alias RaftEx.Infra.Network.Transport
+
   def start_link(opts \\ []) do
     name = opts[:name] || __MODULE__
     GenServer.start_link(__MODULE__, opts, name: name)
@@ -30,13 +32,13 @@ defmodule RaftEx.Infra.Network.NodeMonitor do
   @impl GenServer
   def handle_info({:nodeup, node, _info}, state) do
     Logger.info("RaftEx.Infra.Network.NodeMonitor: node up: #{inspect(node)}")
-    RaftEx.Infra.Network.Transport.handle_node_up(node)
+    Transport.handle_node_up(node)
     {:noreply, state}
   end
 
   def handle_info({:nodedown, node, _info}, state) do
     Logger.warning("RaftEx.Infra.Network.NodeMonitor: node down: #{inspect(node)}")
-    RaftEx.Infra.Network.Transport.handle_node_down(node)
+    Transport.handle_node_down(node)
     {:noreply, state}
   end
 

@@ -42,8 +42,8 @@ defmodule RaftEx.Infra.Filesystem do
   def ensure_dir(path), do: File.mkdir_p(Path.dirname(path))
 
   @doc "Return `true` iff `path` is an existing directory."
-  @spec is_dir(Path.t()) :: boolean()
-  def is_dir(path) do
+  @spec dir?(Path.t()) :: boolean()
+  def dir?(path) do
     match?(
       {:ok, {:file_info, _, :directory, _, _, _, _, _, _, _, _, _, _, _}},
       :prim_file.read_file_info(path)
@@ -51,8 +51,8 @@ defmodule RaftEx.Infra.Filesystem do
   end
 
   @doc "Return `true` iff `path` is an existing regular file."
-  @spec is_file(Path.t()) :: boolean()
-  def is_file(path) do
+  @spec file?(Path.t()) :: boolean()
+  def file?(path) do
     match?(
       {:ok, {:file_info, _, :regular, _, _, _, _, _, _, _, _, _, _, _}},
       :prim_file.read_file_info(path)
@@ -60,8 +60,8 @@ defmodule RaftEx.Infra.Filesystem do
   end
 
   @doc "Return `true` iff `path` exists (any type)."
-  @spec is_any_file(Path.t()) :: boolean()
-  def is_any_file(path) do
+  @spec any_file?(Path.t()) :: boolean()
+  def any_file?(path) do
     match?({:ok, _}, :prim_file.read_file_info(path))
   end
 

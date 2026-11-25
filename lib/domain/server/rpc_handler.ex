@@ -33,10 +33,12 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
   require Logger
 
+  alias RaftEx.Domain.Machine
+  alias RaftEx.Domain.Server
+  alias RaftEx.Domain.Server.{Cluster, Config}
   alias RaftEx.Domain.Types
-  alias RaftEx.Domain.Server.Config
-  alias RaftEx.Domain.Server.Cluster
-  alias RaftEx.Infra.Persistence.Log
+  alias RaftEx.Infra.Filesystem
+  alias RaftEx.Infra.Persistence.{Log, LogMeta, LogSnapshot}
 
   # ---------------------------------------------------------------------------
   # AppendEntries RPC Handling
@@ -119,7 +121,9 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       {last_index, last_term} = Log.last_index_term(log)
       reply = build_append_entries_reply(state.current_term, true, state, last_index, last_term)
 
-      effects = [{:send_rpc, leader_id, reply}] ++ append_effects ++ commit_effects
+      effects =
+        [{:send_rpc, leader_id, reply}, {:reset_election_timeout}] ++
+          append_effects ++ commit_effects
 
       {:follower, state, effects}
     else
@@ -259,7 +263,8 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     cond do
       # Leader's term is behind - reject
       leader_term < current_term ->
-        reply = build_install_snapshot_reply(current_term, state)
+        reply = build_install_snapshot_reply(current_term, state, 0, 0)
+        state = state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
         effects = [{:send_rpc, leader_id, reply}]
         {:follower, state, effects}
 
@@ -273,7 +278,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
             handle_first_snapshot_chunk(meta, data, leader_id, state)
 
           :middle ->
-            handle_middle_snapshot_chunk(data, state)
+            handle_middle_snapshot_chunk(data, leader_id, state)
 
           :last ->
             handle_last_snapshot_chunk(data, leader_id, state)
@@ -284,78 +289,129 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     end
   end
 
-  defp handle_first_snapshot_chunk(meta, data, _leader_id, %{cfg: %Config{id: _id}} = state) do
-    # Begin accepting snapshot
-    {:ok, snapshot_state} =
-      RaftEx.Infra.Persistence.LogSnapshot.begin_accept(state.cfg.system_config.data_dir, meta)
+  defp handle_first_snapshot_chunk(meta, data, leader_id, state) do
+    snap_dir = snapshot_dir(state)
 
-    # Write first chunk
-    case RaftEx.Infra.Persistence.LogSnapshot.accept_chunk(data, snapshot_state) do
-      {:ok, new_snapshot_state} ->
-        state = %{state | snapshot_state: new_snapshot_state}
-        effects = []
-        {:receive_snapshot, state, effects}
+    with :ok <- Filesystem.make_dir(snap_dir),
+         {:ok, accept_state} <- LogSnapshot.begin_accept(snap_dir, meta),
+         {:ok, new_snapshot_state} <-
+           LogSnapshot.accept_chunk(data, accept_state) do
+      state =
+        state
+        |> Map.put(:snapshot_state, new_snapshot_state)
+        |> Map.put(:snapshot_meta, meta)
+
+      {:receive_snapshot, state, []}
+    else
+      err -> snapshot_failure(leader_id, state, err)
     end
   end
 
-  defp handle_middle_snapshot_chunk(data, %{snapshot_state: snapshot_state} = state) do
-    case RaftEx.Infra.Persistence.LogSnapshot.accept_chunk(data, snapshot_state) do
+  defp handle_middle_snapshot_chunk(data, leader_id, %{snapshot_state: accept_state} = state)
+       when is_tuple(accept_state) do
+    case LogSnapshot.accept_chunk(data, accept_state) do
       {:ok, new_snapshot_state} ->
-        state = %{state | snapshot_state: new_snapshot_state}
-        {:receive_snapshot, state, []}
+        {:receive_snapshot, %{state | snapshot_state: new_snapshot_state}, []}
 
       {:error, reason} ->
-        Logger.error("Failed to write snapshot chunk: #{inspect(reason)}")
-        {:follower, state, []}
+        snapshot_failure(leader_id, state, reason)
     end
   end
 
-  defp handle_last_snapshot_chunk(data, leader_id, %{snapshot_state: snapshot_state} = state) do
-    case RaftEx.Infra.Persistence.LogSnapshot.complete_accept(data, snapshot_state) do
+  defp handle_middle_snapshot_chunk(_data, leader_id, state) do
+    snapshot_failure(leader_id, state, :no_snapshot_in_progress)
+  end
+
+  defp handle_last_snapshot_chunk(data, leader_id, %{snapshot_state: accept_state} = state)
+       when is_tuple(accept_state) do
+    snap_dir = snapshot_dir(state)
+
+    data =
+      if byte_size(data) >= 4,
+        do: binary_part(data, 4, byte_size(data) - 4),
+        else: data
+
+    case LogSnapshot.complete_accept(data, accept_state) do
       {:ok, _bytes} ->
-        # Install the snapshot
-        meta = RaftEx.Infra.Persistence.LogSnapshot.read_meta(state.cfg.system_config.data_dir)
+        case LogSnapshot.recover(snap_dir) do
+          {:ok, meta, mac_state} ->
+            install_snapshot(meta, mac_state, leader_id, state)
 
-        case meta do
-          {:ok, %{index: snap_idx, term: snap_term}} ->
-            {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
-            state = %{state | log: log, snapshot_state: nil}
-
-            {last_index, last_term} = Log.last_index_term(log)
-            reply = build_install_snapshot_reply(state.current_term, state, last_index, last_term)
-            effects = [{:send_rpc, leader_id, reply}]
-            {:follower, state, effects}
-
-          _ ->
-            {:follower, state, []}
+          {:error, reason} ->
+            snapshot_failure(leader_id, state, reason)
         end
+
+      {:error, reason} ->
+        snapshot_failure(leader_id, state, reason)
     end
+  end
+
+  defp handle_last_snapshot_chunk(_data, leader_id, state) do
+    snapshot_failure(leader_id, state, :no_snapshot_in_progress)
   end
 
   defp handle_full_snapshot(meta, data, leader_id, state) do
-    # Write complete snapshot in one go
-    case RaftEx.Infra.Persistence.LogSnapshot.write(
-           state.cfg.system_config.data_dir,
-           meta,
-           data,
-           true
-         ) do
-      {:ok, _bytes} ->
-        %{index: snap_idx, term: snap_term} = meta
-        {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
-        state = %{state | log: log}
+    snap_dir = snapshot_dir(state)
 
-        {last_index, last_term} = Log.last_index_term(log)
-        reply = build_install_snapshot_reply(state.current_term, state, last_index, last_term)
-        effects = [{:send_rpc, leader_id, reply}]
-        {:follower, state, effects}
-
-      {:error, reason} ->
-        Logger.error("Failed to write full snapshot: #{inspect(reason)}")
-        reply = build_install_snapshot_reply(state.current_term, state)
-        effects = [{:send_rpc, leader_id, reply}]
-        {:follower, state, effects}
+    with :ok <- Filesystem.make_dir(snap_dir),
+         {:ok, _bytes} <- LogSnapshot.write(snap_dir, meta, data, true),
+         {:ok, recovered_meta, mac_state} <-
+           LogSnapshot.recover(snap_dir) do
+      install_snapshot(recovered_meta, mac_state, leader_id, state)
+    else
+      err -> snapshot_failure(leader_id, state, err)
     end
+  end
+
+  defp install_snapshot(meta, mac_state, leader_id, state) do
+    %{index: snap_idx, term: snap_term} = meta
+    old_mac_state = Map.get(state, :machine_state)
+    {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
+
+    state =
+      state
+      |> Map.put(:log, log)
+      |> Map.put(:machine_state, mac_state)
+      |> Map.put(:snapshot_state, nil)
+      |> Map.put(:snapshot_meta, nil)
+      |> Map.put(:last_applied, max(Map.get(state, :last_applied, 0), snap_idx))
+      |> Map.put(:commit_index, max(Map.get(state, :commit_index, 0), snap_idx))
+
+    if is_map(state.cfg) && state.cfg.effective_machine_module do
+      Machine.snapshot_installed(
+        state.cfg.effective_machine_module,
+        meta,
+        mac_state,
+        %{},
+        old_mac_state
+      )
+    end
+
+    {last_index, last_term} = Log.last_index_term(log)
+    reply = build_install_snapshot_reply(state.current_term, state, last_index, last_term)
+    {:follower, state, [{:send_rpc, leader_id, reply}]}
+  end
+
+  defp snapshot_failure(leader_id, state, reason) do
+    Logger.error("RaftEx.RpcHandler: snapshot transfer failed: #{inspect(reason)}")
+    reply = build_install_snapshot_reply(state.current_term, state, 0, 0)
+
+    case snapshot_dir(state) do
+      dir -> File.rm(Path.join(dir, "snapshot.dat"))
+    end
+
+    state = state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
+    {:follower, state, [{:send_rpc, leader_id, reply}]}
+  end
+
+  defp snapshot_dir(%{log: %{data_dir: dir}}) when is_binary(dir) do
+    Path.join(dir, "snapshot")
+  end
+
+  defp snapshot_dir(%{cfg: %{system_config: %{data_dir: dir}}}) when is_binary(dir), do: dir
+
+  defp snapshot_dir(_state) do
+    Path.join(System.tmp_dir!(), "raft_ex_snapshot")
   end
 
   @doc """
@@ -446,7 +502,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
         apply_effects =
           if new_commit > old_commit, do: [{:apply_committed, new_commit}], else: []
 
-        {state, [{:send_rpc, leader_id, reply} | apply_effects]}
+        {state, [{:send_rpc, leader_id, reply}, {:reset_election_timeout} | apply_effects]}
     end
   end
 
@@ -493,25 +549,23 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   # ---------------------------------------------------------------------------
 
   defp check_log_consistency(prev_log_index, prev_log_term, %{log: log} = state) do
-    cond do
-      # No previous log to check
-      prev_log_index == 0 ->
-        {true, state}
-
+    # No previous log to check
+    if prev_log_index == 0 do
+      {true, state}
+    else
       # Check if we have the entry at prev_log_index
-      true ->
-        case Log.fetch_term(prev_log_index, log) do
-          {^prev_log_term, _} ->
-            {true, state}
+      case Log.fetch_term(prev_log_index, log) do
+        {^prev_log_term, _} ->
+          {true, state}
 
-          {nil, _} ->
-            # Entry doesn't exist
-            {false, state}
+        {nil, _} ->
+          # Entry doesn't exist
+          {false, state}
 
-          {_, _} ->
-            # Term mismatch
-            {false, state}
-        end
+        {_, _} ->
+          # Term mismatch
+          {false, state}
+      end
     end
   end
 
@@ -608,7 +662,22 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   end
 
   defp update_term(state, new_term) do
-    %{state | current_term: new_term, voted_for: nil}
+    cfg = state.cfg
+    uid = cfg.uid
+    meta = Server.meta_name(cfg)
+
+    try do
+      LogMeta.store(meta, uid, :current_term, new_term)
+      LogMeta.store_sync(meta, uid, :voted_for, nil)
+    catch
+      _, _ -> :ok
+    end
+
+    state
+    |> Map.put(:current_term, new_term)
+    |> Map.put(:voted_for, nil)
+    |> Map.put(:leader_id, nil)
+    |> Map.put(:transfer_leadership, nil)
   end
 
   defp build_append_entries_reply(
@@ -635,12 +704,12 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     }
   end
 
-  defp build_install_snapshot_reply(term, state, last_index \\ nil, last_term \\ nil) do
+  defp build_install_snapshot_reply(term, _state, last_index, last_term) do
     {li, lt} =
       if last_index && last_term do
         {last_index, last_term}
       else
-        Log.last_index_term(state.log)
+        {0, 0}
       end
 
     %Types.InstallSnapshotResult{

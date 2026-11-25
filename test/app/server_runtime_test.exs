@@ -79,4 +79,28 @@ defmodule RaftEx.App.ServerRuntimeTest do
                ServerRuntime.candidate(:info, :unknown, state())
     end
   end
+
+  describe "public query and call entry points" do
+    test "leader queries forward options and report a missing server" do
+      missing = :"missing_query_#{System.unique_integer([:positive])}"
+
+      assert {:error, :noproc} =
+               ServerRuntime.query(missing, fn s -> s end, :leader, %{option: true}, 100)
+    end
+
+    test "cast_command and query local variants reach the state machine call" do
+      missing = :"missing_variants_#{System.unique_integer([:positive])}"
+
+      assert {:error, :noproc} =
+               ServerRuntime.query(missing, fn s -> s end, :local, %{option: true}, 100)
+
+      assert {:error, :noproc} =
+               ServerRuntime.query(missing, fn s -> s end, :consistent, %{}, 100)
+
+      assert {:error, :noproc} =
+               ServerRuntime.query(missing, :aux, :consistent_aux, %{}, 100)
+
+      assert :ok = ServerRuntime.cast_command(missing, :cmd)
+    end
+  end
 end

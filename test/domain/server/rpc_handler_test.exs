@@ -3,12 +3,27 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
   alias RaftEx.Domain.Server.{Cluster, Config, RpcHandler}
   alias RaftEx.Domain.Types
+  alias RaftEx.Infra.Filesystem
   alias RaftEx.Infra.Persistence.{Log, LogSnapshot, LogWal}
 
   @self_id {:server1, node()}
   @leader {:leader, node()}
   @peer2 {:server2, node()}
   @peer3 {:server3, node()}
+
+  # A WAL that rejects appends with a clean error tuple, used to drive the
+  # {:error, reason} branch of Log.write/2 in RpcHandler.append_entries/3.
+  defmodule WalErrorServer do
+    use GenServer
+
+    def start_link, do: GenServer.start_link(__MODULE__, :ok, [])
+    def init(:ok), do: {:ok, :ok}
+
+    def handle_call({:append, _uid, _entries}, _from, state),
+      do: {:reply, {:error, :wal_down}, state}
+
+    def handle_call(_msg, _from, state), do: {:reply, :ok, state}
+  end
 
   setup do
     data_dir = RaftEx.TestSupport.tmp_dir("rpc_handler_test")
@@ -104,7 +119,10 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
   defp snapshot_chunk(meta \\ %{index: 3, term: 2}) do
     meta_bin = :erlang.term_to_binary(meta)
-    <<"RASN", 1, 0::32-integer, byte_size(meta_bin)::32-integer, meta_bin::binary>>
+    mac_bin = :erlang.term_to_binary(:mac_state)
+    data = <<byte_size(meta_bin)::32-integer, meta_bin::binary, mac_bin::binary>>
+    crc = :erlang.crc32(data)
+    <<"RASN", 1, crc::32-integer, data::binary>>
   end
 
   describe "handle_append_entries_rpc/2" do
@@ -183,6 +201,21 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       {_next, _state, effects} = RpcHandler.handle_append_entries_rpc(rpc, current)
 
       assert [{:send_rpc, @leader, %Types.AppendEntriesReply{success: false}}] = effects
+    end
+
+    test "a WAL write error skips the written-log effect" do
+      {:ok, wal} = WalErrorServer.start_link()
+      current = state()
+      log = %{current.log | wal_name: wal}
+
+      {next, _state, effects} =
+        RpcHandler.handle_append_entries_rpc(
+          append_rpc(entries: [{1, 2, :cmd}]),
+          %{current | log: log}
+        )
+
+      assert next == :follower
+      refute Enum.any?(effects, &match?({:ra_log_event, _}, &1))
     end
   end
 
@@ -300,7 +333,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
         leader_id: @leader,
         meta: meta,
         chunk_state: :last,
-        data: snapshot_chunk(meta)
+        data: <<>>
       }
 
       {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(last, state)
@@ -312,6 +345,29 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       # Log.last_index_term/1 uses the log's last_term for its range after
       # snapshot installation; the fixture log starts at term 0.
       assert reply.last_term == 0
+    end
+
+    test "rejects a stale-term snapshot and discards partial state" do
+      rpc = %Types.InstallSnapshotRpc{
+        term: 1,
+        leader_id: @leader,
+        meta: %{index: 3, term: 1},
+        chunk_state: :first,
+        data: snapshot_chunk()
+      }
+
+      state =
+        state()
+        |> Map.put(:snapshot_state, {:partial, :state})
+        |> Map.put(:snapshot_meta, %{index: 3, term: 1})
+
+      {next, state2, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, state)
+
+      assert next == :follower
+      assert is_nil(state2.snapshot_state)
+      assert is_nil(state2.snapshot_meta)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{} = reply}] = effects
+      assert reply.last_index == 0
     end
 
     test "handles a full snapshot" do
@@ -333,6 +389,43 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert reply.last_index == 4
     end
 
+    test "streams a multi-chunk snapshot from disk and installs it" do
+      dir = Process.get(:rpc_test_data_dir)
+      meta = %{index: 5, term: 2}
+      :ok = Filesystem.make_dir(dir)
+      streamed_state = String.duplicate("x", 200)
+      assert {:ok, _bytes} = LogSnapshot.write(dir, meta, streamed_state, true)
+
+      assert {:ok, ^meta, read_state} =
+               LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+
+      assert {:ok, first_chunk, {:next, next_state}} = LogSnapshot.read_chunk(read_state, 12, dir)
+      assert {crc, _} = read_state
+      assert {:ok, last_chunk, :last} = LogSnapshot.read_chunk({crc, next_state}, 1_000, dir)
+
+      first_rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta,
+        chunk_state: :first,
+        data: first_chunk
+      }
+
+      {next, state1, effects1} = RpcHandler.handle_install_snapshot_rpc(first_rpc, state())
+      assert next == :receive_snapshot
+      assert effects1 == []
+      assert is_tuple(state1.snapshot_state)
+
+      last_rpc = %{first_rpc | chunk_state: :last, data: last_chunk}
+      {next, state2, effects2} = RpcHandler.handle_install_snapshot_rpc(last_rpc, state1)
+
+      assert next == :follower
+      assert state2.last_applied == 5
+      assert state2.machine_state == streamed_state
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{} = reply}] = effects2
+      assert reply.last_index == 5
+    end
+
     test "reports failure when the full snapshot cannot be written" do
       meta = %{index: 4, term: 2}
 
@@ -352,6 +445,181 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{}}] = effects
     after
       Process.put(:rpc_test_data_dir, nil)
+    end
+
+    test "first chunk failure clears partial state and replies with failure" do
+      bad_dir = Path.join(System.tmp_dir!(), "rpc_bad_dir_#{System.unique_integer([:positive])}")
+      File.write!(bad_dir, "not a directory")
+      on_exit(fn -> File.rm(bad_dir) end)
+      Process.put(:rpc_test_data_dir, bad_dir)
+
+      meta = %{index: 3, term: 2}
+
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta,
+        chunk_state: :first,
+        data: snapshot_chunk(meta)
+      }
+
+      current =
+        state()
+        |> Map.put(:snapshot_state, {:partial, :state})
+        |> Map.put(:snapshot_meta, meta)
+
+      {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, current)
+
+      assert next == :follower
+      assert is_nil(state.snapshot_state)
+      assert is_nil(state.snapshot_meta)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    after
+      Process.put(:rpc_test_data_dir, nil)
+    end
+
+    test "middle chunk whose write fails reports a snapshot failure" do
+      snap_dir = Process.get(:rpc_test_data_dir)
+      :ok = Filesystem.make_dir(snap_dir)
+      meta = %{index: 3, term: 2}
+
+      {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
+      {_bytes, _partial_crc, fd} = accept_state
+      :file.close(fd)
+
+      current =
+        state()
+        |> Map.put(:snapshot_state, accept_state)
+        |> Map.put(:snapshot_meta, meta)
+
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta,
+        chunk_state: :middle,
+        data: snapshot_chunk(meta)
+      }
+
+      {next, new_state, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, current)
+
+      assert next == :follower
+      assert is_nil(new_state.snapshot_state)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    end
+
+    test "middle chunk without a snapshot in progress reports failure" do
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: %{index: 3, term: 2},
+        chunk_state: :middle,
+        data: <<>>
+      }
+
+      {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, state())
+
+      assert next == :follower
+      assert is_nil(state.snapshot_state)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    end
+
+    test "last chunk without a snapshot in progress reports failure" do
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: %{index: 3, term: 2},
+        chunk_state: :last,
+        data: <<>>
+      }
+
+      {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, state())
+
+      assert next == :follower
+      assert is_nil(state.snapshot_state)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    end
+
+    test "snapshot failure uses the fallback directory when no data dir is configured" do
+      base = state()
+      cfg = %{base.cfg | system_config: %{names: base.cfg.system_config.names}}
+      current = %{base | cfg: cfg}
+
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: %{index: 3, term: 2},
+        chunk_state: :last,
+        data: <<>>
+      }
+
+      {next, _state, effects} = RpcHandler.handle_install_snapshot_rpc(rpc, current)
+
+      assert next == :follower
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    end
+
+    test "last chunk whose write fails reports a snapshot failure" do
+      snap_dir = Process.get(:rpc_test_data_dir)
+      :ok = Filesystem.make_dir(snap_dir)
+      meta = %{index: 3, term: 2}
+
+      {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
+
+      {:ok, {bytes, partial_crc, crc, fd}} =
+        LogSnapshot.accept_chunk(snapshot_chunk(meta), accept_state)
+
+      :file.close(fd)
+
+      current =
+        state()
+        |> Map.put(:snapshot_state, {bytes, partial_crc, crc, fd})
+        |> Map.put(:snapshot_meta, meta)
+
+      last = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta,
+        chunk_state: :last,
+        data: <<>>
+      }
+
+      {next, new_state, effects} = RpcHandler.handle_install_snapshot_rpc(last, current)
+
+      assert next == :follower
+      assert is_nil(new_state.snapshot_state)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
+    end
+
+    test "last chunk with a corrupted snapshot reports a recover failure" do
+      # snapshot_dir/1 resolves cfg.system_config.data_dir directly (no
+      # extra "snapshot" segment), so write there.
+      snap_dir = Process.get(:rpc_test_data_dir)
+      :ok = Filesystem.make_dir(snap_dir)
+      meta = %{index: 3, term: 2}
+
+      {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
+
+      {:ok, {bytes, partial_crc, _crc, fd}} =
+        LogSnapshot.accept_chunk(snapshot_chunk(meta), accept_state)
+
+      # complete_accept/2 patches the header crc from the accept state. With a
+      # deliberately wrong value recover/1 rejects the file as a checksum error.
+      corrupted = {bytes, partial_crc, 1, fd}
+      current = state() |> Map.put(:snapshot_state, corrupted) |> Map.put(:snapshot_meta, meta)
+
+      last = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta,
+        chunk_state: :last,
+        data: <<>>
+      }
+
+      {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(last, current)
+
+      assert next == :follower
+      assert is_nil(state.snapshot_state)
+      assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{last_index: 0}}] = effects
     end
   end
 
@@ -397,7 +665,10 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
         assert state.current_term == term
         assert state.leader_id == @leader
-        assert [{:send_rpc, @leader, %Types.HeartbeatReply{} = reply}] = effects
+
+        assert [{:send_rpc, @leader, %Types.HeartbeatReply{} = reply}, {:reset_election_timeout}] =
+                 effects
+
         assert reply.query_index == 7
         assert reply.term == term
       end
@@ -422,6 +693,21 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       {state, effects} = RpcHandler.handle_heartbeat_reply(reply, state())
       assert state.current_term == 2
       assert effects == []
+    end
+
+    test "term persistence tolerates an unavailable metadata store" do
+      base = state()
+      missing = :"missing_meta_#{System.unique_integer([:positive])}"
+      names = Map.put(base.cfg.system_config.names, :log_meta, missing)
+      cfg = %{base.cfg | system_config: %{base.cfg.system_config | names: names}}
+      current = %{base | cfg: cfg}
+
+      rpc = %Types.HeartbeatRpc{query_index: 7, term: 3, leader_id: @leader}
+      {state, _effects} = RpcHandler.handle_heartbeat_rpc(rpc, current)
+
+      assert state.current_term == 3
+      assert state.voted_for == nil
+      assert state.leader_id == @leader
     end
   end
 

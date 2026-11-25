@@ -138,23 +138,27 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   def recover(%{data_dir: data_dir}) do
     segment_dir = segment_dir(data_dir)
 
-    if not File.exists?(segment_dir) do
+    if File.exists?(segment_dir) do
+      recover_segments(segment_dir)
+    else
       File.mkdir_p!(segment_dir)
       {:ok, []}
-    else
-      case File.ls(segment_dir) do
-        {:ok, files} ->
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".segment"))
-          |> Enum.map(fn f -> Path.join(segment_dir, f) end)
-          |> Enum.sort()
-          |> Enum.map(&load_segment_header/1)
-          |> Enum.reject(&is_nil/1)
-          |> then(&{:ok, &1})
+    end
+  end
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+  defp recover_segments(segment_dir) do
+    case File.ls(segment_dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".segment"))
+        |> Enum.map(&Path.join(segment_dir, &1))
+        |> Enum.sort()
+        |> Enum.map(&load_segment_header/1)
+        |> Enum.reject(&is_nil/1)
+        |> then(&{:ok, &1})
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -325,7 +329,6 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     if state.active_segment do
       case seal_segment(state.active_segment) do
         {:ok, _sealed} -> :ok
-        _ -> :ok
       end
     end
 

@@ -10,6 +10,14 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   use DynamicSupervisor
   require Logger
 
+  alias RaftEx.Domain.Utils
+  alias RaftEx.Infra.Config.Env
+  alias RaftEx.Infra.Filesystem
+  alias RaftEx.Infra.Observability.Counters
+  alias RaftEx.Infra.Persistence.Log
+  alias RaftEx.Infra.Persistence.LogMeta
+  alias RaftEx.Infra.Registry.Directory
+
   # Configuration keys that may be overridden when restarting an existing server.
   @mutable_config_keys [
     :install_snap_rpc_timeout,
@@ -37,7 +45,7 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   @doc "Start a new server on the node specified by `config.id`."
   @spec start_server(atom(), map()) :: DynamicSupervisor.on_start_child()
   def start_server(system, %{id: node_id, uid: uid} = config) when is_atom(system) do
-    node = RaftEx.Domain.Utils.ra_server_id_node(node_id)
+    node = Utils.ra_server_id_node(node_id)
     :rpc.call(node, __MODULE__, :start_server_rpc, [system, uid, config])
   end
 
@@ -97,8 +105,8 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   @doc "Stop a running server (does **not** delete its data)."
   @spec stop_server(atom(), RaftEx.Domain.Types.server_id()) :: :ok | {:error, term()}
   def stop_server(system, server_id) when is_atom(system) do
-    node = RaftEx.Domain.Utils.ra_server_id_node(server_id)
-    ra_name = RaftEx.Domain.Utils.ra_server_id_to_local_name(server_id)
+    node = Utils.ra_server_id_node(server_id)
+    ra_name = Utils.ra_server_id_to_local_name(server_id)
 
     case :rpc.call(node, __MODULE__, :stop_server_rpc, [system, ra_name]) do
       :ok -> :ok
@@ -161,8 +169,8 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   @doc "Stop and permanently delete a server, removing its data directory."
   @spec delete_server(atom(), RaftEx.Domain.Types.server_id()) :: :ok | {:error, term()}
   def delete_server(system, server_id) when is_atom(system) do
-    node = RaftEx.Domain.Utils.ra_server_id_node(server_id)
-    name = RaftEx.Domain.Utils.ra_server_id_to_local_name(server_id)
+    node = Utils.ra_server_id_node(server_id)
+    name = Utils.ra_server_id_to_local_name(server_id)
 
     with :ok <- stop_server(system, server_id) do
       :rpc.call(node, __MODULE__, :delete_server_rpc, [system, name])
@@ -178,19 +186,19 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
       %{names: %{log_meta: meta, server_sup: srv_sup} = names} ->
         Logger.info("Deleting server #{ra_name} and its data directory.")
 
-        uid = RaftEx.Infra.Registry.Directory.uid_of(names, ra_name)
-        RaftEx.Infra.Persistence.LogMeta.delete(meta, uid)
+        uid = Directory.uid_of(names, ra_name)
+        LogMeta.delete(meta, uid)
 
-        dir = RaftEx.Infra.Config.Env.server_data_dir(system, uid)
+        dir = Env.server_data_dir(system, uid)
 
         case find_child(srv_sup, ra_name) do
           nil -> :ok
           pid -> DynamicSupervisor.terminate_child(srv_sup, pid)
         end
 
-        RaftEx.Infra.Filesystem.recursive_delete(dir)
-        RaftEx.Infra.Registry.Directory.unregister_name(names, uid)
-        RaftEx.Infra.Observability.Counters.delete({ra_name, node()})
+        Filesystem.recursive_delete(dir)
+        Directory.unregister_name(names, uid)
+        Counters.delete({ra_name, node()})
         RaftEx.Leaderboard.clear(ra_name)
         :ok
     end
@@ -203,14 +211,12 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   @doc false
   @spec recover_config(atom(), atom()) :: {:ok, map()} | {:error, term()}
   def recover_config(system, ra_name) do
-    case RaftEx.Infra.Registry.Directory.uid_of(system, ra_name) do
+    case Directory.uid_of(system, ra_name) do
       nil ->
         {:error, :name_not_registered}
 
       uid ->
-        RaftEx.Infra.Persistence.Log.read_config(
-          RaftEx.Infra.Config.Env.server_data_dir(system, uid)
-        )
+        Log.read_config(Env.server_data_dir(system, uid))
     end
   end
 

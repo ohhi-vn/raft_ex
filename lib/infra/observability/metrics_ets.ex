@@ -1,5 +1,11 @@
 defmodule RaftEx.Infra.Observability.MetricsEts do
+  @moduledoc """
+  GenServer that owns the ETS tables used for Raft metrics and snapshot state.
+  """
+
   use GenServer
+
+  alias RaftEx.Infra.Observability.Counters
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
@@ -7,7 +13,7 @@ defmodule RaftEx.Infra.Observability.MetricsEts do
   def init([]) do
     flags = [:named_table, {:read_concurrency, true}, {:write_concurrency, true}, :public]
     :ets.new(:ra_log_metrics, [:set | flags])
-    RaftEx.Infra.Observability.Counters.init()
+    Counters.init()
     RaftEx.Leaderboard.init()
     :ets.new(:ra_log_snapshot_state, [:set | flags])
     {:ok, %{}}

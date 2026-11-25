@@ -9,6 +9,17 @@ defmodule RaftEx.App.ServerRuntime do
 
   require Logger
 
+  alias RaftEx.Domain.LeakyIntegrator
+  alias RaftEx.Domain.Server
+  alias RaftEx.Domain.Server.Election
+  alias RaftEx.Domain.Utils
+  alias RaftEx.Infra.Network.Transport
+  alias RaftEx.Infra.Observability.Monitor
+  alias RaftEx.Infra.Persistence.LogMeta
+  alias RaftEx.Infra.Persistence.LogSnapshot
+  alias RaftEx.Infra.Process.Worker
+  alias RaftEx.Infra.Registry.Directory
+
   @default_election_mult 5
   @tick_interval_ms 1_000
   @default_await_condition_timeout 30_000
@@ -32,7 +43,7 @@ defmodule RaftEx.App.ServerRuntime do
   # Public API
 
   def start_link(%{id: id} = config) do
-    name = RaftEx.Domain.Utils.ra_server_id_to_local_name(id)
+    name = Utils.ra_server_id_to_local_name(id)
     :gen_statem.start_link({:local, name}, __MODULE__, config, [])
   end
 
@@ -113,7 +124,7 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   def recover(:internal, :go, %{server_state: ss0} = state) do
-    ss = RaftEx.Domain.Server.recover(ss0)
+    ss = Server.recover(ss0)
     next_state(:recovered, %{state | server_state: ss}, [{:next_event, :internal, :next}])
   end
 
@@ -135,25 +146,50 @@ defmodule RaftEx.App.ServerRuntime do
 
   # State: leader (partial — full impl mirrors ra_server_proc.erl)
   def leader(:enter, old_state, state0) do
-    {state, actions} = handle_enter(:leader, old_state, state0)
+    {state, actions0} = handle_enter(:leader, old_state, state0)
     :ok = record_cluster_change(state)
 
-    ss = Map.put(state.server_state, :cluster_change_permitted, true)
-    state = %{state | server_state: ss, election_timeout_set: false}
+    # Append a no-op entry in the new term so prior-term entries can commit
+    # and cluster changes become permitted only after it commits.
+    ss0 = state.server_state
+    mac_ver = ss0.cfg.machine_version
+
+    {_next, ss1, noop_effects} =
+      Server.handle_leader({:command, {:noop, %{}, mac_ver}}, ss0)
+
+    state = %{state | server_state: ss1, election_timeout_set: false}
+
+    {state, actions1} = handle_effects(:leader, noop_effects, :cast, state, actions0)
 
     cluster_name = state.conf[:cluster_name]
-    leader_id = RaftEx.Domain.Server.id(state.server_state)
+    leader_id = Server.id(state.server_state)
     members = Map.keys(state.server_state.cluster)
 
     if cluster_name do
       RaftEx.Leaderboard.record(cluster_name, leader_id, members)
     end
 
-    {:keep_state, state, actions}
+    {:keep_state, state, actions1}
   end
 
   def leader({:call, from}, :trigger_election, state) do
     {:keep_state, state, [{:reply, from, {:error, :already_leader}}]}
+  end
+
+  def leader(:info, {:send_snapshot_chunk, peer_id}, state0) do
+    case Map.get(state0, :snapshot_sends, %{}) |> Map.fetch(peer_id) do
+      {:ok, send_state} ->
+        {state, actions} = send_next_snapshot_chunk(peer_id, send_state, state0, [])
+        {:keep_state, state, actions}
+
+      :error ->
+        {:keep_state, state0, []}
+    end
+  end
+
+  def leader(:state_timeout, :clear_transfer_leadership, state0) do
+    state = %{state0 | server_state: Map.put(state0.server_state, :transfer_leadership, nil)}
+    {:keep_state, state, []}
   end
 
   def leader({:call, from}, :ping, state) do
@@ -167,8 +203,8 @@ defmodule RaftEx.App.ServerRuntime do
 
   def leader(:_, :tick_timeout, state) do
     {state1, rpc_effs} = make_rpcs(state)
-    effects = RaftEx.Domain.Server.tick(state1.server_state)
-    ss = RaftEx.Domain.Server.log_tick(state1.server_state)
+    effects = Server.tick(state1.server_state)
+    ss = Server.log_tick(state1.server_state)
 
     {state2, actions} =
       handle_effects(:leader, rpc_effs ++ effects ++ [{:aux, :tick}], :cast, %{
@@ -187,7 +223,8 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   def leader({:call, from}, {:leader_call, {:command, cmd}}, state0)
-      when is_tuple(cmd) and elem(cmd, 0) in [:"$ra_join", :"$ra_leave"] do
+      when is_tuple(cmd) and
+             elem(cmd, 0) in [:"$ra_join", :"$ra_leave", :"$ra_promote", :"$ra_demote"] do
     {tag, data, reply_mode} = cmd
     cmd = {tag, %{from: from}, data, reply_mode}
     leader({:call, from}, {:command, cmd}, state0)
@@ -204,6 +241,12 @@ defmodule RaftEx.App.ServerRuntime do
       if from_pid,
         do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
+
+    state =
+      case evt_type do
+        {:call, from} -> %{state | server_state: Map.put(state.server_state, :query_from, from)}
+        _ -> state
+      end
 
     case handle_leader(inner_msg, state) do
       {:leader, state1, effects} ->
@@ -229,14 +272,14 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions0} = handle_enter(:follower, old_state, state0)
 
     actions =
-      if RaftEx.Domain.Server.is_new?(state.server_state) do
+      if Server.new?(state.server_state) do
         actions0
       else
         {_state2, actions2} = set_election_timeout(state, actions0)
         actions2
       end
 
-    leader_id = RaftEx.Domain.Server.leader_id(state.server_state)
+    leader_id = Server.leader_id(state.server_state)
     cluster_name = state.conf[:cluster_name]
 
     if leader_id && cluster_name do
@@ -252,12 +295,12 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   def follower({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
-    state = %{state0 | server_state: RaftEx.Domain.Server.clear_leader_id(ss0)}
+    state = %{state0 | server_state: Server.clear_leader_id(ss0)}
     next_state(:candidate, state, [{:reply, from, :ok}])
   end
 
   def follower({:call, from}, {:leader_call, _msg}, state0) do
-    leader_id = RaftEx.Domain.Server.leader_id(state0.server_state)
+    leader_id = Server.leader_id(state0.server_state)
 
     if leader_id do
       {:keep_state, state0, [{:reply, from, {:redirect, leader_id}}]}
@@ -273,6 +316,12 @@ defmodule RaftEx.App.ServerRuntime do
       if from_pid,
         do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
+
+    state =
+      case evt_type do
+        {:call, from} -> %{state | server_state: Map.put(state.server_state, :query_from, from)}
+        _ -> state
+      end
 
     case handle_follower(inner_msg, state) do
       {:follower, state1, effects} ->
@@ -298,7 +347,7 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions0} = handle_enter(:pre_vote, old_state, state0)
 
     {context, election_effects} =
-      RaftEx.Domain.Server.Election.start_election(:pre_vote, state.server_state)
+      Election.start_election(:pre_vote, state.server_state)
 
     state = %{state | election_context: context}
     {s, actions} = handle_effects(:pre_vote, election_effects, :cast, state, actions0)
@@ -307,7 +356,7 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   def pre_vote({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
-    state = %{state0 | server_state: RaftEx.Domain.Server.clear_leader_id(ss0)}
+    state = %{state0 | server_state: Server.clear_leader_id(ss0)}
     next_state(:candidate, state, [{:reply, from, :ok}])
   end
 
@@ -333,22 +382,26 @@ defmodule RaftEx.App.ServerRuntime do
         do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
-    case handle_follower(inner_msg, state) do
-      {:pre_vote, state1, effects} ->
-        {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
-        {:keep_state, state, actions}
+    if is_struct(inner_msg, RaftEx.Domain.Types.PreVoteResult) do
+      handle_pre_vote_reply(inner_msg, {from_pid, nil}, state)
+    else
+      case handle_follower(inner_msg, state) do
+        {:pre_vote, state1, effects} ->
+          {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
+          {:keep_state, state, actions}
 
-      {:follower, state1, effects} ->
-        {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
-        next_state(:follower, state, actions)
+        {:follower, state1, effects} ->
+          {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
+          next_state(:follower, state, actions)
 
-      {:candidate, state1, effects} ->
-        {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
-        next_state(:candidate, state, actions)
+        {:candidate, state1, effects} ->
+          {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
+          next_state(:candidate, state, actions)
 
-      {next_s, state1, effects} ->
-        {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
-        next_state(next_s, state, actions)
+        {next_s, state1, effects} ->
+          {state, actions} = handle_effects(:pre_vote, effects, evt_type, state1)
+          next_state(next_s, state, actions)
+      end
     end
   end
 
@@ -357,7 +410,11 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions} = handle_enter(:candidate, old_state, state0)
 
     {context, election_effects} =
-      RaftEx.Domain.Server.Election.start_election(:candidate, state.server_state)
+      Election.start_election(:candidate, state.server_state)
+
+    ss = state.server_state
+    ss = %{ss | current_term: context.term, voted_for: Server.id(ss)}
+    state = %{state | server_state: ss}
 
     {state1, election_actions} =
       handle_effects(:candidate, election_effects, :cast, %{state | election_context: context})
@@ -373,7 +430,7 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   def candidate({:call, from}, :trigger_election, %{server_state: ss0} = state0) do
-    state = %{state0 | server_state: RaftEx.Domain.Server.clear_leader_id(ss0)}
+    state = %{state0 | server_state: Server.clear_leader_id(ss0)}
     next_state(:candidate, state, [{:reply, from, :ok}])
   end
 
@@ -402,7 +459,7 @@ defmodule RaftEx.App.ServerRuntime do
 
   def candidate(:state_timeout, :become_leader, state0) do
     Logger.info("RaftEx.App.ServerRuntime: Becoming leader after winning election")
-    leader_id = RaftEx.Domain.Server.id(state0.server_state)
+    leader_id = Server.id(state0.server_state)
     cluster_name = state0.conf[:cluster_name]
 
     if cluster_name do
@@ -421,22 +478,26 @@ defmodule RaftEx.App.ServerRuntime do
         do: put_in(state0.server_state.rpc_from, pid_to_server_id(from_pid)),
         else: state0
 
-    case handle_follower(inner_msg, state) do
-      {:candidate, state1, effects} ->
-        {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
-        {:keep_state, state, actions}
+    if is_struct(inner_msg, RaftEx.Domain.Types.RequestVoteResult) do
+      handle_vote_reply(inner_msg, {from_pid, nil}, state)
+    else
+      case handle_follower(inner_msg, state) do
+        {:candidate, state1, effects} ->
+          {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
+          {:keep_state, state, actions}
 
-      {:follower, state1, effects} ->
-        {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
-        next_state(:follower, state, actions)
+        {:follower, state1, effects} ->
+          {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
+          next_state(:follower, state, actions)
 
-      {:pre_vote, state1, effects} ->
-        {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
-        next_state(:pre_vote, state, actions)
+        {:pre_vote, state1, effects} ->
+          {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
+          next_state(:pre_vote, state, actions)
 
-      {next_s, state1, effects} ->
-        {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
-        next_state(next_s, state, actions)
+        {next_s, state1, effects} ->
+          {state, actions} = handle_effects(:candidate, effects, evt_type, state1)
+          next_state(next_s, state, actions)
+      end
     end
   end
 
@@ -513,43 +574,39 @@ defmodule RaftEx.App.ServerRuntime do
     do: statem_call(name, msg, timeout)
 
   defp safe_call({name, node}, msg, timeout) when node != node() do
-    try do
-      case :erpc.call(node, __MODULE__, :statem_call_local, [name, msg, timeout]) do
-        {:badrpc, reason} -> {:error, reason}
-        reply -> reply
-      end
-    catch
-      :exit, {:timeout, _} -> :timeout
-      :exit, {:noproc, _} -> {:error, :noproc}
-      :exit, {{:nodedown, _}, _} -> {:error, :nodedown}
-      :exit, {:shutdown, _} -> {:error, :shutdown}
-      :exit, {reason, _} -> {:error, reason}
+    case :erpc.call(node, __MODULE__, :statem_call_local, [name, msg, timeout]) do
+      {:badrpc, reason} -> {:error, reason}
+      reply -> reply
     end
+  catch
+    :exit, {:timeout, _} -> :timeout
+    :exit, {:noproc, _} -> {:error, :noproc}
+    :exit, {{:nodedown, _}, _} -> {:error, :nodedown}
+    :exit, {:shutdown, _} -> {:error, :shutdown}
+    :exit, {reason, _} -> {:error, reason}
   end
 
   defp safe_call(server_id, msg, timeout) do
-    try do
-      :gen_statem.call(server_id, msg, timeout)
-    catch
-      :exit, {:timeout, _} -> :timeout
-      :exit, {:noproc, _} -> {:error, :noproc}
-      :exit, {{:nodedown, _}, _} -> {:error, :nodedown}
-      :exit, {:shutdown, _} -> {:error, :shutdown}
-      :exit, {reason, _} -> {:error, reason}
-    end
+    :gen_statem.call(server_id, msg, timeout)
+  catch
+    :exit, {:timeout, _} -> :timeout
+    :exit, {:noproc, _} -> {:error, :noproc}
+    :exit, {{:nodedown, _}, _} -> {:error, :nodedown}
+    :exit, {:shutdown, _} -> {:error, :shutdown}
+    :exit, {reason, _} -> {:error, reason}
   end
 
   defp do_init(%{id: id, cluster_name: cluster_name} = config) do
-    key = RaftEx.Domain.Utils.ra_server_id_to_local_name(id)
+    key = Utils.ra_server_id_to_local_name(id)
     true = :ets.insert(:ra_state, {key, :init, :unknown})
     Process.flag(:trap_exit, true)
 
-    server_state = RaftEx.Domain.Server.init(config)
+    server_state = Server.init(config)
 
     if system = config[:system] do
       uid = config[:uid]
 
-      RaftEx.Infra.Registry.Directory.register_name(
+      Directory.register_name(
         system,
         uid,
         self(),
@@ -559,15 +616,22 @@ defmodule RaftEx.App.ServerRuntime do
       )
     end
 
-    sys_cfg = RaftEx.Domain.Server.system_config(server_state)
+    sys_cfg = Server.system_config(server_state)
     broadcast_time = Map.get(config, :broadcast_time, Map.get(sys_cfg, :broadcast_time, 100))
 
     %__MODULE__{
       conf: %{
-        log_id: RaftEx.Domain.Server.log_id(server_state),
+        log_id: Server.log_id(server_state),
         cluster_name: cluster_name,
         name: key,
         broadcast_time: broadcast_time,
+        election_timeout_min:
+          max(
+            Map.get(config, :election_timeout_min, Map.get(sys_cfg, :election_timeout_min, 500)),
+            Map.get(config, :tick_timeout, @tick_interval_ms) + 200
+          ),
+        election_timeout_max:
+          Map.get(config, :election_timeout_max, Map.get(sys_cfg, :election_timeout_max, 2_000)),
         tick_timeout: Map.get(config, :tick_timeout, @tick_interval_ms),
         await_condition_timeout:
           Map.get(config, :await_condition_timeout, @default_await_condition_timeout),
@@ -576,38 +640,36 @@ defmodule RaftEx.App.ServerRuntime do
         counter: Map.get(config, :counter)
       },
       server_state: server_state,
-      monitors: RaftEx.Infra.Observability.Monitor.init(),
+      monitors: Monitor.init(),
       pending_commands: [],
       leader_monitor: nil,
       election_timeout_set: false,
       pending_notifys: %{},
       pending_queries: [],
-      commit_rate: {RaftEx.Domain.LeakyIntegrator.new(@tick_interval_ms * 6), 0, 0.0}
+      commit_rate: {LeakyIntegrator.new(@tick_interval_ms * 6), 0, 0.0}
     }
   end
 
   defp handle_enter(raft_state, _old_state, %{conf: %{name: name}, server_state: ss0} = state) do
-    membership = RaftEx.Domain.Server.get_membership(ss0)
+    membership = Server.get_membership(ss0)
     true = :ets.insert(:ra_state, {name, raft_state, membership})
-    {ss, effects} = RaftEx.Domain.Server.handle_state_enter(raft_state, ss0)
+    {ss, effects} = Server.handle_state_enter(raft_state, ss0)
     handle_effects(raft_state, effects, :cast, %{state | server_state: ss})
   end
 
   defp handle_leader(msg, %{server_state: ss0} = state0) do
-    try do
-      {next_state, ss, effects} = RaftEx.Domain.Server.handle_leader(msg, ss0)
-      state = %{state0 | server_state: RaftEx.Domain.Server.persist_last_applied(ss)}
+    {next_state, ss, effects} = Server.handle_leader(msg, ss0)
+    state = %{state0 | server_state: Server.persist_last_applied(ss)}
+    {next_state, state, effects}
+  catch
+    :throw, {next_state, ss, effects} when is_atom(next_state) ->
+      state = %{state0 | server_state: Server.persist_last_applied(ss)}
       {next_state, state, effects}
-    catch
-      :throw, {next_state, ss, effects} when is_atom(next_state) ->
-        state = %{state0 | server_state: RaftEx.Domain.Server.persist_last_applied(ss)}
-        {next_state, state, effects}
-    end
   end
 
   defp handle_follower(msg, %{server_state: ss0} = state0) do
-    {next_state, ss, effects} = RaftEx.Domain.Server.handle_follower(msg, ss0)
-    state = %{state0 | server_state: RaftEx.Domain.Server.persist_last_applied(ss)}
+    {next_state, ss, effects} = Server.handle_follower(msg, ss0)
+    state = %{state0 | server_state: Server.persist_last_applied(ss)}
     {next_state, state, effects}
   end
 
@@ -620,19 +682,17 @@ defmodule RaftEx.App.ServerRuntime do
     peer_id = Process.get({:election_peer, from_pid})
 
     {should_start_election, ctx, effects} =
-      RaftEx.Domain.Server.Election.handle_pre_vote_reply(reply, ctx0, ss0, peer_id)
+      Election.handle_pre_vote_reply(reply, ctx0, ss0, peer_id)
 
     state = %{state0 | election_context: ctx}
 
-    cond do
-      should_start_election ->
-        Logger.info("RaftEx.App.ServerRuntime: Pre-vote succeeded, transitioning to candidate")
-        {state1, actions} = handle_effects(:pre_vote, effects, :cast, state)
-        next_state(:candidate, state1, actions)
+    {state1, actions} = handle_effects(:pre_vote, effects, :cast, state)
 
-      true ->
-        {state1, actions} = handle_effects(:pre_vote, effects, :cast, state)
-        {:keep_state, state1, actions}
+    if should_start_election do
+      Logger.info("RaftEx.App.ServerRuntime: Pre-vote succeeded, transitioning to candidate")
+      next_state(:candidate, state1, actions)
+    else
+      {:keep_state, state1, actions}
     end
   end
 
@@ -645,7 +705,7 @@ defmodule RaftEx.App.ServerRuntime do
     peer_id = Process.get({:election_peer, from_pid})
 
     {result, ctx, effects} =
-      RaftEx.Domain.Server.Election.handle_vote_reply(reply, ctx0, ss0, peer_id)
+      Election.handle_vote_reply(reply, ctx0, ss0, peer_id)
 
     state = %{state0 | election_context: ctx}
 
@@ -671,7 +731,7 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp handle_election_timeout(:pre_vote, state0) do
     {context, election_effects} =
-      RaftEx.Domain.Server.Election.start_election(:pre_vote, state0.server_state)
+      Election.start_election(:pre_vote, state0.server_state)
 
     state = %{state0 | election_context: context}
     {state, election_effects ++ set_election_timeout(state, [])}
@@ -679,9 +739,11 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp handle_election_timeout(:candidate, state0) do
     {context, election_effects} =
-      RaftEx.Domain.Server.Election.start_election(:candidate, state0.server_state)
+      Election.start_election(:candidate, state0.server_state)
 
-    state = %{state0 | election_context: context}
+    ss = state0.server_state
+    ss = %{ss | current_term: context.term, voted_for: Server.id(ss)}
+    state = %{state0 | server_state: ss, election_context: context}
     {state, election_effects ++ set_election_timeout(state, [])}
   end
 
@@ -720,7 +782,7 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   defp handle_effect(_, {:aux, cmd}, evt_type, %{server_state: ss0} = state0, actions0) do
-    {_, ss, effects} = RaftEx.Domain.Server.handle_aux(:follower, :cast, cmd, ss0)
+    {_, ss, effects} = Server.handle_aux(:follower, :cast, cmd, ss0)
     {state, actions} = handle_effects(:follower, effects, evt_type, %{state0 | server_state: ss})
     {state, actions0 ++ actions}
   end
@@ -737,7 +799,7 @@ defmodule RaftEx.App.ServerRuntime do
          %{server_state: ss0} = state0,
          actions0
        ) do
-    {ss, effects} = RaftEx.Domain.Server.update_release_cursor(idx, mac_state, %{}, ss0)
+    {ss, effects} = Server.update_release_cursor(idx, mac_state, %{}, ss0)
     handle_effects(:leader, effects, evt_type, %{state0 | server_state: ss}, actions0)
   end
 
@@ -748,7 +810,7 @@ defmodule RaftEx.App.ServerRuntime do
          %{conf: %{worker_pid: wp}} = state,
          actions
        ) do
-    if wp, do: RaftEx.Infra.Process.Worker.queue_work(wp, fun_or_mfa, err_fun)
+    if wp, do: Worker.queue_work(wp, fun_or_mfa, err_fun)
     {state, actions}
   end
 
@@ -756,20 +818,43 @@ defmodule RaftEx.App.ServerRuntime do
          :leader,
          {:send_snapshot, peer_id, {snap_state, leader_id, term}},
          _evt_type,
-         %{conf: conf} = state0,
+         state0,
          actions
        ) do
-    snapshot_data = %{
-      snap_state: snap_state,
-      leader_id: leader_id,
-      term: term,
-      peer_id: peer_id,
-      chunk_size: Map.get(conf, :snapshot_chunk_size, 65_536),
-      offset: 0
-    }
+    sends = Map.get(state0, :snapshot_sends, %{})
 
-    {state, rpc} = build_and_send_snapshot_chunk(snapshot_data, state0)
-    {state, [rpc | actions]}
+    case Map.fetch(sends, peer_id) do
+      {:ok, send_state} ->
+        send_next_snapshot_chunk(peer_id, send_state, state0, actions)
+
+      :error ->
+        snap_dir = snapshot_dir(state0)
+
+        case LogSnapshot.begin_read(snap_dir, %{
+               can_accept_full_file: false
+             }) do
+          {:ok, meta, read_state} ->
+            send_state = %{
+              meta: meta,
+              read_state: read_state,
+              offset: 0,
+              snap_state: snap_state,
+              leader_id: leader_id,
+              term: term
+            }
+
+            state = Map.put(state0, :snapshot_sends, Map.put(sends, peer_id, send_state))
+            send_next_snapshot_chunk(peer_id, send_state, state, actions)
+
+          _err ->
+            {state0, actions}
+        end
+    end
+  end
+
+  defp handle_effect(:leader, {:clear_snapshot_send, peer_id}, _, state0, actions) do
+    sends = Map.delete(Map.get(state0, :snapshot_sends, %{}), peer_id)
+    {Map.put(state0, :snapshot_sends, sends), actions}
   end
 
   defp handle_effect(
@@ -797,12 +882,12 @@ defmodule RaftEx.App.ServerRuntime do
          %{server_state: ss0} = state,
          actions
        ) do
-    {ss, effects} = RaftEx.Domain.Server.apply_committed(idx, ss0)
+    {ss, effects} = Server.apply_committed(idx, ss0)
 
     # Checkpoint the applied index immediately: a client may observe the
     # state machine change in the same tick the server is stopped, leaving no
     # subsequent message to trigger the lazy persistence in handle_leader.
-    ss = RaftEx.Domain.Server.persist_last_applied(ss)
+    ss = Server.persist_last_applied(ss)
 
     handle_effects(raft_state, effects, evt_type, %{state | server_state: ss}, actions)
   end
@@ -826,7 +911,114 @@ defmodule RaftEx.App.ServerRuntime do
     {state, actions}
   end
 
+  defp handle_effect(_, {:store_meta, key, value}, _, %{server_state: ss} = state, actions) do
+    meta_name = Server.system_config(ss) |> meta_name_from_sc()
+    uid = Server.uid(ss)
+
+    try do
+      LogMeta.store_sync(meta_name, uid, key, value)
+    catch
+      _, _ -> :ok
+    end
+
+    {state, actions}
+  end
+
+  defp handle_effect(_, {:reset_election_timeout}, _, state, actions) do
+    set_election_timeout(state, actions)
+  end
+
+  defp handle_effect(_, {:transfer_leadership_timeout, _target}, _, state, actions) do
+    {state, [{:state_timeout, 1_000, :clear_transfer_leadership} | actions]}
+  end
+
   defp handle_effect(_, _, _, state, actions), do: {state, actions}
+
+  defp send_next_snapshot_chunk(peer_id, send_state, state0, actions) do
+    chunk_size = Map.get(state0.conf, :snapshot_chunk_size, 65_536)
+    snap_dir = snapshot_dir(state0)
+
+    case LogSnapshot.read_chunk(
+           send_state.read_state,
+           chunk_size,
+           snap_dir
+         ) do
+      {:ok, data, :last} ->
+        chunk_state = if send_state.offset == 0, do: :full, else: :last
+        payload = if chunk_state == :full, do: send_state.snap_state, else: data
+
+        rpc = %RaftEx.Domain.Types.InstallSnapshotRpc{
+          term: send_state.term,
+          leader_id: send_state.leader_id,
+          meta: send_state.meta,
+          chunk_state: chunk_state,
+          data: payload
+        }
+
+        send_snapshot_rpc(peer_id, rpc, state0)
+
+        sends = Map.delete(Map.get(state0, :snapshot_sends, %{}), peer_id)
+        {Map.put(state0, :snapshot_sends, sends), [rpc | actions]}
+
+      {:ok, data, {:next, new_read_state}} ->
+        chunk_state = if send_state.offset == 0, do: :first, else: :middle
+
+        rpc = %RaftEx.Domain.Types.InstallSnapshotRpc{
+          term: send_state.term,
+          leader_id: send_state.leader_id,
+          meta: send_state.meta,
+          chunk_state: chunk_state,
+          data: data
+        }
+
+        send_snapshot_rpc(peer_id, rpc, state0)
+
+        new_read_state =
+          case send_state.read_state do
+            {crc, _} when is_integer(crc) -> {crc, new_read_state}
+            _ -> new_read_state
+          end
+
+        new_send_state = %{
+          send_state
+          | read_state: new_read_state,
+            offset: send_state.offset + chunk_size
+        }
+
+        sends = Map.put(Map.get(state0, :snapshot_sends, %{}), peer_id, new_send_state)
+        state = Map.put(state0, :snapshot_sends, sends)
+        {state, [rpc, {:next_event, :info, {:send_snapshot_chunk, peer_id}} | actions]}
+
+      {:error, _reason} ->
+        sends = Map.delete(Map.get(state0, :snapshot_sends, %{}), peer_id)
+        {Map.put(state0, :snapshot_sends, sends), actions}
+    end
+  end
+
+  defp send_snapshot_rpc({name, node} = _peer_id, rpc, state)
+       when node == node() do
+    _ = state
+
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> :gen_statem.cast(pid, {self(), {:rpc, rpc}})
+    end
+  end
+
+  defp send_snapshot_rpc(peer_id, rpc, _state) do
+    Transport.send_rpc(peer_id, rpc)
+  end
+
+  defp snapshot_dir(%{server_state: %{log: %{data_dir: dir}}}) when is_binary(dir) do
+    Path.join(dir, "snapshot")
+  end
+
+  defp snapshot_dir(_state) do
+    Path.join(System.tmp_dir!(), "raft_ex_snapshot")
+  end
+
+  defp meta_name_from_sc(%{names: %{log_meta: name}}), do: name
+  defp meta_name_from_sc(sc), do: Server.meta_name(sc)
 
   defp send_rpc({name, node} = to, msg, state) do
     incr_counter(state.conf, :rpcs_sent, 1)
@@ -837,7 +1029,7 @@ defmodule RaftEx.App.ServerRuntime do
         pid -> :gen_statem.cast(pid, {self(), {:rpc, msg}})
       end
     else
-      RaftEx.Infra.Network.Transport.send_rpc(to, msg)
+      Transport.send_rpc(to, msg)
     end
   end
 
@@ -856,66 +1048,18 @@ defmodule RaftEx.App.ServerRuntime do
           :gen_statem.cast(pid, {self(), {:rpc, rpc}})
       end
     else
-      RaftEx.Infra.Network.Transport.send_rpc(peer_id, rpc)
+      Transport.send_rpc(peer_id, rpc)
     end
   end
 
-  defp build_and_send_snapshot_chunk(
-         %{
-           snap_state: snap_state,
-           leader_id: leader_id,
-           term: term,
-           peer_id: peer_id,
-           chunk_size: chunk_size,
-           offset: offset
-         } = snap_data,
-         state
-       ) do
-    # Serialize snapshot state into binary
-    data = :erlang.term_to_binary(snap_state)
-    total_size = byte_size(data)
+  defp election_timeout_action(:short, conf) do
+    bt = Map.get(conf, :broadcast_time, 100)
+    min_t = Map.get(conf, :election_timeout_min, bt)
+    max_t = Map.get(conf, :election_timeout_max, bt * @default_election_mult)
 
-    # Calculate chunk boundaries
-    chunk_end = min(offset + chunk_size, total_size)
-    chunk_data = binary_part(data, offset, chunk_end - offset)
-    is_last = chunk_end >= total_size
-
-    # Build InstallSnapshot RPC
-    rpc = %RaftEx.Domain.Types.InstallSnapshotRpc{
-      term: term,
-      leader_id: leader_id,
-      meta: %{
-        last_index: snap_state.last_index || 0,
-        last_term: snap_state.last_term || 0,
-        total_size: total_size,
-        offset: offset,
-        is_last: is_last
-      },
-      chunk_state: if(is_last, do: :last, else: :more),
-      data: chunk_data
-    }
-
-    # Update snapshot data for next chunk
-    new_snap_data = %{snap_data | offset: chunk_end}
-
-    # Store snapshot transfer state in process dictionary for reply handling
-    Process.put({:snapshot_send, peer_id}, new_snap_data)
-
-    # Update peer status to sending_snapshot
-    ss =
-      RaftEx.Domain.Server.update_peer(
-        peer_id,
-        %{status: {:sending_snapshot, self(), offset}},
-        state.server_state
-      )
-
-    state = %{state | server_state: ss}
-
-    {state, {:send_rpc, peer_id, rpc}}
-  end
-
-  defp election_timeout_action(:short, %{broadcast_time: bt}) do
-    t = :rand.uniform(bt * @default_election_mult) + bt
+    lo = min(min_t, max_t)
+    hi = max(min_t, max_t)
+    t = lo + :rand.uniform(max(hi - lo, 1))
     {:state_timeout, t, :election_timeout}
   end
 
@@ -931,12 +1075,12 @@ defmodule RaftEx.App.ServerRuntime do
   end
 
   defp make_rpcs(%{server_state: ss0} = state) do
-    {ss, rpcs} = RaftEx.Domain.Server.make_rpcs(ss0)
+    {ss, rpcs} = Server.make_rpcs(ss0)
     {%{state | server_state: ss}, rpcs}
   end
 
-  defp do_state_query(spec, %{server_state: ss}), do: RaftEx.Domain.Server.state_query(spec, ss)
-  defp id(%{server_state: ss}), do: RaftEx.Domain.Server.id(ss)
+  defp do_state_query(spec, %{server_state: ss}), do: Server.state_query(spec, ss)
+  defp id(%{server_state: ss}), do: Server.id(ss)
   defp record_cluster_change(_state), do: :ok
   defp incr_counter(_, _, _), do: :ok
   defp unwrap_rpc({:rpc, msg}), do: unwrap_rpc(msg)

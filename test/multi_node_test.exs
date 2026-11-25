@@ -1,6 +1,8 @@
 defmodule RaftEx.MultiNodeTest do
   use ExUnit.Case, async: false
 
+  alias RaftEx.Infra.Network.Distribution
+
   @test_cookie :raft_ex_test_cookie
 
   setup do
@@ -30,7 +32,7 @@ defmodule RaftEx.MultiNodeTest do
   describe "node distribution" do
     test "build_server_ids/2 creates correct server id tuples" do
       nodes = [:node1@host, :node2@host, :node3@host]
-      server_ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes)
+      server_ids = Distribution.build_server_ids(nodes)
 
       assert length(server_ids) == 3
       assert {:server1, :node1@host} in server_ids
@@ -39,18 +41,18 @@ defmodule RaftEx.MultiNodeTest do
     end
 
     test "connect_to_seeds/2 handles empty seed list" do
-      connected = RaftEx.Infra.Network.Distribution.connect_to_seeds([], @test_cookie)
+      connected = Distribution.connect_to_seeds([], @test_cookie)
       assert connected == []
     end
 
     test "cluster_nodes/0 includes self" do
-      nodes = RaftEx.Infra.Network.Distribution.cluster_nodes()
+      nodes = Distribution.cluster_nodes()
       assert node() in nodes
     end
 
     test "build_server_ids/2 uses custom prefix" do
       nodes = [:n1@host, :n2@host]
-      ids = RaftEx.Infra.Network.Distribution.build_server_ids(nodes, :raft)
+      ids = Distribution.build_server_ids(nodes, :raft)
       assert {:raft1, :n1@host} in ids
       assert {:raft2, :n2@host} in ids
     end
@@ -103,7 +105,7 @@ defmodule RaftEx.MultiNodeTest do
       RaftEx.Leaderboard.record(:cluster_c, {:s1, node()}, [{:s1, node()}])
 
       overview = RaftEx.Leaderboard.overview()
-      assert length(overview) > 0
+      assert overview != []
       entry = Enum.find(overview, fn e -> e.cluster == :cluster_c end)
       assert entry != nil
       assert entry.leader == {:s1, node()}
@@ -155,7 +157,7 @@ defmodule RaftEx.MultiNodeTest do
 
       {:ok, status} = RaftEx.cluster_status()
       assert is_list(status.servers)
-      assert length(status.servers) > 0
+      assert status.servers != []
       assert status.node == node()
     end
 
@@ -186,7 +188,7 @@ defmodule RaftEx.MultiNodeTest do
         RaftEx.form_cluster(cluster_name, machine, [node()], timeout: 5_000)
 
       {:ok, members, _leader} = RaftEx.members(sid, 2_000)
-      assert length(members) > 0
+      assert members != []
     end
 
     test "leaderboard_overview returns formatted data", %{data_dir: _dd} do

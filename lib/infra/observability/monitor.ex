@@ -1,4 +1,9 @@
 defmodule RaftEx.Infra.Observability.Monitor do
+  @moduledoc """
+  Tracks process and node monitors, grouping several logical components under
+  a single monitor reference.
+  """
+
   @type component :: :machine | :aux | :snapshot_sender
   @type t :: map()
 

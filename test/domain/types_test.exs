@@ -52,6 +52,14 @@ defmodule RaftEx.Domain.TypesTest do
              }
     end
 
+    test "TimeoutNowRpc carries term and leader" do
+      rpc = %Types.TimeoutNowRpc{term: 7, leader_id: {:s1, node()}}
+
+      assert rpc.term == 7
+      assert rpc.leader_id == {:s1, node()}
+      assert %Types.TimeoutNowRpc{term: 7} = rpc
+    end
+
     test "PreVoteRpc defaults version to 1" do
       rpc = %Types.PreVoteRpc{term: 4, candidate_id: {:s1, node()}, token: make_ref()}
 

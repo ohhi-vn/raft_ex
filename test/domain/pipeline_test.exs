@@ -74,5 +74,12 @@ defmodule RaftEx.Domain.PipelineTest do
       conn = %Conn{request: %{x: 1}}
       assert Pipeline.run(conn, []) == conn
     end
+
+    test "runs a bare module plug with empty options" do
+      conn = Pipeline.run(%Conn{}, [CallablePlug])
+
+      assert Conn.get_assign(conn, :callable) == true
+      refute conn.halted
+    end
   end
 end

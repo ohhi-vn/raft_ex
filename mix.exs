@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.3.1"
+  @version "0.4.0"
 
   def project do
     [
@@ -36,6 +36,7 @@ defmodule RaftEx.MixProject do
   def cli do
     [
       preferred_envs: [
+        precommit: :test,
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
@@ -62,7 +63,7 @@ defmodule RaftEx.MixProject do
 
       # Code quality
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7.19", only: [:dev, :test], runtime: false}
     ]
   end
 
@@ -94,6 +95,12 @@ defmodule RaftEx.MixProject do
 
   defp aliases do
     [
+      precommit: [
+        "compile --warnings-as-errors",
+        "format --check-formatted",
+        "credo --strict",
+        "test"
+      ],
       quality: ["format", "credo --strict", "dialyzer"],
       "quality.ci": [
         "format --check-formatted",

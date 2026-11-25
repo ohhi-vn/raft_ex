@@ -35,45 +35,43 @@ defmodule RaftEx.Infra.Network.Distribution do
   """
   @spec connect_to_seeds([node()], atom()) :: [node()]
   def connect_to_seeds(seeds, cookie \\ :raft_ex) do
-    unless Node.alive?() do
-      Logger.warning(
-        "RaftEx.Infra.Network.Distribution: node not alive, skipping seed connection"
-      )
-
-      []
-    else
+    if Node.alive?() do
       try do
         Node.set_cookie(cookie)
       rescue
         _ -> :ok
       end
 
-      seeds
-      |> Enum.filter(&(&1 != node()))
-      |> Enum.filter(fn seed ->
-        try do
-          case Node.connect(seed) do
-            true ->
-              Logger.info("RaftEx.Infra.Network.Distribution: connected to seed #{inspect(seed)}")
-              true
+      Enum.filter(seeds, fn seed -> seed != node() and connect_seed(seed) end)
+    else
+      Logger.warning(
+        "RaftEx.Infra.Network.Distribution: node not alive, skipping seed connection"
+      )
 
-            false ->
-              Logger.warning(
-                "RaftEx.Infra.Network.Distribution: failed to connect to seed #{inspect(seed)}"
-              )
-
-              false
-          end
-        rescue
-          _ ->
-            Logger.warning(
-              "RaftEx.Infra.Network.Distribution: error connecting to seed #{inspect(seed)}"
-            )
-
-            false
-        end
-      end)
+      []
     end
+  end
+
+  defp connect_seed(seed) do
+    case Node.connect(seed) do
+      true ->
+        Logger.info("RaftEx.Infra.Network.Distribution: connected to seed #{inspect(seed)}")
+        true
+
+      false ->
+        Logger.warning(
+          "RaftEx.Infra.Network.Distribution: failed to connect to seed #{inspect(seed)}"
+        )
+
+        false
+    end
+  rescue
+    _ ->
+      Logger.warning(
+        "RaftEx.Infra.Network.Distribution: error connecting to seed #{inspect(seed)}"
+      )
+
+      false
   end
 
   @doc """

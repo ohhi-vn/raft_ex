@@ -1,4 +1,9 @@
 defmodule RaftEx.Infra.Process.MachineEts do
+  @moduledoc """
+  GenServer that creates and tracks named ETS tables on behalf of RaftEx
+  systems.
+  """
+
   use GenServer
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)

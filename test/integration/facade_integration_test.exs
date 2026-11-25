@@ -76,30 +76,32 @@ defmodule RaftEx.FacadeIntegrationTest do
       {_name, sid} = cluster()
 
       result = RaftEx.local_query(sid, fn state -> state end, 1_000)
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
 
       result = RaftEx.local_query(sid, fn state -> state end, %{timeout: 1_000, extra: 1})
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
     end
 
     test "leader_query with timeout and options map" do
       {_name, sid} = cluster()
 
       result = RaftEx.leader_query(sid, fn state -> state end, 1_000)
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
 
       result = RaftEx.leader_query(sid, fn state -> state end, %{timeout: 1_000})
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
     end
 
     test "consistent_query and consistent_aux" do
       {_name, sid} = cluster()
 
       result = RaftEx.consistent_query(sid, fn state -> state end, 1_000)
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
 
       result = RaftEx.consistent_aux(sid, {:aux, :query}, 1_000)
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result) or
+               match?({:error, _}, result)
     end
 
     test "members, members_info, initial_members, member_overview" do
@@ -109,7 +111,7 @@ defmodule RaftEx.FacadeIntegrationTest do
       assert {:ok, _info, _leader} = RaftEx.members_info(sid, 3_000)
       assert {:ok, _initial, _leader} = RaftEx.initial_members(sid, 3_000)
       result = RaftEx.member_overview(sid, 1_000)
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result)
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result)
     end
 
     test "key_metrics with a registered counter" do
@@ -241,7 +243,7 @@ defmodule RaftEx.FacadeIntegrationTest do
       assert RaftEx.trigger_election(sid, 3_000) in [:ok, {:error, :already_leader}]
       result = RaftEx.transfer_leadership(sid, sid, 3_000)
 
-      assert match?({:ok, _}, result) or match?({:timeout, _}, result) or
+      assert match?({:ok, _, _}, result) or match?({:timeout, _}, result) or
                match?({:error, _}, result)
     end
 

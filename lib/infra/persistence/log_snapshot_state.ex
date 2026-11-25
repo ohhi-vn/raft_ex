@@ -1,4 +1,11 @@
 defmodule RaftEx.Infra.Persistence.LogSnapshotState do
+  @moduledoc """
+  ETS-backed index information about installed snapshots.
+
+  Stores, per server uid, the snapshot index, the smallest live index and
+  the list of live log indexes used during snapshot recovery.
+  """
+
   @table :ra_log_snapshot_state
 
   def insert(table \\ @table, uid, snap_idx, smallest_idx, live_indexes)

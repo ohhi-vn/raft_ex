@@ -1,5 +1,15 @@
 defmodule RaftEx.Infra.Persistence.LogSnapshot do
+  @moduledoc """
+  File-backed snapshot storage for the replicated log.
+
+  Snapshots are written as a single `snapshot.dat` file consisting of a
+  magic/version/checksum header, a serialized metadata term, and the
+  serialized machine state with a final CRC32 checksum.
+  """
+
   @behaviour RaftEx.Infra.Persistence.Snapshot
+
+  alias RaftEx.Infra.Filesystem
 
   @magic "RASN"
   @version 1
@@ -18,7 +28,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshot do
 
     header = <<@magic, @version::8-unsigned, checksum::32-integer>>
 
-    case RaftEx.Infra.Filesystem.write_file(file, [header | data], sync) do
+    case Filesystem.write_file(file, [header | data], sync) do
       :ok -> {:ok, bytes}
       err -> err
     end
@@ -26,7 +36,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshot do
 
   @impl RaftEx.Infra.Persistence.Snapshot
   def sync(dir) do
-    RaftEx.Infra.Filesystem.sync_file(filename(dir))
+    Filesystem.sync_file(filename(dir))
   end
 
   @impl RaftEx.Infra.Persistence.Snapshot
@@ -49,31 +59,53 @@ defmodule RaftEx.Infra.Persistence.LogSnapshot do
       ) do
     partial_crc = :erlang.crc32(rest)
     bytes = 5 + 4 + byte_size(rest)
-    {:ok, 0} = :file.position(fd, 0)
-    :ok = :file.write(fd, <<@magic, @version::8-unsigned, crc::32-integer, rest::binary>>)
-    {:ok, {bytes, partial_crc, crc, fd}}
+
+    with {:ok, 0} <- :file.position(fd, 0),
+         :ok <- :file.write(fd, <<@magic, @version::8-unsigned, crc::32-integer, rest::binary>>) do
+      {:ok, {bytes, partial_crc, crc, fd}}
+    else
+      {:error, _reason} = error -> error
+    end
   end
 
-  def accept_chunk(chunk, {bytes, partial_crc, fd}) do
-    <<_crc::32-integer, rest::binary>> = chunk
+  def accept_chunk(<<_crc::32-integer, rest::binary>>, {bytes, partial_crc, fd}) do
     accept_chunk(rest, {bytes, partial_crc, nil, fd})
   end
 
+  def accept_chunk(_chunk, {_bytes, _partial_crc, _fd}), do: {:error, :invalid_chunk}
+
   def accept_chunk(chunk, {bytes, partial_crc0, crc, fd}) do
     bytes1 = bytes + byte_size(chunk)
-    :ok = :file.write(fd, chunk)
-    partial_crc = :erlang.crc32(partial_crc0, chunk)
-    {:ok, {bytes1, partial_crc, crc, fd}}
+
+    case :file.write(fd, chunk) do
+      :ok ->
+        {:ok, {bytes1, :erlang.crc32(partial_crc0, chunk), crc, fd}}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @impl RaftEx.Infra.Persistence.Snapshot
-  def complete_accept(chunk, {bytes, _partial_crc, crc0, fd}) do
-    {:ok, {final_bytes, calculated_crc, crc0, _fd}} = accept_chunk(chunk, {bytes, 0, crc0, fd})
-    crc_to_write = if crc0 == nil, do: calculated_crc, else: crc0
-    :ok = :file.pwrite(fd, 5, <<crc_to_write::32-integer>>)
-    :ok = RaftEx.Infra.Filesystem.sync(fd)
-    :ok = :file.close(fd)
-    {:ok, final_bytes}
+  def complete_accept(chunk, {bytes, partial_crc, crc0, fd}) do
+    case accept_chunk(chunk, {bytes, partial_crc, crc0, fd}) do
+      {:ok, {final_bytes, calculated_crc, crc0, _fd}} ->
+        crc_to_write = if crc0 == nil, do: calculated_crc, else: crc0
+
+        with :ok <- :file.pwrite(fd, 5, <<crc_to_write::32-integer>>),
+             :ok <- Filesystem.sync(fd),
+             :ok <- :file.close(fd) do
+          {:ok, final_bytes}
+        else
+          {:error, _reason} = error ->
+            :file.close(fd)
+            error
+        end
+
+      {:error, _reason} = error ->
+        :file.close(fd)
+        error
+    end
   end
 
   @impl RaftEx.Infra.Persistence.Snapshot
@@ -82,12 +114,12 @@ defmodule RaftEx.Infra.Persistence.LogSnapshot do
 
     with {:ok, fd} <- :file.open(file, [:read, :binary, :raw]),
          {:ok, meta, crc} <- read_meta_internal(fd) do
+      {:ok, cur} = :file.position(fd, :cur)
       {:ok, eof} = :file.position(fd, :eof)
 
       if Map.get(context, :can_accept_full_file) do
         {:ok, meta, {0, eof, fd}}
       else
-        {:ok, cur} = :file.position(fd, :cur)
         {:ok, meta, {crc, {cur, eof, fd}}}
       end
     else

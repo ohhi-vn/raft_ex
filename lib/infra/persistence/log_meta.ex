@@ -174,10 +174,8 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
   defp set_field(:last_applied, value, row), do: put_elem(row, @pos_last_applied - 1, value)
 
   defp ets_lookup(meta_name, uid, pos) do
-    try do
-      :ets.lookup_element(meta_name, uid, pos)
-    rescue
-      ArgumentError -> nil
-    end
+    :ets.lookup_element(meta_name, uid, pos)
+  rescue
+    ArgumentError -> nil
   end
 end

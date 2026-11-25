@@ -106,6 +106,8 @@ defmodule RaftEx.Domain.Machine do
   @callback version() :: version()
   @callback which_module(version()) :: module()
 
+  alias RaftEx.Domain.Seq
+
   @default_version 0
 
   # ---------------------------------------------------------------------------
@@ -157,7 +159,7 @@ defmodule RaftEx.Domain.Machine do
 
     case result do
       {:ra_seq, seq} -> seq
-      list -> RaftEx.Domain.Seq.from_list(list)
+      list -> Seq.from_list(list)
     end
   end
 
@@ -168,8 +170,8 @@ defmodule RaftEx.Domain.Machine do
 
   def version({:machine, mod, _}), do: version(mod)
 
-  @spec is_versioned(machine()) :: boolean()
-  def is_versioned({:machine, mod, _}) do
+  @spec versioned?(machine()) :: boolean()
+  def versioned?({:machine, mod, _}) do
     call_optional(fn -> mod.version() && true end, false)
   end
 

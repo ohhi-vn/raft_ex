@@ -126,6 +126,8 @@ defmodule RaftEx.Domain.ServerTest do
       membership: :voter,
       cluster_change_permitted: false,
       pending_consistent_queries: [],
+      query_index: 0,
+      queries_waiting_heartbeats: :queue.new(),
       cluster: %{
         @self_id => %{
           voter_status: %{membership: :voter},
@@ -145,7 +147,7 @@ defmodule RaftEx.Domain.ServerTest do
         }
       },
       log: Keyword.get(opts, :log, log([{1, 2, :cmd}, {2, 2, :cmd}])),
-      machine_state: :machine_state,
+      machine_state: Keyword.get(opts, :machine_state, :machine_state),
       aux_state: Keyword.get(opts, :aux_state, nil)
     }
   end
@@ -173,17 +175,17 @@ defmodule RaftEx.Domain.ServerTest do
   end
 
   describe "log predicates" do
-    test "is_new?/1" do
-      assert Server.is_new?(state(log: %Log{next_index: 1}))
-      refute Server.is_new?(state(log: %Log{next_index: 4}))
+    test "new?/1" do
+      assert Server.new?(state(log: %Log{next_index: 1}))
+      refute Server.new?(state(log: %Log{next_index: 4}))
     end
 
-    test "is_fully_persisted?/1" do
+    test "fully_persisted?/1" do
       s = state(log: log([{1, 2, :cmd}]))
-      assert Server.is_fully_persisted?(s)
+      assert Server.fully_persisted?(s)
 
       s = %{s | log: %{s.log | last_written_index_term: {0, 0}}}
-      refute Server.is_fully_persisted?(s)
+      refute Server.fully_persisted?(s)
     end
   end
 
@@ -463,6 +465,105 @@ defmodule RaftEx.Domain.ServerTest do
       assert [{:send_rpc, @peer2, %Types.AppendEntriesRpc{} = rpc}] = effects
       assert rpc.term == 2
       assert rpc.leader_id == @self_id
+    end
+  end
+
+  describe "durable term adoption" do
+    test "adopt_term/3 returns store_meta effects for a higher term" do
+      s = state()
+
+      {s2, effects} = Server.adopt_term(3, s, @peer2)
+
+      assert s2.current_term == 3
+      assert s2.voted_for == @peer2
+      assert s2.leader_id == nil
+      assert effects == [{:store_meta, :current_term, 3}, {:store_meta, :voted_for, @peer2}]
+
+      {s3, effects3} = Server.adopt_term(2, s2, @self_id)
+      assert s3 == s2
+      assert effects3 == []
+    end
+  end
+
+  describe "query handlers" do
+    setup do
+      machine_state = {:simple, fn state -> {:queried, state} end, :st}
+      %{state: state(machine_state: machine_state)}
+    end
+
+    test "local queries are answered by leader and follower", %{state: s} do
+      {:leader, _state, effects} = Server.handle_leader({:local_query, fn st -> st end}, s)
+      assert [{:reply, {:ok, :st, @self_id}}] = effects
+
+      {:follower, _state, effects} =
+        Server.handle_follower({:local_query, fn st -> st end, %{}}, s)
+
+      assert [{:reply, {:ok, :st, @self_id}}] = effects
+    end
+
+    test "consistent query allocates a query index and probes voters", %{state: s} do
+      s = %{s | cluster_change_permitted: true, rpc_from: {:caller, node()}}
+
+      {:leader, s2, effects} =
+        Server.handle_leader({:consistent_query, fn st -> st end}, s)
+
+      assert s2.query_index == 1
+      assert {[{1, _}], []} = s2.queries_waiting_heartbeats
+      assert [{:send_rpc, @peer2, %Types.HeartbeatRpc{} = rpc}] = effects
+      assert rpc.query_index == 1
+      assert rpc.leader_id == @self_id
+    end
+  end
+
+  describe "leadership transfer" do
+    test "leader sends TimeoutNowRpc to a caught-up voter" do
+      cluster =
+        put_in(
+          state().cluster,
+          [@peer2, :match_index],
+          2
+        )
+
+      s = %{state() | cluster: cluster, commit_index: 1, leader_id: @self_id}
+
+      {:leader, s2, effects} = Server.handle_leader({:transfer_leadership, @peer2}, s)
+
+      assert s2.transfer_leadership == @peer2
+      assert {:send_rpc, @peer2, %Types.TimeoutNowRpc{term: 2, leader_id: @self_id}} in effects
+      assert {:reply, {:ok, @peer2}} in effects
+      assert {:transfer_leadership_timeout, @peer2} in effects
+    end
+
+    test "leader rejects transfer to self, unknown and lagging servers" do
+      s = state()
+
+      {:leader, _s, effects} = Server.handle_leader({:transfer_leadership, @self_id}, s)
+      assert {:reply, {:error, :self}} in effects
+
+      {:leader, _s, effects} =
+        Server.handle_leader({:transfer_leadership, {:unknown, node()}}, s)
+
+      assert {:reply, {:error, :not_member}} in effects
+
+      {:leader, _s, effects} = Server.handle_leader({:transfer_leadership, @peer2}, s)
+      assert {:reply, {:error, :not_caught_up}} in effects
+    end
+
+    test "TimeoutNowRpc starts an immediate candidate election" do
+      {:candidate, s2, effects} =
+        Server.handle_follower(%Types.TimeoutNowRpc{term: 3, leader_id: @peer2}, state())
+
+      assert s2.current_term == 3
+      assert s2.leader_id == nil
+      assert effects == []
+    end
+
+    test "stale TimeoutNowRpc is ignored" do
+      {:follower, s2, effects} =
+        Server.handle_follower(%Types.TimeoutNowRpc{term: 1, leader_id: @peer2}, state())
+
+      assert s2.current_term == 2
+      assert effects == []
     end
   end
 end

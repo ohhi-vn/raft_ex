@@ -6,9 +6,91 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
   alias RaftEx.Domain.Server.Config
   alias RaftEx.Domain.Types
   alias RaftEx.Infra.Persistence.Log
+  alias RaftEx.Infra.Persistence.LogMeta
+  alias RaftEx.Infra.Persistence.LogSnapshot
+
+  setup do
+    name = :runtime_test_meta
+    dir = Path.join(System.tmp_dir!(), "runtime_meta_#{System.unique_integer([:positive])}")
+
+    case Process.whereis(name) do
+      nil ->
+        {:ok, pid} =
+          LogMeta.start_link(%{
+            name: :runtime_test_setup,
+            data_dir: dir,
+            names: %{log_meta: name}
+          })
+
+        Process.unlink(pid)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
 
   @self_id {:server1, node()}
   @peer2 {:server2, node()}
+
+  # A WAL that always rejects appends, used to drive the :wal_down branch of
+  # Domain.Server.handle_leader/2 (which becomes an :await_condition transition).
+  defmodule WalDownServer do
+    use GenServer
+
+    def start_link, do: GenServer.start_link(__MODULE__, :ok, [])
+    def init(:ok), do: {:ok, :ok}
+
+    def handle_call({:append, _uid, _entries}, _from, state),
+      do: {:reply, {:error, :wal_down}, state}
+  end
+
+  # Minimal gen_statem used to exercise the statem_call/safe_call helpers.
+  defmodule CallResponder do
+    @behaviour :gen_statem
+
+    def start(reply_fun), do: :gen_statem.start(__MODULE__, reply_fun, [])
+    def init(reply_fun), do: {:ok, :ready, reply_fun}
+    def callback_mode, do: :handle_event_function
+
+    def handle_event({:call, from}, msg, :ready, reply_fun) do
+      {:keep_state_and_data, [{:reply, from, reply_fun.(msg)}]}
+    end
+  end
+
+  # A gen_statem that terminates with a chosen reason while handling a call.
+  defmodule CrashingResponder do
+    @behaviour :gen_statem
+
+    def start(reason), do: :gen_statem.start(__MODULE__, reason, [])
+    def init(reason), do: {:ok, :ready, reason}
+    def callback_mode, do: :handle_event_function
+
+    def handle_event({:call, _from}, _msg, :ready, reason) do
+      Process.exit(self(), reason)
+      {:keep_state_and_data, []}
+    end
+  end
+
+  # A machine that emits a chosen effect when its command is applied.
+  defmodule EffectMachine do
+    @behaviour RaftEx.Domain.Machine
+
+    def init(_conf), do: :initial
+
+    def apply(_meta, cmd, state) do
+      effects =
+        case cmd do
+          :release_cursor -> [{:release_cursor, 1, state}]
+          :bg_work -> [{:bg_work, fn -> :ok end, fn _ -> :ok end}]
+          :gc -> [:garbage_collection]
+          _ -> []
+        end
+
+      {state, :ok, effects}
+    end
+  end
 
   defp server_state(opts \\ []) do
     struct!(Config,
@@ -92,7 +174,64 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
     }
   end
 
+  # Creates a snapshot file in a private directory and returns a state whose
+  # server_state.log.data_dir points at its parent (so ServerRuntime's
+  # snapshot_dir/1 resolves to the private directory).
+  defp state_with_snapshot(opts \\ []) do
+    root = Path.join(System.tmp_dir!(), "runtime_snap_#{System.unique_integer([:positive])}")
+    dir = Path.join(root, "snapshot")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    meta = %{index: 3, term: 2}
+    mac_state = :erlang.term_to_binary(String.duplicate("snapshot-payload", 8))
+    {:ok, _bytes} = LogSnapshot.write(dir, meta, mac_state, true)
+
+    base = state(opts)
+    log = %{base.server_state.log | data_dir: root, current_snapshot: {3, 2}}
+    ss = %{base.server_state | log: log}
+
+    {%{base | server_state: ss}, dir, meta}
+  end
+
+  defp send_state(read_state, opts \\ []) do
+    %{
+      meta: Keyword.get(opts, :meta, %{index: 3, term: 2}),
+      read_state: read_state,
+      offset: Keyword.get(opts, :offset, 0),
+      snap_state: Keyword.get(opts, :snap_state, :snap),
+      leader_id: @self_id,
+      term: 2
+    }
+  end
+
+  # An external pid whose node is not the local node; used to exercise the
+  # remote branch of pid_to_server_id/1.
+  defp remote_pid do
+    node_bin = "remote@host"
+
+    :erlang.binary_to_term(
+      <<131, 103, 100, byte_size(node_bin)::16, node_bin::binary, 0::32, 1::32, 0>>
+    )
+  end
+
   describe "leader callbacks" do
+    test "clear_transfer_leadership removes a stalled transfer target" do
+      base = state()
+      ss = Map.put(base.server_state, :transfer_leadership, @peer2)
+      s = %{base | server_state: ss}
+
+      assert {:keep_state, cleared, []} =
+               ServerRuntime.leader(:state_timeout, :clear_transfer_leadership, s)
+
+      assert is_nil(cleared.server_state.transfer_leadership)
+    end
+
+    test "unknown snapshot chunk peer is ignored" do
+      assert {:keep_state, _s, []} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, state())
+    end
+
     test "enter records the leader" do
       assert {:keep_state, _state, _actions} = ServerRuntime.leader(:enter, :follower, state())
     end
@@ -225,6 +364,346 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
     end
   end
 
+  describe "leader error and cluster-change branches" do
+    test "install-snapshot result clears the snapshot send and queues pipeline rpcs" do
+      reply = %Types.InstallSnapshotResult{term: 2, last_index: 5, last_term: 2}
+
+      assert {:keep_state, _s, actions} = ServerRuntime.leader(:info, reply, state())
+      assert {:next_event, :info, :pipeline_rpcs} in actions
+    end
+
+    test "install-snapshot result with a higher term steps down to follower" do
+      reply = %Types.InstallSnapshotResult{term: 3, last_index: 5, last_term: 2}
+
+      assert {:next_state, :follower, _s, _actions} = ServerRuntime.leader(:info, reply, state())
+    end
+
+    test "store_meta falls back to the default meta name" do
+      base = state()
+      cfg = %{base.server_state.cfg | system_config: %{data_dir: "/tmp/runtime_test"}}
+      ss = %{base.server_state | cfg: cfg}
+      s = %{base | server_state: ss}
+      reply = %Types.InstallSnapshotResult{term: 3, last_index: 5, last_term: 2}
+
+      assert {:next_state, :follower, _s, _actions} = ServerRuntime.leader(:info, reply, s)
+    end
+
+    test "a wal_down append error transitions to await_condition" do
+      {:ok, wal} = WalDownServer.start_link()
+      base = state()
+      log = %{base.server_state.log | wal_name: wal}
+      s = %{base | server_state: %{base.server_state | log: log}}
+      from = {self(), make_ref()}
+
+      assert {:next_state, :await_condition, _s, _actions} =
+               ServerRuntime.leader(
+                 {:call, from},
+                 {:leader_call, {:command, {:"$usr", :probe, :await_consensus}}},
+                 s
+               )
+    end
+
+    test "machine release_cursor and bg_work effects are executed" do
+      for {cmd, worker_pid} <- [{:release_cursor, nil}, {:bg_work, nil}] do
+        base = state()
+        ss = base.server_state
+
+        cfg = %{
+          ss.cfg
+          | machine: {:machine, EffectMachine, %{}},
+            machine_versions: [{0, 0}],
+            effective_machine_module: EffectMachine,
+            effective_handle_aux_fun: nil
+        }
+
+        ss = %{
+          ss
+          | cfg: cfg,
+            machine_state: :initial,
+            cluster: %{@self_id => Map.fetch!(ss.cluster, @self_id)}
+        }
+
+        ss = Map.put(ss, :commit_latency, 0)
+
+        s = %{base | conf: Map.put(base.conf, :worker_pid, worker_pid), server_state: ss}
+        from = {self(), make_ref()}
+
+        assert {:keep_state, _s, _actions} =
+                 ServerRuntime.leader(
+                   {:call, from},
+                   {:leader_call, {:command, {:"$usr", cmd, :noreply}}},
+                   s
+                 )
+      end
+    end
+
+    test "a committed cluster delete is caught and mapped to a next state" do
+      base = state()
+      ss = base.server_state
+      entries = Map.put(ss.log.entries, 2, {2, 2, {:"$ra_cluster", %{}, :delete, :noreply}})
+      log = %{ss.log | entries: entries, range: {1, 2}, next_index: 3}
+      ss = %{ss | log: log, cluster: %{@self_id => Map.fetch!(ss.cluster, @self_id)}}
+
+      assert {:next_state, :delete_and_terminate, _s, _actions} =
+               ServerRuntime.leader(:info, {:ra_log_event, {:written, [], []}}, %{
+                 base
+                 | server_state: ss
+               })
+    end
+  end
+
+  describe "follower, pre_vote and candidate message routing" do
+    test "follower election timeout enters pre_vote" do
+      assert {:next_state, :pre_vote, _s, _actions} =
+               ServerRuntime.follower(:info, :election_timeout, state())
+    end
+
+    test "rpc and gen_cast envelopes are unwrapped" do
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.follower(:info, {:rpc, :unknown}, state())
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.follower(:info, {:gen_cast, :unknown}, state())
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.follower(:info, {self(), {:gen_cast, :unknown}}, state())
+    end
+
+    test "a sender pid from another node is looked up remotely" do
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.follower(:info, {remote_pid(), :unknown}, state())
+    end
+
+    test "pre_vote handles a pid sender, a result struct and follower-driven transitions" do
+      base = state()
+
+      assert {:next_state, :follower, _s, _actions} =
+               ServerRuntime.pre_vote(:info, {self(), {:gen_cast, :unknown}}, base)
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.pre_vote(
+                 :info,
+                 %Types.PreVoteResult{term: 2, vote_granted: false},
+                 base
+               )
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.pre_vote(:info, :election_timeout, base)
+
+      assert {:next_state, :candidate, _s, _actions} =
+               ServerRuntime.pre_vote(:info, %Types.TimeoutNowRpc{term: 2}, base)
+    end
+
+    test "pre_vote and candidate route an incoming snapshot to a generic next state" do
+      {base, _dir, _meta} = state_with_snapshot()
+
+      rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @peer2,
+        meta: %{index: 3, term: 2},
+        chunk_state: :first,
+        data: <<0, 0, 0, 0, "abc">>
+      }
+
+      assert {:next_state, :receive_snapshot, _s, _actions} =
+               ServerRuntime.pre_vote(:info, rpc, base)
+
+      assert {:next_state, :receive_snapshot, _s, _actions} =
+               ServerRuntime.candidate(:info, rpc, base)
+    end
+
+    test "candidate handles follower-driven candidate and pre_vote transitions" do
+      base = state()
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.candidate(:info, %Types.TimeoutNowRpc{term: 2}, base)
+
+      assert {:next_state, :pre_vote, _s, _actions} =
+               ServerRuntime.candidate(:info, :election_timeout, base)
+    end
+
+    test "follower replies to a remote rpc sender" do
+      remote_candidate = {:remote_candidate, :remote@host}
+
+      rpc = %Types.PreVoteRpc{
+        term: 2,
+        candidate_id: remote_candidate,
+        token: make_ref(),
+        machine_version: 0,
+        last_log_index: 2,
+        last_log_term: 2
+      }
+
+      assert {:keep_state, _s, _actions} = ServerRuntime.follower(:info, rpc, state())
+    end
+
+    test "vote replies can lose or remain ongoing" do
+      from = {self(), make_ref()}
+      base = state(context_state: :candidate)
+
+      assert {:next_state, :follower, _s, _actions} =
+               ServerRuntime.candidate(
+                 {:cast, {from, %Types.RequestVoteResult{term: 5, vote_granted: false}}},
+                 :vote_reply,
+                 base
+               )
+
+      assert {:keep_state, _s, _actions} =
+               ServerRuntime.candidate(
+                 {:cast, {from, %Types.RequestVoteResult{term: 2, vote_granted: false}}},
+                 :vote_reply,
+                 base
+               )
+    end
+  end
+
+  describe "snapshot send paths" do
+    test "tick starts a snapshot transfer for a lagging peer" do
+      {base, _dir, _meta} = state_with_snapshot()
+
+      assert {:keep_state, _s, actions} = ServerRuntime.leader(:_, :tick_timeout, base)
+      assert Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+    end
+
+    test "tick resumes a snapshot transfer already in progress" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+      s = Map.put(base, :snapshot_sends, %{@peer2 => send_state(read_state)})
+
+      assert {:keep_state, _s, actions} = ServerRuntime.leader(:_, :tick_timeout, s)
+      assert Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+    end
+
+    test "tick with no snapshot file does not emit an rpc" do
+      base = state()
+      empty = Path.join(System.tmp_dir!(), "runtime_empty_#{System.unique_integer([:positive])}")
+
+      ss = %{
+        base.server_state
+        | log: %{base.server_state.log | data_dir: empty, current_snapshot: {3, 2}}
+      }
+
+      assert {:keep_state, _s, actions} =
+               ServerRuntime.leader(:_, :tick_timeout, %{base | server_state: ss})
+
+      refute Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+    end
+
+    test "multi-chunk snapshot sends cover first, middle and last chunks" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+      s = %{base | conf: Map.put(base.conf, :snapshot_chunk_size, 20)}
+      s = Map.put(s, :snapshot_sends, %{@peer2 => send_state(read_state)})
+
+      assert {:keep_state, s1, [rpc, {:next_event, :info, {:send_snapshot_chunk, @peer2}}]} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, s)
+
+      assert %Types.InstallSnapshotRpc{chunk_state: :first} = rpc
+      assert %{offset: 20} = s1.snapshot_sends[@peer2]
+
+      {final_state, last_rpc} =
+        Enum.reduce_while(2..50, {s1, nil}, fn _, {current, _} ->
+          case ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, current) do
+            {:keep_state, next, [next_rpc]} ->
+              assert %Types.InstallSnapshotRpc{chunk_state: :last} = next_rpc
+              {:halt, {next, next_rpc}}
+
+            {:keep_state, next, [next_rpc, {:next_event, :info, {:send_snapshot_chunk, @peer2}}]} ->
+              assert %Types.InstallSnapshotRpc{chunk_state: :middle} = next_rpc
+              {:cont, {next, next_rpc}}
+          end
+        end)
+
+      assert %Types.InstallSnapshotRpc{chunk_state: :last} = last_rpc
+      assert map_size(final_state.snapshot_sends) == 0
+    end
+
+    test "a bare read state also advances the snapshot chunk offset" do
+      {base, dir, _meta} = state_with_snapshot()
+
+      {:ok, _meta, {_crc, read_state}} =
+        LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+
+      s = %{base | conf: Map.put(base.conf, :snapshot_chunk_size, 20)}
+      s = Map.put(s, :snapshot_sends, %{@peer2 => send_state(read_state)})
+
+      assert {:keep_state, _s, [rpc, _next]} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, s)
+
+      assert %Types.InstallSnapshotRpc{chunk_state: :first} = rpc
+    end
+
+    test "a failed chunk read clears the snapshot send" do
+      base = state()
+      s = Map.put(base, :snapshot_sends, %{@peer2 => send_state({0, 100, make_ref()})})
+
+      assert {:keep_state, s1, []} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, s)
+
+      assert map_size(s1.snapshot_sends) == 0
+    end
+
+    test "snapshot rpcs are delivered to local and remote peers" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+      name = :"snapshot_peer_#{System.unique_integer([:positive])}"
+      Process.register(self(), name)
+
+      local_peer = {name, node()}
+      s = Map.put(base, :snapshot_sends, %{local_peer => send_state(read_state)})
+
+      assert {:keep_state, _s, [_rpc]} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, local_peer}, s)
+
+      assert_receive {:"$gen_cast", {_from, {:rpc, %Types.InstallSnapshotRpc{}}}}
+
+      Process.unregister(name)
+
+      remote_peer = {:snapshot_remote, :remote@host}
+
+      {:ok, _meta, remote_read_state} =
+        LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+
+      s = Map.put(base, :snapshot_sends, %{remote_peer => send_state(remote_read_state)})
+
+      assert {:keep_state, _s, [_rpc]} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, remote_peer}, s)
+    end
+
+    test "snapshot chunk info for an unknown peer is ignored" do
+      assert {:keep_state, _s, []} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, state())
+    end
+
+    test "a snapshot chunk for a local peer with no registered process is a no-op" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+      name = :"missing_snapshot_peer_#{System.unique_integer([:positive])}"
+      peer = {name, node()}
+      refute Process.whereis(name)
+
+      s = Map.put(base, :snapshot_sends, %{peer => send_state(read_state)})
+
+      assert {:keep_state, _s, [_rpc]} =
+               ServerRuntime.leader(:info, {:send_snapshot_chunk, peer}, s)
+    end
+
+    test "a follower reply to a remote rpc sender goes through the transport" do
+      remote_candidate = {:remote_reply_candidate, :remote@host}
+
+      rpc = %Types.PreVoteRpc{
+        term: 2,
+        candidate_id: remote_candidate,
+        token: make_ref(),
+        machine_version: 0,
+        last_log_index: 2,
+        last_log_term: 2
+      }
+
+      assert {:keep_state, _s, _actions} = ServerRuntime.follower(:info, rpc, state())
+    end
+  end
+
   describe "call helpers" do
     test "missing local processes produce errors" do
       missing = :"missing_runtime_#{System.unique_integer([:positive])}"
@@ -241,6 +720,33 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
 
       assert {:error, {:no_more_servers_to_try, _}} =
                ServerRuntime.state_query([{missing, node()}, {missing, node()}], :members, 100)
+    end
+
+    test "a registered gen_statem is called through statem_call_local" do
+      {:ok, pid} = CallResponder.start(fn _msg -> {:ok, :replied, :test} end)
+      name = :"call_responder_#{System.unique_integer([:positive])}"
+      Process.register(pid, name)
+      on_exit(fn -> if Process.whereis(name), do: Process.unregister(name) end)
+
+      assert {:ok, :replied, :test} = ServerRuntime.statem_call_local(name, :anything, 100)
+      assert {:ok, :replied, :test} = ServerRuntime.state_query([name], :members, 100)
+    end
+
+    test "calls to a process that exits during the call are converted to errors" do
+      for reason <- [:shutdown, :boom] do
+        {:ok, pid} = CrashingResponder.start(reason)
+        assert {:error, ^reason} = ServerRuntime.ping(pid, 100)
+      end
+    end
+
+    test "a call to a remote pid is converted to a nodedown error" do
+      assert {:error, :nodedown} = ServerRuntime.ping(remote_pid(), 100)
+    end
+
+    test "a remote server id reaches the erpc branch of safe_call" do
+      assert_raise ErlangError, fn ->
+        ServerRuntime.ping({:remote_server, :nope@badhost}, 100)
+      end
     end
   end
 end

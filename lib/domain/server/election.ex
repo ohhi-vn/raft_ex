@@ -26,8 +26,10 @@ defmodule RaftEx.Domain.Server.Election do
 
   require Logger
 
-  alias RaftEx.Domain.Types
+  alias RaftEx.Domain.Server.Cluster
   alias RaftEx.Domain.Server.Config
+  alias RaftEx.Domain.Types
+  alias RaftEx.Infra.Persistence.{Log, LogMeta}
 
   @type election_state :: :pre_vote | :candidate
   @type election_result :: :won | :lost | :ongoing
@@ -36,6 +38,7 @@ defmodule RaftEx.Domain.Server.Election do
           state: election_state(),
           term: Types.term_num(),
           votes_received: MapSet.t(Types.server_id()),
+          votes_rejected: MapSet.t(Types.server_id()),
           total_voters: non_neg_integer(),
           last_log_index: Types.index(),
           last_log_term: Types.term_num()
@@ -57,12 +60,13 @@ defmodule RaftEx.Domain.Server.Election do
         log: log,
         cluster: cluster
       }) do
-    {last_log_index, last_log_term} = RaftEx.Infra.Persistence.Log.last_index_term(log)
+    {last_log_index, last_log_term} = Log.last_index_term(log)
 
     context = %{
       state: state,
       term: term,
       votes_received: MapSet.new([id]),
+      votes_rejected: MapSet.new(),
       total_voters: count_voters(cluster),
       last_log_index: last_log_index,
       last_log_term: last_log_term
@@ -98,12 +102,13 @@ defmodule RaftEx.Domain.Server.Election do
     # Increment term for candidate phase
     new_term = term + 1
 
-    {last_log_index, last_log_term} = RaftEx.Infra.Persistence.Log.last_index_term(log)
+    {last_log_index, last_log_term} = Log.last_index_term(log)
 
     context = %{
       state: state,
       term: new_term,
       votes_received: MapSet.new([id]),
+      votes_rejected: MapSet.new(),
       total_voters: count_voters(cluster),
       last_log_index: last_log_index,
       last_log_term: last_log_term
@@ -149,7 +154,7 @@ defmodule RaftEx.Domain.Server.Election do
           log: log
         } = _state
       ) do
-    {last_log_index, last_log_term} = RaftEx.Infra.Persistence.Log.last_index_term(log)
+    {last_log_index, last_log_term} = Log.last_index_term(log)
 
     # Grant pre-vote if:
     # 1. Candidate's term is >= our current term
@@ -181,6 +186,7 @@ defmodule RaftEx.Domain.Server.Election do
   Returns `{vote_granted, updated_state, effects}`.
   """
   @spec handle_vote_request(Types.RequestVoteRpc.t(), map()) :: {boolean(), map(), [term()]}
+  # credo:disable-for-lines:90
   def handle_vote_request(
         %Types.RequestVoteRpc{
           term: candidate_term,
@@ -194,7 +200,7 @@ defmodule RaftEx.Domain.Server.Election do
           log: log
         } = state
       ) do
-    {last_log_index, last_log_term} = RaftEx.Infra.Persistence.Log.last_index_term(log)
+    {last_log_index, last_log_term} = Log.last_index_term(log)
 
     # Determine if we should grant the vote
     {vote_granted, new_state} =
@@ -225,7 +231,7 @@ defmodule RaftEx.Domain.Server.Election do
         # Same term - check if we already voted
         candidate_term == current_term ->
           voted_for =
-            RaftEx.Infra.Persistence.LogMeta.fetch(
+            LogMeta.fetch(
               state.cfg.system_config.names.log_meta,
               uid,
               :voted_for
@@ -331,9 +337,13 @@ defmodule RaftEx.Domain.Server.Election do
         %Types.RequestVoteResult{vote_granted: false},
         context,
         _state,
-        _peer_id
+        peer_id
       ) do
-    # Vote denied but term is OK - continue waiting
+    # Vote denied but term is OK - remember it so the result can be decided
+    # once no voters remain, then continue waiting.
+    context =
+      Map.update(context, :votes_rejected, MapSet.new([peer_id]), &MapSet.put(&1, peer_id))
+
     {:ongoing, context, []}
   end
 
@@ -388,27 +398,36 @@ defmodule RaftEx.Domain.Server.Election do
     {false, context, [{:become, :follower}, {:update_term, term}]}
   end
 
-  def handle_pre_vote_reply(%Types.PreVoteResult{vote_granted: false}, context, _state, _peer_id) do
-    # Pre-vote denied
+  def handle_pre_vote_reply(%Types.PreVoteResult{vote_granted: false}, context, _state, peer_id) do
+    context =
+      Map.update(context, :votes_rejected, MapSet.new([peer_id]), &MapSet.put(&1, peer_id))
+
     {false, context, []}
   end
 
   @doc """
-  Evaluate election result based on current votes.
+  Evaluate election result based on votes granted and denied so far.
 
-  Returns `:won`, `:lost`, or `:ongoing`.
+  Returns `:won` once a majority has granted a vote, `:lost` when the remaining
+  unanswered voters cannot supply a majority, and `:ongoing` otherwise.
   """
   @spec evaluate_election_result(election_context()) :: election_result()
-  def evaluate_election_result(%{
-        votes_received: votes,
-        total_voters: total
-      }) do
+  def evaluate_election_result(
+        %{
+          votes_received: votes,
+          total_voters: total
+        } = context
+      ) do
     vote_count = MapSet.size(votes)
-    majority = div(total, 2) + 1
+
+    rejected =
+      context
+      |> Map.get(:votes_rejected, MapSet.new())
+      |> MapSet.size()
 
     cond do
-      vote_count >= majority -> :won
-      vote_count < majority and can_still_win?(vote_count, total) -> :ongoing
+      vote_count >= votes_needed(total) -> :won
+      can_still_win?(vote_count, total, rejected) -> :ongoing
       true -> :lost
     end
   end
@@ -416,14 +435,20 @@ defmodule RaftEx.Domain.Server.Election do
   @doc """
   Check if it's still possible to win the election.
 
-  Returns true if there are enough outstanding votes to reach majority.
+  With two arguments, reports only whether a majority has not been reached.
+  With three, also accounts for voters that already denied their vote.
   """
   @spec can_still_win?(non_neg_integer(), non_neg_integer()) :: boolean()
   def can_still_win?(votes_received, total_voters) do
-    # We can still win if we haven't received replies from all peers yet
-    # and it's mathematically possible to reach majority
-    majority = div(total_voters, 2) + 1
-    votes_received < majority
+    votes_received < votes_needed(total_voters)
+  end
+
+  @spec can_still_win?(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: boolean()
+  def can_still_win?(votes_received, total_voters, votes_rejected) do
+    outstanding = max(total_voters - votes_received - votes_rejected, 0)
+
+    votes_received < votes_needed(total_voters) and
+      votes_received + outstanding >= votes_needed(total_voters)
   end
 
   @doc """
@@ -441,13 +466,7 @@ defmodule RaftEx.Domain.Server.Election do
   # ---------------------------------------------------------------------------
 
   defp count_voters(cluster) do
-    Enum.count(cluster, fn {_id, peer} ->
-      case peer do
-        %{voter_status: %{membership: :voter}} -> true
-        %{voter_status: %{membership: :promotable}} -> true
-        _ -> false
-      end
-    end)
+    Cluster.voter_count(cluster)
   end
 
   defp build_election_rpcs(cluster, self_id, rpc, _type) do
@@ -455,7 +474,7 @@ defmodule RaftEx.Domain.Server.Election do
     |> Map.delete(self_id)
     |> Enum.flat_map(fn {peer_id, peer_state} ->
       case peer_state do
-        %{voter_status: %{membership: membership}} when membership in [:voter, :promotable] ->
+        %{voter_status: %{membership: :voter}} ->
           [{:send_rpc, peer_id, rpc}]
 
         _ ->
@@ -477,8 +496,10 @@ defmodule RaftEx.Domain.Server.Election do
       (candidate_last_term == our_last_term and candidate_last_index >= our_last_index)
   end
 
-  defp update_term_and_voted_for(term, _voted_for, state) do
-    %{state | current_term: term}
+  defp update_term_and_voted_for(term, voted_for, state) do
+    state
+    |> Map.put(:current_term, term)
+    |> Map.put(:voted_for, voted_for)
   end
 
   defp generate_token do

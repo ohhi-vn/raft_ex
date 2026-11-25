@@ -34,6 +34,15 @@ defmodule RaftEx.Infra.ObservabilityTest do
       assert Monitor.components(pid, monitors) == []
     end
 
+    test "removing the last component drops a node monitor" do
+      node = :single_component@node
+      monitors = Monitor.add(node, :machine, Monitor.init())
+      monitors = Monitor.remove(node, :machine, monitors)
+
+      assert monitors == %{}
+      assert Monitor.components(node, monitors) == []
+    end
+
     test "remove_all and unknown targets" do
       pid = spawn(fn -> Process.sleep(1_000) end)
       monitors = Monitor.add(pid, :machine, Monitor.init())
@@ -43,6 +52,50 @@ defmodule RaftEx.Infra.ObservabilityTest do
       assert Monitor.remove(:unknown, :machine, %{}) == %{}
       assert Monitor.handle_down(:unknown, %{}) == {[], %{}}
       assert Monitor.components(:unknown, %{}) == []
+    end
+
+    test "remove keeps a pid monitor while other components remain" do
+      pid = spawn(fn -> Process.sleep(1_000) end)
+      monitors = Monitor.add(pid, :machine, Monitor.init())
+      monitors = Monitor.add(pid, :aux, monitors)
+
+      monitors = Monitor.remove(pid, :machine, monitors)
+
+      assert Monitor.components(pid, monitors) == [:aux]
+      assert map_size(monitors) == 1
+    end
+
+    test "node monitors keep and then drop components" do
+      node = :multi_components@node
+      monitors = Monitor.add(node, :machine, Monitor.init())
+      monitors = Monitor.add(node, :aux, monitors)
+
+      monitors = Monitor.remove(node, :machine, monitors)
+      assert Monitor.components(node, monitors) == [:aux]
+
+      {components, remaining} = Monitor.handle_down(node, monitors)
+      assert components == [:aux]
+      assert remaining == monitors
+      assert Monitor.components(node, remaining) == [:aux]
+
+      assert Monitor.remove(node, :aux, %{}) == %{}
+    end
+
+    test "handle_down reports all components of a pid" do
+      pid = spawn(fn -> Process.sleep(1_000) end)
+      monitors = Monitor.add(pid, :machine, Monitor.init())
+      monitors = Monitor.add(pid, :aux, monitors)
+
+      {components, remaining} = Monitor.handle_down(pid, monitors)
+
+      assert Enum.sort(components) == [:aux, :machine]
+      assert remaining == %{}
+    end
+
+    test "adding the current node emits a nodeup message" do
+      node = node()
+      _monitors = Monitor.add(node, :machine, Monitor.init())
+      assert_receive {:nodeup, ^node, []}
     end
   end
 
@@ -57,6 +110,17 @@ defmodule RaftEx.Infra.ObservabilityTest do
       assert Counters.overview(:counters_test) != nil
       assert Counters.counters(:counters_test, []) != nil
       assert :ok = Counters.delete(:counters_test)
+    end
+
+    test "new/3 registers labelled counters in a dedicated group" do
+      assert :ok = Counters.init()
+
+      group = {:ra, :counters_labelled_test}
+      :seshat.new_group(group)
+      fields = [{:count, 1, :counter, "Count"}]
+
+      assert :ok = Counters.new(:counters_labelled_test, :labelled, fields)
+      assert %{labelled: %{count: 0}} = :seshat.overview(group)
     end
   end
 

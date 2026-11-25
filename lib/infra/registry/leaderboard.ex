@@ -127,13 +127,11 @@ defmodule RaftEx.Leaderboard do
   end
 
   defp lookup(cluster_name) do
-    try do
-      case :ets.lookup(@table, cluster_name) do
-        [record] -> record
-        [] -> nil
-      end
-    rescue
-      ArgumentError -> nil
+    case :ets.lookup(@table, cluster_name) do
+      [record] -> record
+      [] -> nil
     end
+  rescue
+    ArgumentError -> nil
   end
 end

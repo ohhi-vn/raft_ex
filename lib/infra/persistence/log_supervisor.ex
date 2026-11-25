@@ -1,4 +1,11 @@
 defmodule RaftEx.Infra.Persistence.LogSupervisor do
+  @moduledoc """
+  Supervisor for a single server's log persistence processes.
+
+  Starts the pre-init, metadata store, segment writer and WAL supervisor
+  as an `one_for_all` subtree.
+  """
+
   use Supervisor
 
   def start_link(%{names: %{log_sup: name}} = cfg) do

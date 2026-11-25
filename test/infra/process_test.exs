@@ -64,5 +64,16 @@ defmodule RaftEx.Infra.ProcessTest do
 
       assert :ets.info(table2) != :undefined
     end
+
+    test "create_table delegates to the registered server" do
+      case MachineEts.start_link([]) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
+
+      table = :"machine_ets_create_#{System.unique_integer([:positive])}"
+      assert :ok = MachineEts.create_table(table, [:set, :public, :named_table])
+      assert :ets.info(table) != :undefined
+    end
   end
 end

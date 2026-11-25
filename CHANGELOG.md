@@ -5,7 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0]
+
+### Added
+- **Multi-server elections**: Pre-vote and request-vote RPCs are now dispatched through the server state machine. Peer state carries `voter_status`, so only voters count toward quorums and receive vote requests. Terms and votes are persisted before replies are sent, and election timeouts use the configured min/max values.
+- **Leader no-op entry**: New leaders append a no-op entry in their own term so prior-term entries can commit and cluster changes become permitted only after the entry commits.
+- **Local, leader and consistent queries**: Query and auxiliary command paths now reply instead of timing out. Consistent queries confirm leadership with a voter quorum before returning, and aux commands are dispatched in every server state for both 5- and 6-arity machine handlers.
+- **Leadership transfer**: `RaftEx.transfer_leadership/3` now sends a `TimeoutNowRpc` to a caught-up voter, which starts an immediate election; the old leader steps down on the higher term.
+- **Role-aware membership**: `RaftEx.add_member/4`, `RaftEx.promote_member/3` and `RaftEx.demote_member/3` carry voter/promotable/non-voter roles, with catch-up and last-voter safety checks.
+- **Snapshot checkpointing**: Machine release cursors and log compaction now write snapshots, compact the log, and recover state from disk on startup.
+- **Three-server integration tests**: New coverage for elections, replication, queries, leadership transfer, and membership roles.
+- **Five- and seven-server cluster tests**: New integration coverage for full replication, re-election after leader loss, duplicate/unknown-member errors, tolerated follower failures, and quorum-loss write rejection.
+- **Expanded edge-case coverage**: The suite grew from 107 to 821 tests and line coverage from ~82% to 98.2%, including error paths across the app, domain, network, persistence and supervisor layers.
+- **Capability specifications**: Behavioural specs for `cluster-membership`, `leader-election`, `log-replication`, `raft-queries`, `raft-startup` and `snapshots` were synced into `openspec/specs/`.
+- **`mix precommit` alias**: Runs `compile --warnings-as-errors`, `format --check-formatted`, `credo --strict`, and the full test suite in the `:test` environment.
+- **`coveralls.json`**: Configures ExCoveralls to treat modules with no executable lines (typespecs, structs, behaviours) as covered instead of reporting a misleading 0.0%.
+
+### Changed
+- **Credo upgraded to 1.7.19 and cleaned up**: Resolves a Credo 1.7.17 crash on Elixir 1.20. All 312 strict-mode findings were fixed in code — aliases, module docs, nesting/complexity extractions, implicit `try` conversions, and convention fixes — so `mix credo --strict` now reports no issues. Dialyzer retains pre-existing type-annotation warnings.
+- **Predicate helpers renamed (breaking)**: `Filesystem.is_dir/1`, `is_file/1` and `is_any_file/1` are now `dir?/1`, `file?/1` and `any_file?/1`; `Machine.is_versioned/1` is now `versioned?/1`; `Server.is_new?/1` and `is_fully_persisted?/1` are now `new?/1` and `fully_persisted?/1`. All internal call sites were updated.
+- **Snapshot chunk persistence returns errors**: `LogSnapshot.accept_chunk/2` and `complete_accept/2` now return `{:error, reason}` on file failures instead of raising, and `RpcHandler` reports those failures through the normal snapshot-failure path.
+- **Election result evaluation**: `evaluate_election_result/1` now records denied votes in `election_context.votes_rejected`, so the `:lost` result is reachable instead of being dead code. `can_still_win?/3` accounts for denied votes; `can_still_win?/2` keeps its previous behaviour.
+- **Removed dead snapshot-effect handler**: `handle_effect(:leader, {:send_snapshot_chunk, ...})` was unreachable — chunks are sent via `:info` actions — and was deleted.
+- **Startup uses `:raft_ex`**: `RaftEx.start/1` and `RaftEx.start_in/1` stop and restart only the default system, configure the `:raft_ex` application environment, and return a real success or error result. The `:ra` data directory remains as a one-release fallback.
+
+### Fixed
+- **WAL recovery clause grouping**: Moved the v1 fallback clause of `do_recover_records/4` next to its sibling clause so `compile --warnings-as-errors` passes.
+- **README accuracy**: Corrected the state-machine `@impl` target, install version, Git URL, plug configuration example, architecture diagram label, and obsolete test/status counts.
 
 ## [0.3.1] - Current
 
@@ -17,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **WAL Record Format v2**: WAL records now include the entries-blob byte size in the header so each record can be read back exactly. Legacy v1 records (count-only header) can no longer be decoded reliably; recovery now stops cleanly instead of returning a partial log.
 - **Synchronous `last_applied` Checkpointing**: `RaftEx.Domain.Server.persist_last_applied/1` now uses `LogMeta.store_sync/4` and is checkpointed immediately when committed entries are applied. This prevents a client-visible state change from being lost if the server is stopped in the same tick.
-- **Cross-Node RPC Routing**: Remote `safe_call/3` now uses `:erpc` to invoke a local entry point on the target node, with structured error mapping (`:noproc`, `:nodedown`, `:shutdown`, timeouts). `pid_to_server_id/1` resolves registered names on remote nodes via `:erpc`. Remote sends now wrap messages with the sender pid so the receiver can derive `rpc_from`, matching the local send path.
+- **Cross-Node RPC Routing**: Remote `safe_call/3` now uses `:erpc` to invoke a local entry point on the target node, with structured error mapping (`:noproc`, `:nodedown`, `:shutdown`, timeouts). pid_to_server_id/1 resolves registered names on remote nodes via `:erpc`. Remote sends now wrap messages with the sender pid so the receiver can derive `rpc_from`, matching the local send path.
 - **WAL-Backed Leader Appends**: Leader command and cluster-change entries now go through `Log.write/2` (write-ahead) instead of in-memory `Log.append/2`, with graceful `{:not_appended, reason, ...}` handling when the WAL is unavailable.
 
 ### Fixed
@@ -27,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-11-24
 
 ### Added
-- **Commit Index Propagation via Heartbeats**: Added a `:commit_index` field to `RaftEx.Domain.Types.HeartbeatRpc`. Leader heartbeats now carry the current commit index; followers advance their own commit index from it and apply newly committed entries. Leaders rebroadcast commit advances to their peers, and followers handle `HeartbeatRpc` explicitly via `RaftEx.Domain.Server.handle_follower/2`.
-- Exposed `RaftEx.Domain.Server.apply_committed/2` for applying committed log entries to the state machine.
+- **Commit Index Propagation via Heartbeats**: Added a `:commit_index` field to `RaftEx.Domain.Types.HeartbeatRpc`. Leader heartbeats now carry the current commit index; followers advance their own commit index from it and apply newly committed entries. Leaders rebroadcast commit advances to their peers, and followers handle `HeartbeatRpc` explicitly via RaftEx.Domain.Server.handle_follower/2.
+- Exposed RaftEx.Domain.Server.apply_committed/2 for applying committed log entries to the state machine.
 
 ### Changed
 - **Follower Reply Ownership**: Followers applying committed entries no longer emit client replies. Only the leader owns the caller's reply alias, preventing duplicate responses when the same entry is applied across the cluster.
@@ -36,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **WAL Directory Config**: `RaftEx.Infra.Persistence.LogWal` now reads the `:dir` key (as built by `LogWalSupervisor` from `:wal_data_dir`), falling back to `:data_dir` for callers passing the full system config directly.
-- **RPC Sender Resolution**: `RaftEx.App.ServerRuntime.pid_to_server_id/1` now handles both the tuple and list forms returned by `Process.info(pid, :registered_name)` and guards against non-atom names.
+- **RPC Sender Resolution**: RaftEx.App.ServerRuntime.pid_to_server_id/1 now handles both the tuple and list forms returned by `Process.info(pid, :registered_name)` and guards against non-atom names.
 - **Metrics Safety**: `RaftEx.key_metrics/1` now normalizes non-map counter values (e.g. `:undefined` for unregistered servers) to an empty map instead of raising `BadMapError`.
 
 ## [0.2.0] - 2026-11-24
@@ -49,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Module Namespace Migration (breaking)**: Public/internal modules moved to layered namespaces, e.g. `RaftEx.Server` → `RaftEx.Domain.Server`, `RaftEx.ServerProc` → `RaftEx.App.ServerRuntime`, `RaftEx.Log` → `RaftEx.Infra.Persistence.Log`, `RaftEx.Network` → `RaftEx.Infra.Network.Transport`, `RaftEx.Types` → `RaftEx.Domain.Types`, `RaftEx.Machine` → `RaftEx.Domain.Machine`. README examples and the Mix task were updated accordingly.
-- **OTP Application Callback**: Renamed `RaftEx.Application` to `RaftEx.OTPApplication` and updated `mix.exs`.
+- **OTP Application Callback**: Renamed `RaftEx.Application` to RaftEx.OTPApplication and updated `mix.exs`.
 - **Naming Fixes**: Corrected the `MachineSimple` filename typo (`simpile` → `simple`, now `RaftEx.Domain.Machine.Simple`) and renamed `RaftEx.Monitors` to the singular `RaftEx.Infra.Observability.Monitor`.
 - **Test Suite Reorganization**: Tests are now split by layer into `test/domain/`, `test/app/`, and `test/infra/`, with integration/facade tests under `test/integration/` and new coverage for previously untested modules (Election, RpcHandler, network, persistence, supervisors, Mix task). Test count grew from 130 to 552 and overall line coverage from 37.7% to 82.4%.
 

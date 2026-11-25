@@ -58,6 +58,7 @@ defmodule RaftEx.Domain.Server.ElectionTest do
       term: Keyword.get(opts, :term, 2),
       votes_received: Keyword.get(opts, :votes, MapSet.new([@self_id, @peer2])),
       total_voters: Keyword.get(opts, :total, 3),
+      votes_rejected: Keyword.get(opts, :rejected, MapSet.new()),
       last_log_index: 5,
       last_log_term: 2
     }
@@ -70,13 +71,13 @@ defmodule RaftEx.Domain.Server.ElectionTest do
       assert ctx.state == :pre_vote
       assert ctx.term == 2
       assert ctx.votes_received == MapSet.new([@self_id])
-      assert ctx.total_voters == 3
+      assert ctx.total_voters == 2
       assert ctx.last_log_index == 5
       assert ctx.last_log_term == 2
-      assert length(effects) == 2
+      assert length(effects) == 1
 
       for {:send_rpc, peer, rpc} <- effects do
-        assert peer in [@peer2, @peer3]
+        assert peer in [@peer2]
         assert %Types.PreVoteRpc{} = rpc
         assert rpc.term == 2
         assert rpc.candidate_id == @self_id
@@ -97,7 +98,7 @@ defmodule RaftEx.Domain.Server.ElectionTest do
                {:store_meta, :voted_for, @self_id}
              ]
 
-      assert length(effects) == 4
+      assert length(effects) == 3
 
       for {:send_rpc, _peer, %Types.RequestVoteRpc{} = rpc} <- Enum.drop(effects, 2) do
         assert rpc.term == 3
@@ -318,6 +319,25 @@ defmodule RaftEx.Domain.Server.ElectionTest do
       refute Election.can_still_win?(2, 3)
       assert Election.votes_needed(3) == 2
       assert Election.votes_needed(5) == 3
+    end
+
+    test "reports a lost election once every voter has replied without a majority" do
+      ctx = context(votes: MapSet.new([@self_id]), rejected: MapSet.new([@peer2, @peer3]))
+
+      assert Election.evaluate_election_result(ctx) == :lost
+    end
+
+    test "can_still_win?/3 accounts for denied votes" do
+      assert Election.can_still_win?(1, 3, 1)
+      refute Election.can_still_win?(1, 3, 2)
+    end
+
+    test "a same-term denial is recorded against the election context" do
+      result = %Types.RequestVoteResult{term: 2, vote_granted: false}
+
+      assert {:ongoing, new_ctx, []} = Election.handle_vote_reply(result, context(), %{}, @peer3)
+      assert new_ctx.votes_rejected == MapSet.new([@peer3])
+      assert new_ctx.votes_received == MapSet.new([@self_id, @peer2])
     end
   end
 end

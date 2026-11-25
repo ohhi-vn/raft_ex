@@ -23,24 +23,32 @@ defmodule RaftEx.Infra.Network.Transport do
     seeds = Keyword.get(opts, :seeds, [])
     cookie = Keyword.get(opts, :cookie, :raft_ex)
 
-    if seeds != [] do
-      Node.set_cookie(cookie)
-
-      for seed <- seeds, seed != node() do
-        case Node.connect(seed) do
-          true ->
-            Logger.info("RaftEx.Infra.Network.Transport: connected to seed #{inspect(seed)}")
-
-          false ->
-            Logger.warning(
-              "RaftEx.Infra.Network.Transport: failed to connect to seed #{inspect(seed)}"
-            )
-        end
-      end
-    end
+    connect_to_seeds(seeds, cookie)
 
     Node.monitor(:all, true)
     :ok
+  end
+
+  defp connect_to_seeds([], _cookie), do: :ok
+
+  defp connect_to_seeds(seeds, cookie) do
+    Node.set_cookie(cookie)
+
+    seeds
+    |> Enum.reject(&(&1 == node()))
+    |> Enum.each(&log_connect_result/1)
+  end
+
+  defp log_connect_result(seed) do
+    case Node.connect(seed) do
+      true ->
+        Logger.info("RaftEx.Infra.Network.Transport: connected to seed #{inspect(seed)}")
+
+      false ->
+        Logger.warning(
+          "RaftEx.Infra.Network.Transport: failed to connect to seed #{inspect(seed)}"
+        )
+    end
   end
 
   @doc """
@@ -197,21 +205,22 @@ defmodule RaftEx.Infra.Network.Transport do
   end
 
   defp notify_server_procs(node, event) do
-    try do
-      :ets.match(:ra_state, {:"$1", :"$2", :"$3"})
-    rescue
-      _ -> []
-    else
-      servers ->
-        for [name, _state, _membership] <- servers do
-          case Process.whereis(name) do
-            nil ->
-              :ok
+    servers = matched_server_procs()
 
-            pid ->
-              Process.send(pid, {:ra_network_event, event, node}, [:nosuspend])
-          end
-        end
+    for [name, _state, _membership] <- servers do
+      case Process.whereis(name) do
+        nil ->
+          :ok
+
+        pid ->
+          Process.send(pid, {:ra_network_event, event, node}, [:nosuspend])
+      end
     end
+  end
+
+  defp matched_server_procs do
+    :ets.match(:ra_state, {:"$1", :"$2", :"$3"})
+  rescue
+    _ -> []
   end
 end
