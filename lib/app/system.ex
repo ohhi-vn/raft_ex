@@ -25,7 +25,7 @@ defmodule RaftEx.App.System do
   @type config :: map()
 
   def start(%{name: name} = config) do
-    Logger.info("ra: starting system #{name}")
+    Logger.info("raft_ex: starting system #{name}")
     SystemsSupervisor.start_system(config)
   end
 

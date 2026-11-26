@@ -29,6 +29,7 @@ defmodule RaftEx.Domain.Server.Election do
   alias RaftEx.Domain.Server.Cluster
   alias RaftEx.Domain.Server.Config
   alias RaftEx.Domain.Types
+  alias RaftEx.Infra.Observability.Metrics
   alias RaftEx.Infra.Persistence.{Log, LogMeta}
 
   @type election_state :: :pre_vote | :candidate
@@ -85,6 +86,8 @@ defmodule RaftEx.Domain.Server.Election do
 
     effects = build_election_rpcs(cluster, id, rpc, :pre_vote)
 
+    Metrics.inc(:elections_started)
+
     Logger.info(
       "RaftEx.Election: Starting pre-vote for term #{term}, " <>
         "last_log_index=#{last_log_index}, last_log_term=#{last_log_term}"
@@ -126,6 +129,8 @@ defmodule RaftEx.Domain.Server.Election do
     }
 
     vote_effects = build_election_rpcs(cluster, id, rpc, :vote)
+
+    Metrics.inc(:elections_started)
 
     Logger.info(
       "RaftEx.Election: Starting candidate election for term #{new_term}, " <>
@@ -272,6 +277,8 @@ defmodule RaftEx.Domain.Server.Election do
       end
 
     if vote_granted do
+      Metrics.inc(:votes_granted)
+
       Logger.debug(
         "RaftEx.Election: Vote granted to #{inspect(candidate_id)} for term #{candidate_term}"
       )

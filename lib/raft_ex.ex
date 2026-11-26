@@ -1,6 +1,17 @@
 defmodule RaftEx do
   @moduledoc """
   Primary module for interacting with RaftEx servers and clusters.
+
+  See the guides for narrative documentation:
+
+  - [Getting Started](guides/getting-started.md)
+  - [Architecture](guides/architecture.md)
+  - [State Machines](guides/state-machine.md)
+  - [Persistence](guides/persistence.md)
+  - [Membership](guides/membership.md)
+  - [Consistent Queries](guides/consistent-queries.md)
+  - [Leadership Transfer](guides/leadership-transfer.md)
+  - [Observability](guides/observability.md)
   """
 
   require Logger
@@ -83,7 +94,10 @@ defmodule RaftEx do
               true
 
             err ->
-              Logger.error("ra: failed to start a server #{inspect(c)}, error: #{inspect(err)}")
+              Logger.error(
+                "raft_ex: failed to start a server #{inspect(c)}, error: #{inspect(err)}"
+              )
+
               false
           end
         end,
@@ -92,7 +106,10 @@ defmodule RaftEx do
 
     case result do
       {:ok, [], _not_started} ->
-        Logger.error("ra: failed to form cluster #{inspect(cluster_name)}. No servers started.")
+        Logger.error(
+          "raft_ex: failed to form cluster #{inspect(cluster_name)}. No servers started."
+        )
+
         {:error, :cluster_not_formed}
 
       {:ok, started, not_started} ->
@@ -104,14 +121,17 @@ defmodule RaftEx do
         case wait_for_leader(triggered_id, length(configs) * timeout) do
           {:ok, leader} ->
             Logger.info(
-              "ra: started cluster #{inspect(cluster_name)} with #{length(configs)} servers. " <>
+              "raft_ex: started cluster #{inspect(cluster_name)} with #{length(configs)} servers. " <>
                 "#{length(not_started)} failed. Leader: #{inspect(leader)}"
             )
 
             {:ok, started_ids, not_started_ids}
 
           err ->
-            Logger.warning("ra: failed to form cluster #{inspect(cluster_name)}: #{inspect(err)}")
+            Logger.warning(
+              "raft_ex: failed to form cluster #{inspect(cluster_name)}: #{inspect(err)}"
+            )
+
             Enum.each(started_ids, &force_delete_server(system, &1))
             {:error, :cluster_not_formed}
         end
@@ -397,11 +417,7 @@ defmodule RaftEx do
       :term
     ]
 
-    counters =
-      case Counters.counters(server_id, fields) do
-        c when is_map(c) -> c
-        _ -> %{}
-      end
+    counters = Counters.counters(server_id, fields)
 
     case Process.whereis(name) do
       nil ->
@@ -510,6 +526,12 @@ defmodule RaftEx do
 
   The UID is deterministic so restarting or re-forming a cluster with the same
   name recovers its existing log instead of starting from an empty directory.
+
+  ## Examples
+
+      iex> RaftEx.new_uid("my_cluster") == RaftEx.new_uid("my_cluster")
+      true
+
   """
   def new_uid(source) when is_binary(source) do
     prefix = Utils.derive_safe_string(source, 6)

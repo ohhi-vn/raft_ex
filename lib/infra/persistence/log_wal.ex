@@ -45,6 +45,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   use GenServer
   require Logger
 
+  alias RaftEx.Infra.Observability.Metrics
+
   # "RAWL"
   @magic 0x5241574C
   # v2 adds the byte size of the entries blob to the header, so recovery can
@@ -447,9 +449,17 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
   defp flush_buffer(file, config) do
     entries = file.buffer
+    start = System.monotonic_time(:millisecond)
+    bytes = byte_size(:erlang.term_to_binary(entries))
     file = write_entries_to_wal(entries, file, config)
     sync_wal(file, config)
     notify_pending_writes(file)
+
+    latency = System.monotonic_time(:millisecond) - start
+    Metrics.inc(:wal_flushes)
+    Metrics.inc(:wal_bytes_written, bytes)
+    Metrics.inc(:wal_segment_writes)
+    Metrics.observe(:wal_flush_latency_ms, latency)
 
     %{file | buffer: [], pending_writes: []}
   end
@@ -497,15 +507,18 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
     case sync_method do
       :fsync ->
+        Metrics.inc(:wal_fsyncs)
         :file.sync(file.fd)
 
       :datasync ->
+        Metrics.inc(:wal_fsyncs)
         :file.datasync(file.fd)
 
       :none ->
         :ok
 
       _ ->
+        Metrics.inc(:wal_fsyncs)
         :file.datasync(file.fd)
     end
   end

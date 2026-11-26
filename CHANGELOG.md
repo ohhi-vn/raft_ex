@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-26
+
+### Added
+- **Full metrics integration**: new `RaftEx.Infra.Observability.MetricNames` catalogue covering WAL, replication, election, quorum, snapshots, and leadership transfer; metrics wired into all code paths; ETS-backed `Metrics.get/1` now reads gauges/histograms; `RaftEx.Observability.server_metrics/1` and `cluster_metrics/1`.
+- **Documentation guides**: `guides/` with getting-started, architecture, state machine, persistence, membership, consistent queries, leadership transfer, observability, configuration, troubleshooting; ExDoc extras + groups; `mix docs --warnings-as-errors` in `quality.ci`.
+- **Doctests**: `RaftEx.new_uid/1` example and `test/doctests_test.exs`.
+- **Jepsen harness**: fixed CLI invocation so `lein run test` works; hardened DB startup; updated README.
+
+### Changed
+- **Removed `:seshat` dependency**: `Counters` is now a thin compatibility layer over the ETS-backed `Metrics` store; `MetricsEts` no longer initialises seshat.
+- **Metrics store is primary**: `Counters.overview/0` returns `Metrics.all()`.
+
+### Fixed
+- **Election timeout effects**: `RaftEx.App.ServerRuntime.handle_election_timeout` now converts the domain effects returned by `Election.start_election/2` through `handle_effects/5` before returning gen_statem actions. Previously `{:store_meta, ...}` effects leaked into the `:pre_vote` and `:candidate` state functions as raw actions, crashing the server with `{:bad_action_from_state_function, ...}` whenever an election timed out.
+
 ## [0.4.0]
 
 ### Added

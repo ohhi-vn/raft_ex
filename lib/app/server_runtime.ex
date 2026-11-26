@@ -14,6 +14,7 @@ defmodule RaftEx.App.ServerRuntime do
   alias RaftEx.Domain.Server.Election
   alias RaftEx.Domain.Utils
   alias RaftEx.Infra.Network.Transport
+  alias RaftEx.Infra.Observability.Metrics
   alias RaftEx.Infra.Observability.Monitor
   alias RaftEx.Infra.Persistence.LogMeta
   alias RaftEx.Infra.Persistence.LogSnapshot
@@ -416,6 +417,8 @@ defmodule RaftEx.App.ServerRuntime do
     ss = %{ss | current_term: context.term, voted_for: Server.id(ss)}
     state = %{state | server_state: ss}
 
+    Metrics.inc(:term_changed)
+
     {state1, election_actions} =
       handle_effects(:candidate, election_effects, :cast, %{state | election_context: context})
 
@@ -711,6 +714,7 @@ defmodule RaftEx.App.ServerRuntime do
 
     case result do
       :won ->
+        Metrics.inc(:elections_won)
         Logger.info("RaftEx.App.ServerRuntime: Won election, becoming leader")
 
         {state1, actions} =
@@ -719,6 +723,7 @@ defmodule RaftEx.App.ServerRuntime do
         next_state(:leader, state1, actions)
 
       :lost ->
+        Metrics.inc(:elections_lost)
         Logger.info("RaftEx.App.ServerRuntime: Lost election, stepping down to follower")
         {state1, actions} = handle_effects(:candidate, effects, :cast, state)
         next_state(:follower, state1, actions)
@@ -734,7 +739,8 @@ defmodule RaftEx.App.ServerRuntime do
       Election.start_election(:pre_vote, state0.server_state)
 
     state = %{state0 | election_context: context}
-    {state, election_effects ++ set_election_timeout(state, [])}
+    {state, actions} = handle_effects(:pre_vote, election_effects, :cast, state)
+    set_election_timeout(state, actions)
   end
 
   defp handle_election_timeout(:candidate, state0) do
@@ -744,7 +750,11 @@ defmodule RaftEx.App.ServerRuntime do
     ss = state0.server_state
     ss = %{ss | current_term: context.term, voted_for: Server.id(ss)}
     state = %{state0 | server_state: ss, election_context: context}
-    {state, election_effects ++ set_election_timeout(state, [])}
+
+    Metrics.inc(:term_changed)
+
+    {state, actions} = handle_effects(:candidate, election_effects, :cast, state)
+    set_election_timeout(state, actions)
   end
 
   defp set_election_timeout(%{conf: conf} = state, actions) do
@@ -944,6 +954,7 @@ defmodule RaftEx.App.ServerRuntime do
            snap_dir
          ) do
       {:ok, data, :last} ->
+        Metrics.inc(:snapshot_chunks_sent)
         chunk_state = if send_state.offset == 0, do: :full, else: :last
         payload = if chunk_state == :full, do: send_state.snap_state, else: data
 
@@ -961,6 +972,7 @@ defmodule RaftEx.App.ServerRuntime do
         {Map.put(state0, :snapshot_sends, sends), [rpc | actions]}
 
       {:ok, data, {:next, new_read_state}} ->
+        Metrics.inc(:snapshot_chunks_sent)
         chunk_state = if send_state.offset == 0, do: :first, else: :middle
 
         rpc = %RaftEx.Domain.Types.InstallSnapshotRpc{

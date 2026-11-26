@@ -1,56 +1,47 @@
 defmodule RaftEx.Infra.Observability.Counters do
   @moduledoc """
-  Thin wrapper around the `:seshat` counter library.
+  Counter helpers backed by the ETS-backed `RaftEx.Infra.Observability.Metrics`
+  store.
 
-  Falls back to no-ops gracefully when `:seshat` is unavailable so that the
-  rest of the codebase can call these functions unconditionally.
+  This module preserves the historical API surface (init/new/fetch/delete/
+  overview/counters and the inc/observe/set_gauge helpers) but no longer depends
+  on `:seshat`; all data lives in the ETS-backed `Metrics` store.
   """
 
-  @group :ra
+  alias RaftEx.Infra.Observability.{MetricNames, Metrics}
 
   # ---------------------------------------------------------------------------
   # Initialisation
   # ---------------------------------------------------------------------------
 
-  @doc "Initialise the seshat counter group.  Safe to call more than once."
+  @doc "Initialise the metrics store. Safe to call more than once."
   @spec init() :: :ok
   def init do
-    if seshat_available?() do
-      Application.ensure_all_started(:seshat)
-      :seshat.new_group(@group)
-      :persistent_term.put(:ra_seshat_fields_spec, counter_fields())
-    end
-
+    Metrics.init()
     :ok
   end
 
   # ---------------------------------------------------------------------------
-  # Per-server counter management
+  # Per-server counter management (no-op registration; ETS auto-creates keys)
   # ---------------------------------------------------------------------------
 
   @spec new(term(), list()) :: :ok
-  def new(name, fields_spec) do
-    if seshat_available?(), do: :seshat.new(@group, name, fields_spec)
+  def new(_name, _fields_spec) do
     :ok
   end
 
-  @spec new(term(), list(), map()) :: :ok
-  def new(name, fields_spec, labels) do
-    if seshat_available?() do
-      :seshat.new({@group, name}, fields_spec, labels)
-    end
-
+  @spec new(term(), list(), map() | term()) :: :ok
+  def new(_name, _fields_spec, _labels) do
     :ok
   end
 
-  @spec fetch(term()) :: map() | nil
-  def fetch(name) do
-    if seshat_available?(), do: :seshat.fetch(@group, name), else: nil
+  @spec fetch(term()) :: nil
+  def fetch(_name) do
+    nil
   end
 
   @spec delete(term()) :: :ok
-  def delete(name) do
-    if seshat_available?(), do: :seshat.delete(@group, name)
+  def delete(_name) do
     :ok
   end
 
@@ -60,29 +51,64 @@ defmodule RaftEx.Infra.Observability.Counters do
 
   @spec overview() :: map()
   def overview do
-    if seshat_available?(), do: :seshat.counters(@group, :all), else: %{}
+    Metrics.all()
   end
 
   @spec overview(term()) :: map()
-  def overview(name) do
-    if seshat_available?(), do: :seshat.counters(@group, name), else: %{}
+  def overview(_name) do
+    Metrics.all()
   end
 
-  @spec counters(term(), [atom()]) :: map() | nil
-  def counters(name, fields) do
-    if seshat_available?(), do: :seshat.counters(@group, name, fields), else: nil
+  @spec counters(term(), [atom()]) :: map()
+  def counters(_name, _fields) do
+    %{}
   end
 
   # ---------------------------------------------------------------------------
-  # Private
+  # Counter fields
   # ---------------------------------------------------------------------------
 
-  defp seshat_available? do
-    Code.ensure_loaded?(:seshat)
-  rescue
-    _ -> false
+  @spec counter_fields() :: [tuple()]
+  def counter_fields do
+    MetricNames.all()
+    |> Enum.filter(fn {_name, kind} -> kind == :counter end)
+    |> Enum.map(fn {name, :counter} -> name end)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {name, idx} -> {name, idx, :counter, Atom.to_string(name)} end)
   end
 
-  # Extend this list to add new per-server counter fields.
-  defp counter_fields, do: []
+  # ---------------------------------------------------------------------------
+  # Convenience (delegates to ETS-backed Metrics)
+  # ---------------------------------------------------------------------------
+
+  @spec inc(term(), number()) :: :ok
+  def inc(name, amount \\ 1) do
+    Metrics.inc(name, amount)
+  end
+
+  @spec observe(term(), number()) :: :ok
+  def observe(name, value) do
+    Metrics.observe(name, value)
+  end
+
+  @spec set_gauge(term(), number()) :: :ok
+  def set_gauge(name, value) do
+    Metrics.set(name, value)
+  end
+
+  # Per-server helpers (ETS is flat/global; server_id kept for API compat)
+  @spec inc(term(), term(), number()) :: :ok
+  def inc(_server_id, name, amount) do
+    Metrics.inc(name, amount)
+  end
+
+  @spec observe(term(), term(), number()) :: :ok
+  def observe(_server_id, name, value) do
+    Metrics.observe(name, value)
+  end
+
+  @spec set_gauge(term(), term(), number()) :: :ok
+  def set_gauge(_server_id, name, value) do
+    Metrics.set(name, value)
+  end
 end

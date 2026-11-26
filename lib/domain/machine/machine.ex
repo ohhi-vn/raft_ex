@@ -6,6 +6,8 @@ defmodule RaftEx.Domain.Machine do
   callbacks (`tick`, `state_enter`, snapshot hooks, versioning, etc.) are
   optional — sensible defaults are used when they are absent.
 
+  See the [State Machines guide](guides/state-machine.md).
+
   ## Effects
 
   `c:apply/3` may return a third element containing one or more *effects* that

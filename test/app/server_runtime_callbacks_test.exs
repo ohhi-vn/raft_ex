@@ -343,6 +343,30 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
                ServerRuntime.candidate(:state_timeout, :become_leader, state())
     end
 
+    test "pre_vote election timeout does not leak domain effects as statem actions" do
+      assert {:next_state, :pre_vote, _state, actions} =
+               ServerRuntime.pre_vote(:state_timeout, :election_timeout, state())
+
+      refute Enum.any?(actions, &match?({:store_meta, _, _}, &1)),
+             "store_meta is a domain effect, not a gen_statem action"
+
+      assert Enum.any?(actions, &match?({:state_timeout, _, :election_timeout}, &1))
+    end
+
+    test "candidate election timeout does not leak domain effects as statem actions" do
+      assert {:next_state, :candidate, _state, actions} =
+               ServerRuntime.candidate(
+                 :state_timeout,
+                 :election_timeout,
+                 state(context_state: :candidate)
+               )
+
+      refute Enum.any?(actions, &match?({:store_meta, _, _}, &1)),
+             "store_meta is a domain effect, not a gen_statem action"
+
+      assert Enum.any?(actions, &match?({:state_timeout, _, :election_timeout}, &1))
+    end
+
     test "vote reply handling" do
       reply = %Types.RequestVoteResult{term: 2, vote_granted: true}
 

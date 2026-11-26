@@ -27,3 +27,4 @@ wal.dat
 priv/plts
 .dexter.db*
 mise.toml
+jepsen/target

@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.4.0"
+  @version "0.5.0"
 
   def project do
     [
@@ -55,7 +55,6 @@ defmodule RaftEx.MixProject do
 
   defp deps do
     [
-      {:seshat, "~> 0.6"},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
 
       # Test dependencies
@@ -68,7 +67,7 @@ defmodule RaftEx.MixProject do
   end
 
   defp description do
-    "Elixir port of RabbitMQ RA Raft consensus. Implements leader election, log replication, snapshots, and cluster management. APIs are unstable and under active development."
+    "Elixir implement of Raft consensus. Implements leader election, log replication, snapshots, and cluster management."
   end
 
   defp package do
@@ -84,9 +83,25 @@ defmodule RaftEx.MixProject do
   end
 
   defp docs do
+    guides = [
+      "guides/getting-started.md",
+      "guides/architecture.md",
+      "guides/state-machine.md",
+      "guides/persistence.md",
+      "guides/membership.md",
+      "guides/consistent-queries.md",
+      "guides/leadership-transfer.md",
+      "guides/observability.md",
+      "guides/configuration.md",
+      "guides/troubleshooting.md"
+    ]
+
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"],
+      extras: ["README.md", "CHANGELOG.md", "docs/metrics.md"] ++ guides,
+      groups_for_extras: [
+        "Guides": guides
+      ],
       source_url: @source_url,
       source_ref: "v#{@version}",
       formatters: ["html"]
@@ -105,8 +120,10 @@ defmodule RaftEx.MixProject do
       "quality.ci": [
         "format --check-formatted",
         "credo --strict",
-        "dialyzer"
-      ]
+        "dialyzer",
+        "docs --warnings-as-errors"
+      ],
+      "release.check": ["cmd bash scripts/release_check.sh"]
     ]
   end
 end

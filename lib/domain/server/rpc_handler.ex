@@ -38,6 +38,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   alias RaftEx.Domain.Server.{Cluster, Config}
   alias RaftEx.Domain.Types
   alias RaftEx.Infra.Filesystem
+  alias RaftEx.Infra.Observability.Metrics
   alias RaftEx.Infra.Persistence.{Log, LogMeta, LogSnapshot}
 
   # ---------------------------------------------------------------------------
@@ -165,6 +166,20 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       reply_term == current_term ->
         peer_id = state.rpc_from
 
+        Metrics.inc(:append_entries_acked)
+
+        lag =
+          case state do
+            %{log: log} ->
+              {li, _} = Log.last_index_term(log)
+              max(li - last_index, 0)
+
+            _ ->
+              0
+          end
+
+        Metrics.set({:replication_lag_ms, peer_id}, lag)
+
         cluster =
           Cluster.update_peer(
             peer_id,
@@ -290,6 +305,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   end
 
   defp handle_first_snapshot_chunk(meta, data, leader_id, state) do
+    Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
 
     with :ok <- Filesystem.make_dir(snap_dir),
@@ -309,6 +325,8 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
   defp handle_middle_snapshot_chunk(data, leader_id, %{snapshot_state: accept_state} = state)
        when is_tuple(accept_state) do
+    Metrics.inc(:snapshot_chunks_received)
+
     case LogSnapshot.accept_chunk(data, accept_state) do
       {:ok, new_snapshot_state} ->
         {:receive_snapshot, %{state | snapshot_state: new_snapshot_state}, []}
@@ -324,6 +342,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
   defp handle_last_snapshot_chunk(data, leader_id, %{snapshot_state: accept_state} = state)
        when is_tuple(accept_state) do
+    Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
 
     data =
@@ -351,6 +370,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   end
 
   defp handle_full_snapshot(meta, data, leader_id, state) do
+    Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
 
     with :ok <- Filesystem.make_dir(snap_dir),
@@ -364,6 +384,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   end
 
   defp install_snapshot(meta, mac_state, leader_id, state) do
+    Metrics.inc(:snapshot_chunks_installed)
     %{index: snap_idx, term: snap_term} = meta
     old_mac_state = Map.get(state, :machine_state)
     {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
@@ -393,6 +414,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   end
 
   defp snapshot_failure(leader_id, state, reason) do
+    Metrics.inc(:snapshot_chunks_failed)
     Logger.error("RaftEx.RpcHandler: snapshot transfer failed: #{inspect(reason)}")
     reply = build_install_snapshot_reply(state.current_term, state, 0, 0)
 

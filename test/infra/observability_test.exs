@@ -100,27 +100,18 @@ defmodule RaftEx.Infra.ObservabilityTest do
   end
 
   describe "Counters" do
-    test "init is idempotent and counters can be managed" do
+    test "init is idempotent" do
       assert :ok = Counters.init()
       assert :ok = Counters.init()
-
-      assert :ok = Counters.new(:counters_test, [{:count, 1, :counter, "Count"}])
-      assert Counters.fetch(:counters_test) != nil
-      assert Counters.overview() != nil
-      assert Counters.overview(:counters_test) != nil
-      assert Counters.counters(:counters_test, []) != nil
-      assert :ok = Counters.delete(:counters_test)
     end
 
-    test "new/3 registers labelled counters in a dedicated group" do
-      assert :ok = Counters.init()
-
-      group = {:ra, :counters_labelled_test}
-      :seshat.new_group(group)
-      fields = [{:count, 1, :counter, "Count"}]
-
-      assert :ok = Counters.new(:counters_labelled_test, :labelled, fields)
-      assert %{labelled: %{count: 0}} = :seshat.overview(group)
+    test "new/fetch/delete/overview are ETS-backed or no-ops" do
+      assert :ok = Counters.new(:counters_test, [{:count, 1, :counter, "Count"}])
+      assert Counters.fetch(:counters_test) == nil
+      assert Counters.overview() != nil
+      assert Counters.overview(:counters_test) != nil
+      assert Counters.counters(:counters_test, []) == %{}
+      assert :ok = Counters.delete(:counters_test)
     end
   end
 

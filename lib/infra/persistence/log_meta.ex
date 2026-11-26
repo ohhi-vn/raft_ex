@@ -99,7 +99,7 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
     ^tbl_name = :dets.to_ets(tbl_name, tbl_name)
 
     Logger.info(
-      "ra: meta data store initialised for #{system}. " <>
+      "raft_ex: meta data store initialised for #{system}. " <>
         "#{:ets.info(tbl_name, :size)} record(s)"
     )
 

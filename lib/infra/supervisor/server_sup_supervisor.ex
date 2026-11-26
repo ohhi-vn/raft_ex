@@ -65,7 +65,13 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
           type: :supervisor
         }
 
-        DynamicSupervisor.start_child(sup_name, spec)
+        result = DynamicSupervisor.start_child(sup_name, spec)
+
+        if match?({:ok, _}, result) or match?({:ok, _, _}, result) do
+          Counters.new(config.id, Counters.counter_fields())
+        end
+
+        result
     end
   end
 
@@ -97,7 +103,9 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
             type: :supervisor
           }
 
-          DynamicSupervisor.start_child(sup_name, spec)
+          result = DynamicSupervisor.start_child(sup_name, spec)
+          register_server_counters(result, config)
+          result
         end
     end
   end
@@ -147,6 +155,12 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
   # `DynamicSupervisor` children all have the id `:undefined`; the server name
   # is the id of the runtime child inside each `ServerSupervisor`. Walk one
   # level down to find the supervisor that owns `ra_name`.
+  defp register_server_counters(result, config) do
+    if match?({:ok, _}, result) or match?({:ok, _, _}, result) do
+      Counters.new(config.id, Counters.counter_fields())
+    end
+  end
+
   defp find_child(srv_sup, ra_name) do
     srv_sup
     |> DynamicSupervisor.which_children()

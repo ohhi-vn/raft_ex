@@ -33,9 +33,10 @@ defmodule RaftEx.Domain.Server do
 
   require Logger
 
-  alias RaftEx.Domain.{Conn, Machine, Pipeline, Types}
+  alias RaftEx.Domain.{Conn, Invariant, Machine, Pipeline, Types}
   alias RaftEx.Domain.Server.{Cluster, Config, Effects, Election, RpcHandler}
   alias RaftEx.Domain.Utils
+  alias RaftEx.Infra.Observability.Metrics
   alias RaftEx.Infra.Persistence.{Log, LogMeta}
 
   # ---------------------------------------------------------------------------
@@ -178,7 +179,26 @@ defmodule RaftEx.Domain.Server do
         state3
       end
 
-    Map.put(state, :commit_latency, 0)
+    new_state = Map.put(state, :commit_latency, 0)
+
+    snap_idx =
+      case Log.snapshot_index_term(new_state.log) do
+        {idx, _} when is_integer(idx) -> idx
+        _ -> 0
+      end
+
+    {lli, _} = Log.last_index_term(new_state.log)
+    {lwi, _} = Log.last_written(new_state.log)
+
+    Invariant.check_recovery!(%{
+      snapshot_index: snap_idx,
+      wal_persisted_index: lwi,
+      log_last_index: lli,
+      commit_index: new_state.commit_index,
+      last_applied: new_state.last_applied
+    })
+
+    new_state
   end
 
   # ---------------------------------------------------------------------------
@@ -401,6 +421,8 @@ defmodule RaftEx.Domain.Server do
 
   def handle_follower(%Types.TimeoutNowRpc{} = rpc, state) do
     if rpc.term >= state.current_term do
+      Metrics.inc(:leadership_transfers_completed)
+
       state =
         if rpc.term > state.current_term do
           %{state | current_term: rpc.term, voted_for: nil, leader_id: nil}
@@ -552,9 +574,11 @@ defmodule RaftEx.Domain.Server do
 
     cond do
       target == id ->
+        Metrics.inc(:leadership_transfers_failed)
         {:leader, state, [{:reply, {:error, :self}}]}
 
       not Map.has_key?(state.cluster, target) ->
+        Metrics.inc(:leadership_transfers_failed)
         {:leader, state, [{:reply, {:error, :not_member}}]}
 
       true ->
@@ -569,8 +593,10 @@ defmodule RaftEx.Domain.Server do
         caught_up = Map.get(peer, :match_index, 0) >= state.commit_index
 
         if not is_voter or not caught_up do
+          Metrics.inc(:leadership_transfers_failed)
           {:leader, state, [{:reply, {:error, :not_caught_up}}]}
         else
+          Metrics.inc(:leadership_transfers_initiated)
           # send TimeoutNowRpc
           rpc = %Types.TimeoutNowRpc{term: state.current_term, leader_id: id}
           effects = [{:send_rpc, target, rpc}]
@@ -915,15 +941,25 @@ defmodule RaftEx.Domain.Server do
   end
 
   defp increment_commit_index(
-         %{current_term: ct, cfg: %Config{id: id}, cluster: cluster, log: log} = state0
+         %{current_term: ct, cfg: %Config{id: id}, cluster: cluster, log: log, commit_index: ci0} =
+           state0
        ) do
     {lwi, _} = Log.last_written(log)
     indexes = Cluster.voter_match_indexes(id, cluster, lwi)
     potential_ci = Cluster.agreed_commit(indexes)
 
     case fetch_term(potential_ci, state0) do
-      {^ct, state} -> Map.put(state, :commit_index, potential_ci)
-      {_, state} -> state
+      {^ct, state} ->
+        if potential_ci > ci0 do
+          Metrics.inc(:quorum_reached)
+          Metrics.inc(:commit_advanced)
+          Metrics.set(:commit_index, potential_ci)
+        end
+
+        Map.put(state, :commit_index, potential_ci)
+
+      {_, state} ->
+        state
     end
   end
 
@@ -1335,26 +1371,70 @@ defmodule RaftEx.Domain.Server do
        %{next_index: ni, status: :normal, commit_index_sent: cis, match_index: mi} = peer0},
       {s0, more0, effs}
       when ni < next_log_idx or cis < ci ->
-        in_flight = ni - mi - 1
-        effective_batch = max(1, min(batch_size, max_pipeline - in_flight))
-
-        if in_flight < max_pipeline do
-          {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, [])
-          peer = %{peer0 | next_index: new_ni, commit_index_sent: ci}
-          new_more = more0 or (new_ni < next_log_idx and new_ni - mi - 1 < max_pipeline)
-          {put_peer(peer_id, peer, s), new_more, [eff | effs]}
-        else
-          {s0, more0, effs}
-        end
+        process_peer_replication(%{
+          peer_id: peer_id,
+          peer0: peer0,
+          ni: ni,
+          mi: mi,
+          ci: ci,
+          next_log_idx: next_log_idx,
+          more0: more0,
+          effs: effs,
+          s0: s0,
+          batch_size: batch_size,
+          max_pipeline: max_pipeline
+        })
 
       _, acc ->
         acc
     end)
   end
 
+  defp process_peer_replication(ctx) do
+    peer_id = ctx.peer_id
+    peer0 = ctx.peer0
+    ni = ctx.ni
+    mi = ctx.mi
+    ci = ctx.ci
+    next_log_idx = ctx.next_log_idx
+    more0 = ctx.more0
+    effs = ctx.effs
+    s0 = ctx.s0
+    batch_size = ctx.batch_size
+    max_pipeline = ctx.max_pipeline
+    count = Map.get(peer0, :backpressure_count, 0)
+
+    if count > 0 do
+      peer = Map.put(peer0, :backpressure_count, count - 1)
+      {put_peer(peer_id, peer, s0), more0, effs}
+    else
+      in_flight = ni - mi - 1
+      effective_batch = max(1, min(batch_size, max_pipeline - in_flight))
+
+      if in_flight < max_pipeline do
+        {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, [])
+
+        peer =
+          peer0
+          |> Map.put(:next_index, new_ni)
+          |> Map.put(:commit_index_sent, ci)
+          |> Map.put(:backpressure_count, 0)
+
+        new_more = more0 or (new_ni < next_log_idx and new_ni - mi - 1 < max_pipeline)
+        {put_peer(peer_id, peer, s), new_more, [eff | effs]}
+      else
+        Metrics.inc(:replication_backpressure)
+        peer = Map.put(peer0, :backpressure_count, 3)
+        {put_peer(peer_id, peer, s0), more0, effs}
+      end
+    end
+  end
+
   defp make_rpc_effect(peer_id, %{next_index: next} = _peer, batch_size, state, cache \\ []) do
     prev_idx = next - 1
     %{log: log0} = state
+
+    Metrics.inc(:append_entries_sent)
 
     case Log.fetch_term(prev_idx, log0) do
       {prev_term, log} when is_integer(prev_term) ->

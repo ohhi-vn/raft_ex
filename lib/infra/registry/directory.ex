@@ -59,7 +59,7 @@ defmodule RaftEx.Infra.Registry.Directory do
 
       other_uid ->
         :ok = :dets.insert(dir_rev, {server_name, uid})
-        Logger.warning("ra: server #{server_name} uid #{uid} replaces prior #{other_uid}")
+        Logger.warning("raft_ex: server #{server_name} uid #{uid} replaces prior #{other_uid}")
     end
   end
 

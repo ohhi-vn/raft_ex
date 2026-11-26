@@ -196,6 +196,113 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriterTest do
     end
   end
 
+  describe "index-based direct access" do
+    test "seal writes a sidecar index file" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+      assert File.exists?(segment_path("1-1.segment.idx"))
+    end
+
+    test "recovery loads sidecar index and reads entries" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+
+      dir = Process.get(:segment_writer_test_dir)
+      name2 = :"recovered_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {LogSegmentWriter,
+         %{name: name2, data_dir: dir, segment_max_entries: 2, segment_max_size_bytes: 1_000_000}},
+        id: name2
+      )
+
+      assert {:ok, {1, 1, :a}} = LogSegmentWriter.read_entry(name2, 1)
+      assert {:ok, {2, 1, :b}} = LogSegmentWriter.read_entry(name2, 2)
+      assert {:ok, [{1, 1, :a}, {2, 1, :b}]} = LogSegmentWriter.read(name2, 1, 2)
+    end
+
+    test "corrupt sidecar is rebuilt from segment" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+
+      sc = segment_path("1-1.segment.idx")
+      File.write!(sc, "garbage")
+
+      dir = Process.get(:segment_writer_test_dir)
+      name2 = :"recovered2_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {LogSegmentWriter,
+         %{name: name2, data_dir: dir, segment_max_entries: 2, segment_max_size_bytes: 1_000_000}},
+        id: name2
+      )
+
+      assert {:ok, {1, 1, :a}} = LogSegmentWriter.read_entry(name2, 1)
+      assert File.read!(sc) != "garbage"
+    end
+
+    test "missing sidecar is rebuilt from segment" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+
+      sc = segment_path("1-1.segment.idx")
+      File.rm!(sc)
+
+      dir = Process.get(:segment_writer_test_dir)
+      name2 = :"recovered3_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {LogSegmentWriter,
+         %{name: name2, data_dir: dir, segment_max_entries: 2, segment_max_size_bytes: 1_000_000}},
+        id: name2
+      )
+
+      assert {:ok, {2, 1, :b}} = LogSegmentWriter.read_entry(name2, 2)
+      assert File.exists?(sc)
+    end
+
+    test "range read stays correct after recovery" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}, {3, 1, :c}])
+
+      dir = Process.get(:segment_writer_test_dir)
+      name2 = :"recovered4_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {LogSegmentWriter,
+         %{name: name2, data_dir: dir, segment_max_entries: 2, segment_max_size_bytes: 1_000_000}},
+        id: name2
+      )
+
+      assert {:ok, entries} = LogSegmentWriter.read(name2, 1, 3)
+      assert length(entries) == 3
+      assert Enum.map(entries, &elem(&1, 0)) == [1, 2, 3]
+    end
+
+    test "delete_up_to removes sidecar files" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+      assert File.exists?(segment_path("1-1.segment.idx"))
+      assert :ok = LogSegmentWriter.delete_up_to(writer, 2)
+      refute File.exists?(segment_path("1-1.segment.idx"))
+    end
+
+    test "truncate_from removes sidecars of removed segments" do
+      writer = name()
+      LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
+      LogSegmentWriter.write(writer, [{3, 1, :c}])
+      assert File.exists?(segment_path("1-1.segment.idx"))
+      assert :ok = LogSegmentWriter.truncate_from(writer, 2)
+      refute File.exists?(segment_path("1-1.segment.idx"))
+    end
+  end
+
   defp name, do: Process.get(:segment_writer_test_name)
 
   defp segment_path(file) do

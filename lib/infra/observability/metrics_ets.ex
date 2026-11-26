@@ -5,7 +5,7 @@ defmodule RaftEx.Infra.Observability.MetricsEts do
 
   use GenServer
 
-  alias RaftEx.Infra.Observability.Counters
+  alias RaftEx.Infra.Observability.Metrics
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
@@ -13,7 +13,7 @@ defmodule RaftEx.Infra.Observability.MetricsEts do
   def init([]) do
     flags = [:named_table, {:read_concurrency, true}, {:write_concurrency, true}, :public]
     :ets.new(:ra_log_metrics, [:set | flags])
-    Counters.init()
+    Metrics.init()
     RaftEx.Leaderboard.init()
     :ets.new(:ra_log_snapshot_state, [:set | flags])
     {:ok, %{}}

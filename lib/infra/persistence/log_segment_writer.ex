@@ -13,11 +13,13 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   - Entries: serialized log entries with checksums
   - Footer: checksum of the entire file
 
-  ## Lifecycle
+  ## Index-based direct access
 
-  1. **Active Segment**: Receives new entries from WAL
-  2. **Sealed Segment**: Closed when max size/entries reached
-  3. **Compacted**: Merged with other segments during cleanup
+  Each segment maintains an in-memory index of `{entry_index, byte_offset, byte_length}`
+  for every entry it contains. Sealed segments also persist this index as a sidecar
+  file (`<segment>.idx`) so recovery does not need to re-parse the whole segment.
+  Reads use `:file.pread/3` to fetch only the requested bytes. When the index is
+  missing or corrupt, the implementation falls back to parsing the full segment.
   """
 
   use GenServer
@@ -26,11 +28,18 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   # "RASG" - Raft Segment
   @magic_bytes <<0x52, 0x41, 0x53, 0x47>>
   @version 1
-  @header_size 24
+  @header_size 28
   #  @footer_size 8
+
+  # "RASI" - Raft Segment Index (sidecar)
+  @sidecar_magic <<0x52, 0x41, 0x53, 0x49>>
+  @sidecar_version 1
 
   @type segment_id :: non_neg_integer()
   @type segment_range :: {first_index :: non_neg_integer(), last_index :: non_neg_integer()}
+  @type index_entry ::
+          {entry_index :: non_neg_integer(), offset :: non_neg_integer(),
+           length :: non_neg_integer()}
 
   @type segment :: %{
           id: segment_id(),
@@ -39,7 +48,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           entry_count: non_neg_integer(),
           size_bytes: non_neg_integer(),
           sealed: boolean(),
-          fd: reference() | nil
+          fd: reference() | nil,
+          index: [index_entry()]
         }
 
   @type t :: %__MODULE__{
@@ -153,7 +163,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         |> Enum.filter(&String.ends_with?(&1, ".segment"))
         |> Enum.map(&Path.join(segment_dir, &1))
         |> Enum.sort()
-        |> Enum.map(&load_segment_header/1)
+        |> Enum.map(&load_segment/1)
         |> Enum.reject(&is_nil/1)
         |> then(&{:ok, &1})
 
@@ -280,16 +290,18 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
 
   @impl GenServer
   def handle_call({:truncate_from, from_index}, _from, state) do
-    {to_keep, to_remove} =
-      Enum.split_with(state.segments, fn seg ->
-        elem(seg.range, 1) < from_index
-      end)
+    to_remove = Enum.filter(state.segments, fn seg -> elem(seg.range, 1) >= from_index end)
+    to_keep = state.segments -- to_remove
 
-    Enum.each(to_remove, &delete_segment_file/1)
+    Enum.each(to_remove, fn seg ->
+      delete_segment_file(seg)
+      File.rm(sidecar_path(seg.path))
+    end)
 
     active =
       if state.active_segment && elem(state.active_segment.range, 0) >= from_index do
         delete_segment_file(state.active_segment)
+        File.rm(sidecar_path(state.active_segment.path))
         nil
       else
         state.active_segment
@@ -306,7 +318,10 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         elem(seg.range, 1) <= up_to_index
       end)
 
-    Enum.each(to_delete, &delete_segment_file/1)
+    Enum.each(to_delete, fn seg ->
+      delete_segment_file(seg)
+      File.rm(sidecar_path(seg.path))
+    end)
 
     state = %{state | segments: to_keep}
     {:reply, :ok, state}
@@ -346,6 +361,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     "#{first_index}-#{last_index}.segment"
   end
 
+  defp sidecar_path(path), do: path <> ".idx"
+
   defp create_new_segment(state) do
     first_index =
       case compute_index_range(state) do
@@ -365,13 +382,16 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
       entry_count: 0,
       size_bytes: @header_size,
       sealed: false,
-      fd: nil
+      fd: nil,
+      index: []
     }
 
     {:ok, segment}
   end
 
-  defp seal_segment(%{path: path, range: {first, last}, entry_count: count} = segment) do
+  defp seal_segment(
+         %{path: path, range: {first, last}, entry_count: count, index: index} = segment
+       ) do
     header = build_header(first, last, count)
 
     {:ok, fd} = File.open(path, [:read, :write])
@@ -379,14 +399,26 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     :ok = :file.sync(fd)
     File.close(fd)
 
+    write_sidecar(path, index)
+
     {:ok, %{segment | sealed: true}}
   end
 
   defp append_entries(
-         %{path: path, range: {first, last}, entry_count: count, size_bytes: size} = segment,
+         %{path: path, range: {first, last}, entry_count: count, size_bytes: size, index: idx} =
+           segment,
          entries
        ) do
-    data = Enum.map(entries, &serialize_entry/1) |> IO.iodata_to_binary()
+    binaries = Enum.map(entries, &serialize_entry/1)
+
+    {rev_new_index, _} =
+      Enum.reduce(Enum.zip(entries, binaries), {[], size}, fn {{entry_index, _, _}, bin},
+                                                              {acc, off} ->
+        {[{entry_index, off, byte_size(bin)} | acc], off + byte_size(bin)}
+      end)
+
+    new_index_entries = Enum.reverse(rev_new_index)
+    data = IO.iodata_to_binary(binaries)
 
     case File.open(path, [:append, :binary]) do
       {:ok, fd} ->
@@ -402,7 +434,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           segment
           | range: {first, new_last},
             entry_count: new_count,
-            size_bytes: new_size
+            size_bytes: new_size,
+            index: idx ++ new_index_entries
         }
 
         {:ok, updated_segment}
@@ -441,6 +474,16 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   end
 
   defp read_from_segment(segment, from_index, to_index) do
+    index_list = Map.get(segment, :index, [])
+
+    if index_list == [] do
+      read_from_segment_full(segment, from_index, to_index)
+    else
+      read_from_segment_indexed(segment, index_list, from_index, to_index)
+    end
+  end
+
+  defp read_from_segment_full(segment, from_index, to_index) do
     case File.read(segment.path) do
       {:ok, data} ->
         data
@@ -452,7 +495,63 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     end
   end
 
+  defp read_from_segment_indexed(segment, index_list, from_index, to_index) do
+    index_list
+    |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
+    |> Enum.reduce([], fn {_idx, offset, length}, acc ->
+      read_indexed_entry(segment.path, offset, length, acc)
+    end)
+    |> Enum.reverse()
+  end
+
+  defp read_indexed_entry(path, offset, length, acc) do
+    case read_bytes(path, offset, length) do
+      {:ok, bin} ->
+        case decode_entry(bin) do
+          {:ok, entry} -> [entry | acc]
+          :error -> acc
+        end
+
+      _ ->
+        acc
+    end
+  end
+
   defp read_single_entry(segment, index) do
+    index_list = Map.get(segment, :index, [])
+
+    if index_list == [] do
+      fallback_read_single(segment, index)
+    else
+      read_single_entry_indexed(segment, index_list, index)
+    end
+  end
+
+  defp read_single_entry_indexed(segment, index_list, index) do
+    case binary_search_index(index_list, index) do
+      {:found, mid} ->
+        {_i, offset, length} = Enum.at(index_list, mid)
+        read_single_entry_bytes(segment, index, offset, length)
+
+      :not_found ->
+        {:error, :not_found}
+    end
+  end
+
+  defp read_single_entry_bytes(segment, index, offset, length) do
+    case read_bytes(segment.path, offset, length) do
+      {:ok, bin} ->
+        case decode_entry(bin) do
+          {:ok, entry} -> {:ok, entry}
+          :error -> fallback_read_single(segment, index)
+        end
+
+      _ ->
+        fallback_read_single(segment, index)
+    end
+  end
+
+  defp fallback_read_single(segment, index) do
     case File.read(segment.path) do
       {:ok, data} ->
         data
@@ -468,6 +567,24 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     end
   end
 
+  defp read_bytes(path, offset, length) do
+    case File.open(path, [:read, :binary]) do
+      {:ok, fd} ->
+        result = :file.pread(fd, offset, length)
+        File.close(fd)
+        result
+
+      {:error, _} ->
+        {:error, :enoent}
+    end
+  end
+
+  defp decode_entry(<<index::64, term::64, cmd_size::32, cmd_data::binary-size(cmd_size)>>) do
+    {:ok, {index, term, :erlang.binary_to_term(cmd_data)}}
+  end
+
+  defp decode_entry(_), do: :error
+
   # ---------------------------------------------------------------------------
   # Serialization
   # ---------------------------------------------------------------------------
@@ -476,20 +593,20 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     <<@magic_bytes::binary, @version::32, first_index::64, last_index::64, entry_count::32>>
   end
 
-  # defp parse_header(
-  #        <<@magic_bytes::binary, @version::32, first::64, last::64, count::32, _rest::binary>>
-  #      ) do
-  #   %{first_index: first, last_index: last, entry_count: count}
-  # end
-
-  # defp parse_header(_), do: nil
-
   defp serialize_entry({index, term, command}) do
     cmd_data = :erlang.term_to_binary(command)
     cmd_size = byte_size(cmd_data)
 
     <<index::64, term::64, cmd_size::32, cmd_data::binary>>
   end
+
+  defp parse_header(
+         <<@magic_bytes::binary, @version::32, first::64, last::64, count::32, _rest::binary>>
+       ) do
+    %{first: first, last: last, count: count}
+  end
+
+  defp parse_header(_), do: nil
 
   defp parse_entries(
          <<@magic_bytes::binary, _version::32, _first::64, _last::64, _count::32, rest::binary>>
@@ -513,10 +630,21 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   # Recovery
   # ---------------------------------------------------------------------------
 
-  defp load_segment_header(path) do
+  defp load_segment(path) do
     case File.read(path) do
-      {:ok, <<@magic_bytes::binary, @version::32, first::64, last::64, count::32, _rest::binary>>} ->
+      {:ok, data} ->
+        load_segment_from_data(path, data)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp load_segment_from_data(path, data) do
+    case parse_header(data) do
+      %{first: first, last: last, count: count} ->
         {:ok, %{size: size}} = File.stat(path)
+        index = load_or_build_index(path, data, count)
 
         %{
           id: System.unique_integer([:positive]),
@@ -525,15 +653,134 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           entry_count: count,
           size_bytes: size,
           sealed: true,
-          fd: nil
+          fd: nil,
+          index: index
         }
 
-      _ ->
+      nil ->
         Logger.warning(
           "RaftEx.Infra.Persistence.LogSegmentWriter: corrupted segment file #{path}"
         )
 
         nil
+    end
+  end
+
+  defp load_or_build_index(path, data, count) do
+    case load_sidecar(path, count) do
+      {:ok, idx} ->
+        idx
+
+      :error ->
+        {_entries, idx} = parse_segment_with_index(data)
+        write_sidecar(path, idx)
+        idx
+    end
+  end
+
+  defp parse_segment_with_index(
+         <<@magic_bytes::binary, _version::32, _first::64, _last::64, _count::32, rest::binary>>
+       ) do
+    parse_segment_entries(rest, [], [], 28)
+  end
+
+  defp parse_segment_with_index(_), do: {[], []}
+
+  defp parse_segment_entries(<<>>, entries_acc, index_acc, _off) do
+    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
+  end
+
+  defp parse_segment_entries(
+         <<index::64, term::64, cmd_size::32, cmd_data::binary-size(cmd_size), rest::binary>>,
+         entries_acc,
+         index_acc,
+         off
+       ) do
+    command = :erlang.binary_to_term(cmd_data)
+    len = 8 + 8 + 4 + cmd_size
+
+    parse_segment_entries(
+      rest,
+      [{index, term, command} | entries_acc],
+      [{index, off, len} | index_acc],
+      off + len
+    )
+  end
+
+  defp parse_segment_entries(_, entries_acc, index_acc, _off) do
+    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Sidecar index
+  # ---------------------------------------------------------------------------
+
+  defp load_sidecar(path, expected_count) do
+    sc = sidecar_path(path)
+
+    case File.read(sc) do
+      {:ok, <<@sidecar_magic::binary, @sidecar_version::32, count::32, rest::binary>>}
+      when count == expected_count ->
+        validate_sidecar_rest(rest, count)
+
+      _ ->
+        :error
+    end
+  end
+
+  defp validate_sidecar_rest(rest, count) do
+    entry_size = 8 + 8 + 4
+    bytes_needed = count * entry_size
+
+    if byte_size(rest) < bytes_needed + 4 do
+      :error
+    else
+      <<entries_bin::binary-size(^bytes_needed), checksum::32, _::binary>> = rest
+      validate_sidecar_checksum(entries_bin, checksum, count)
+    end
+  end
+
+  defp validate_sidecar_checksum(entries_bin, checksum, count) do
+    if :erlang.crc32(entries_bin) != checksum do
+      :error
+    else
+      entries = parse_sidecar_entries(entries_bin, [])
+
+      if is_list(entries) and length(entries) == count do
+        {:ok, entries}
+      else
+        :error
+      end
+    end
+  end
+
+  defp parse_sidecar_entries(<<>>, acc), do: Enum.reverse(acc)
+
+  defp parse_sidecar_entries(<<index::64, offset::64, length::32, rest::binary>>, acc) do
+    parse_sidecar_entries(rest, [{index, offset, length} | acc])
+  end
+
+  defp parse_sidecar_entries(_, _acc), do: :error
+
+  defp write_sidecar(_path, []) do
+    :ok
+  end
+
+  defp write_sidecar(path, index) do
+    entries_bin =
+      Enum.reduce(index, <<>>, fn {index, offset, length}, acc ->
+        <<acc::binary, index::64, offset::64, length::32>>
+      end)
+
+    checksum = :erlang.crc32(entries_bin)
+
+    data =
+      <<@sidecar_magic::binary, @sidecar_version::32, length(index)::32, entries_bin::binary,
+        checksum::32>>
+
+    case File.write(sidecar_path(path), data) do
+      :ok -> :ok
+      {:error, _} -> :ok
     end
   end
 
@@ -560,7 +807,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           entry_count: 0,
           size_bytes: @header_size,
           sealed: false,
-          fd: nil
+          fd: nil,
+          index: []
         }
 
       active ->
@@ -599,6 +847,23 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         )
 
         :ok
+    end
+  end
+
+  defp binary_search_index(index_list, target) do
+    do_binary_search(index_list, target, 0, length(index_list) - 1)
+  end
+
+  defp do_binary_search(_list, _target, lo, hi) when lo > hi, do: :not_found
+
+  defp do_binary_search(list, target, lo, hi) do
+    mid = div(lo + hi, 2)
+    {idx, _off, _len} = Enum.at(list, mid)
+
+    cond do
+      idx == target -> {:found, mid}
+      idx < target -> do_binary_search(list, target, mid + 1, hi)
+      true -> do_binary_search(list, target, lo, mid - 1)
     end
   end
 end

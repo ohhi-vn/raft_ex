@@ -1,0 +1,98 @@
+2026-11-26 10:53:42,877{GMT}	INFO	[jepsen test runner] jepsen.core: Test version a06c8a3c407e19a8470ad3e0822e4666bd09933e (plus uncommitted changes)
+2026-11-26 10:53:42,892{GMT}	INFO	[jepsen test runner] jepsen.core: Running test:
+{:remote
+ #jepsen.control.retry.Remote{:remote #jepsen.control.scp.Remote{:cmd-remote #jepsen.control.sshj.SSHJRemote{:concurrency-limit 6,
+                                                                                                             :conn-spec nil,
+                                                                                                             :client nil,
+                                                                                                             :semaphore nil},
+                                                                 :conn-spec nil},
+                              :conn nil}
+ :concurrency 5
+ :db
+ #object[raft_ex_jepsen.db$raft_ex_db$reify__734
+         "0x434a8938"
+         "raft_ex_jepsen.db$raft_ex_db$reify__734@434a8938"]
+ :name "raft-ex"
+ :start-time
+ #object[org.joda.time.DateTime "0x6a07e6ca" "2026-11-26T10:53:42.817+07:00"]
+ :net
+ #object[jepsen.net$reify__13231
+         "0x726ef6aa"
+         "jepsen.net$reify__13231@726ef6aa"]
+ :client #raft_ex_jepsen.workload.RaftExClient{:conn nil}
+ :barrier
+ #object[java.util.concurrent.CyclicBarrier
+         "0x6104691c"
+         "java.util.concurrent.CyclicBarrier@6104691c"]
+ :checker
+ #object[jepsen.checker$compose$reify__11082
+         "0x195cbf5e"
+         "jepsen.checker$compose$reify__11082@195cbf5e"]
+ :nemesis #unprintable "jepsen.nemesis$partitioner$reify__13384@4cb82b09"
+ :nodes ["n1" "n2" "n3" "n4" "n5"]
+ :generator
+ #object[jepsen.util.Forgettable
+         "0x2a0c244e"
+         ({:type :invoke, :f :write, :value 0}
+          {:type :invoke, :f :write, :value 1}
+          {:type :invoke, :f :write, :value 2}
+          {:type :invoke, :f :write, :value 3}
+          {:type :invoke, :f :write, :value 4}
+          {:type :invoke, :f :write, :value 5}
+          {:type :invoke, :f :write, :value 6}
+          {:type :invoke, :f :write, :value 7}
+          ...)]
+ :os :debian
+ :time-limit 60
+ :model #knossos.model.Register{:value nil}}
+
+2026-11-26 10:53:45,016{GMT}	WARN	[jepsen test runner] jepsen.core: Test crashed!
+clojure.lang.ExceptionInfo: throw+: {:private-key-path nil, :password "root", :username "root", :type :jepsen.control/session-error, :port 22, :strict-host-key-checking :yes, :host "n1", :dummy nil, :message "Error opening SSH session. Verify username, password, and node hostnames are correct."}
+	at slingshot.support$stack_trace.invoke(support.clj:201)
+	at jepsen.control.sshj.SSHJRemote.connect(sshj.clj:142)
+	at jepsen.control.core$fn__5985$G__5954__5988.invoke(core.clj:9)
+	at jepsen.control.core$fn__5985$G__5953__5992.invoke(core.clj:9)
+	at clojure.core$update.invokeStatic(core.clj:6233)
+	at clojure.core$update.invoke(core.clj:6223)
+	at jepsen.control.scp.Remote.connect(scp.clj:87)
+	at jepsen.control.retry.Remote$open__6131.invoke(retry.clj:41)
+	at jepsen.reconnect$open_BANG_$fn__6094.invoke(reconnect.clj:61)
+	at jepsen.reconnect$open_BANG_.invokeStatic(reconnect.clj:59)
+	at jepsen.reconnect$open_BANG_.invoke(reconnect.clj:56)
+	at jepsen.control.retry.Remote.connect(retry.clj:40)
+	at jepsen.control$session.invokeStatic(control.clj:233)
+	at jepsen.control$session.invoke(control.clj:230)
+	at clojure.lang.AFn.applyToHelper(AFn.java:154)
+	at clojure.lang.AFn.applyTo(AFn.java:144)
+	at clojure.core$apply.invokeStatic(core.clj:667)
+	at clojure.core$with_bindings_STAR_.invokeStatic(core.clj:1990)
+	at clojure.core$with_bindings_STAR_.doInvoke(core.clj:1990)
+	at clojure.lang.RestFn.applyTo(RestFn.java:142)
+	at clojure.core$apply.invokeStatic(core.clj:671)
+	at clojure.core$bound_fn_STAR_$fn__5818.doInvoke(core.clj:2020)
+	at clojure.lang.RestFn.applyTo(RestFn.java:137)
+	at clojure.core$apply.invokeStatic(core.clj:667)
+	at clojure.core$apply.invoke(core.clj:662)
+	at jepsen.util$fcatch$wrapper__5162.doInvoke(util.clj:48)
+	at clojure.lang.RestFn.invoke(RestFn.java:408)
+	at dom_top.core$real_pmap_helper$build_thread__730$fn__731.invoke(core.clj:163)
+	at clojure.lang.AFn.applyToHelper(AFn.java:152)
+	at clojure.lang.AFn.applyTo(AFn.java:144)
+	at clojure.core$apply.invokeStatic(core.clj:667)
+	at clojure.core$with_bindings_STAR_.invokeStatic(core.clj:1990)
+	at clojure.core$with_bindings_STAR_.doInvoke(core.clj:1990)
+	at clojure.lang.RestFn.invoke(RestFn.java:425)
+	at clojure.lang.AFn.applyToHelper(AFn.java:156)
+	at clojure.lang.RestFn.applyTo(RestFn.java:132)
+	at clojure.core$apply.invokeStatic(core.clj:671)
+	at clojure.core$bound_fn_STAR_$fn__5818.doInvoke(core.clj:2020)
+	at clojure.lang.RestFn.invoke(RestFn.java:397)
+	at clojure.lang.AFn.run(AFn.java:22)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+Caused by: java.net.UnknownHostException: n1
+	at java.base/sun.nio.ch.NioSocketImpl.connect(NioSocketImpl.java:572)
+	at java.base/java.net.SocksSocketImpl.connect(SocksSocketImpl.java:351)
+	at java.base/java.net.Socket.connect(Socket.java:633)
+	at net.schmizz.sshj.SocketClient.connect(SocketClient.java:69)
+	at jepsen.control.sshj.SSHJRemote.connect(sshj.clj:127)
+	... 39 common frames omitted
