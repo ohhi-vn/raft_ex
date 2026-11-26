@@ -65,7 +65,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   defstruct [
     :config,
     :files,
-    :flush_timer
+    :flush_timer,
+    flush_scheduled?: false
   ]
 
   @type file_state :: %{
@@ -73,6 +74,10 @@ defmodule RaftEx.Infra.Persistence.LogWal do
           required(:fd) => :file.io_device() | nil,
           required(:buffer) => [
             {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.term_num(), term()}
+          ],
+          required(:buffer_size) => non_neg_integer(),
+          required(:pending_sync) => [
+            {term(), RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index()}
           ],
           required(:pending_writes) => [{pid(), reference()}],
           required(:first_index) => RaftEx.Domain.Types.index(),
@@ -83,7 +88,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   @type t :: %__MODULE__{
           config: map(),
           files: %{optional(term()) => file_state()},
-          flush_timer: reference() | nil
+          flush_timer: reference() | nil,
+          flush_scheduled?: boolean()
         }
 
   # ---------------------------------------------------------------------------
@@ -222,10 +228,41 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   @impl GenServer
   def handle_call({:append, uid, entries}, from, state) do
     {file, state} = ensure_file(uid, state)
-    file = add_to_buffer(entries, file)
-    file = maybe_flush(file, from, state.config)
-    state = put_file(uid, file, state)
-    {:reply, {:ok, file.first_index, file.last_index}, state}
+
+    cond do
+      entries == [] ->
+        state = put_file(uid, file, state)
+        reply_or_noreply(from, {:ok, file.first_index, file.last_index}, state)
+
+      reply_target?(from) ->
+        prior_size = file.buffer_size
+        file = add_to_buffer(entries, file)
+        {first, last} = entry_range(entries)
+        file = %{file | pending_sync: [{from, first, last} | file.pending_sync]}
+
+        cond do
+          file.buffer_size >= max_batch_size(state.config) ->
+            file = finish_flush(file, state.config)
+            {:noreply, put_file(uid, file, state)}
+
+          prior_size > 0 or state.flush_scheduled? or queued_appends?() ->
+            {:noreply, schedule_flush(put_file(uid, file, state))}
+
+          true ->
+            # No other append is waiting, so there is nothing to group with.
+            # Flush now instead of paying for a self-message round trip.
+            file = finish_flush(file, state.config)
+            {:noreply, put_file(uid, file, state)}
+        end
+
+      true ->
+        # A direct callback invocation with no real caller: buffer the entries
+        # without scheduling a group commit.
+        file = add_to_buffer(entries, file)
+        file = flush_if_full(file, state.config)
+        state = put_file(uid, file, state)
+        {:reply, {:ok, file.first_index, file.last_index}, state}
+    end
   end
 
   def handle_call({:truncate, uid, index}, _from, state) do
@@ -242,43 +279,27 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     {:reply, :ok, state}
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   def handle_call({:truncate_from, uid, from_index}, _from, state) do
-    state =
-      case Map.fetch(state.files, uid) do
-        {:ok, file} ->
-          compute_checksums = Map.get(state.config, :wal_compute_checksums, true)
-          sync_wal(file, state.config)
-          {_first, _last, disk_entries} = do_recover_file(file.path, compute_checksums)
+    case Map.fetch(state.files, uid) do
+      {:ok, file} ->
+        case apply_truncate_from(file, from_index, state.config) do
+          {:ok, file} ->
+            {:reply, :ok, put_file(uid, file, state)}
 
-          entries =
-            Enum.reject(disk_entries ++ file.buffer, fn {idx, _, _} -> idx >= from_index end)
+          {:error, reason, file} ->
+            {:reply, {:error, reason}, put_file(uid, file, state)}
+        end
 
-          :ok = :file.close(file.fd)
-          {:ok, fd} = :file.open(file.path, [:write, :binary, :raw, :truncate])
-
-          file = %{file | fd: fd, file_size: 0, buffer: [], pending_writes: []}
-          file = write_entries_to_wal(entries, file, state.config)
-          sync_wal(file, state.config)
-
-          {first, last} =
-            case entries do
-              [] -> {from_index, from_index - 1}
-              _ -> {hd(entries) |> elem(0), List.last(entries) |> elem(0)}
-            end
-
-          put_file(uid, %{file | first_index: first, last_index: last}, state)
-
-        :error ->
-          state
-      end
-
-    {:reply, :ok, state}
+      :error ->
+        {:reply, :ok, state}
+    end
   end
 
   def handle_call({:info, uid}, _from, state) do
     reply =
       case Map.fetch(state.files, uid) do
-        {:ok, file} -> {file.first_index, file.last_index, length(file.buffer)}
+        {:ok, file} -> {file.first_index, file.last_index, file.buffer_size}
         :error -> {0, 0, 0}
       end
 
@@ -287,7 +308,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
   def handle_call(:overview, _from, state) do
     files = state.files
-    buffers = Enum.map(files, fn {_uid, file} -> length(file.buffer) end)
+    buffers = Enum.map(files, fn {_uid, file} -> file.buffer_size end)
     indexes = Map.values(files)
 
     reply = %{
@@ -307,7 +328,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
         {:ok, file} ->
           file.buffer
           |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
-          |> Enum.sort_by(fn {idx, _, _} -> idx end)
+          |> Enum.reverse()
 
         :error ->
           []
@@ -329,10 +350,19 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   def handle_info(:flush_timeout, state) do
     files =
       Map.new(state.files, fn {uid, file} ->
-        {uid, flush_buffer(file, state.config)}
+        {uid, finish_flush(file, state.config)}
       end)
 
     {:noreply, %{state | files: files, flush_timer: start_flush_timer()}}
+  end
+
+  def handle_info(:group_commit, state) do
+    files =
+      Map.new(state.files, fn {uid, file} ->
+        {uid, finish_flush(file, state.config)}
+      end)
+
+    {:noreply, %{state | files: files, flush_scheduled?: false}}
   end
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
@@ -348,10 +378,9 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   @impl GenServer
   def terminate(_reason, state) do
     Enum.each(state.files, fn {_uid, file} ->
-      file = flush_buffer(file, state.config)
+      file = finish_flush(file, state.config)
 
       if file.fd do
-        sync_wal(file, state.config)
         :file.close(file.fd)
       end
     end)
@@ -382,13 +411,15 @@ defmodule RaftEx.Infra.Persistence.LogWal do
         # Entries already in the file must not be buffered again: they are
         # recovered into the server's log state by `Log.init/1`, and rewriting
         # them here would duplicate them on every restart.
-        {:ok, fd} = :file.open(path, [:append, :binary, :raw, :delayed_write])
+        {:ok, fd} = :file.open(path, [:append, :binary, :raw])
         {:ok, file_size} = :file.position(fd, :eof)
 
         file = %{
           path: path,
           fd: fd,
           buffer: [],
+          buffer_size: 0,
+          pending_sync: [],
           pending_writes: [],
           first_index: first_index,
           last_index: last_index,
@@ -408,33 +439,97 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   defp add_to_buffer([], file), do: file
 
   defp add_to_buffer(entries, file) do
-    new_buffer = file.buffer ++ entries
+    # The buffer is kept newest-first so appending a batch is a single reverse
+    # into the existing list instead of `buffer ++ entries`, which is quadratic
+    # in the number of buffered entries.
     {last_idx, _, _} = List.last(entries)
 
-    %{file | buffer: new_buffer, last_index: last_idx}
+    %{
+      file
+      | buffer: Enum.reverse(entries, file.buffer),
+        buffer_size: file.buffer_size + length(entries),
+        last_index: last_idx
+    }
   end
 
-  defp maybe_flush(file, from, config) do
-    max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
+  defp entry_range(entries) do
+    {first, _, _} = hd(entries)
+    {last, _, _} = List.last(entries)
+    {first, last}
+  end
 
-    if length(file.buffer) >= max_batch_size or from != nil do
-      file = flush_buffer(file, config)
-
-      if from do
-        send_reply(from, file)
-      end
-
-      file
+  defp flush_if_full(file, config) do
+    if file.buffer_size >= max_batch_size(config) do
+      finish_flush(file, config)
     else
       file
     end
   end
 
-  defp maybe_flush_async(file, reply_to, config) do
-    max_batch_size = Map.get(config, :wal_max_batch_size, 8192)
+  defp max_batch_size(config), do: Map.get(config, :wal_max_batch_size, 8192)
 
-    if length(file.buffer) >= max_batch_size do
-      file = flush_buffer(file, config)
+  defp queued_appends? do
+    case Process.info(self(), :messages) do
+      {:messages, msgs} ->
+        Enum.any?(msgs, fn
+          {:call, _from, {:append, _, _}} -> true
+          {:append, _, _} -> true
+          _ -> false
+        end)
+
+      _ ->
+        false
+    end
+  end
+
+  defp schedule_flush(%{flush_scheduled?: true} = state), do: state
+
+  defp schedule_flush(state) do
+    send(self(), :group_commit)
+    %{state | flush_scheduled?: true}
+  end
+
+  # Flush one file, acknowledge its queued callers, and clear the pending
+  # lists. On failure the buffer is left in place so a later flush can retry,
+  # but the callers are told that the write did not succeed.
+  defp finish_flush(file, config) do
+    case flush_buffer(file, config) do
+      {:ok, file} ->
+        ack_sync(file, :ok)
+        notify_pending_writes(file)
+        %{file | pending_sync: [], pending_writes: []}
+
+      {:error, reason, file} ->
+        Logger.error("RaftEx.Infra.Persistence.LogWal: WAL flush failed: #{inspect(reason)}")
+
+        Metrics.inc(:wal_flush_errors)
+        ack_sync(file, {:error, reason})
+        %{file | pending_sync: []}
+    end
+  end
+
+  defp ack_sync(file, result) do
+    Enum.each(file.pending_sync, fn {from, first, last} ->
+      reply = if result == :ok, do: {:ok, first, last}, else: result
+      GenServer.reply(from, reply)
+    end)
+  end
+
+  defp reply_target?({pid, _ref}) when is_pid(pid), do: true
+  defp reply_target?(_), do: false
+
+  defp reply_or_noreply(from, reply, state) do
+    if reply_target?(from) do
+      GenServer.reply(from, reply)
+      {:noreply, state}
+    else
+      {:reply, reply, state}
+    end
+  end
+
+  defp maybe_flush_async(file, reply_to, config) do
+    if file.buffer_size >= max_batch_size(config) do
+      file = finish_flush(file, config)
       send(reply_to, {:wal_written, file.first_index, file.last_index})
       file
     else
@@ -445,33 +540,43 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     end
   end
 
-  defp flush_buffer(%{buffer: []} = file, _config), do: file
+  defp flush_buffer(%{buffer: []} = file, _config), do: {:ok, file}
 
   defp flush_buffer(file, config) do
-    entries = file.buffer
+    entries = Enum.reverse(file.buffer)
+    entries_binary = :erlang.term_to_binary(entries)
     start = System.monotonic_time(:millisecond)
-    bytes = byte_size(:erlang.term_to_binary(entries))
-    file = write_entries_to_wal(entries, file, config)
-    sync_wal(file, config)
-    notify_pending_writes(file)
 
-    latency = System.monotonic_time(:millisecond) - start
-    Metrics.inc(:wal_flushes)
-    Metrics.inc(:wal_bytes_written, bytes)
-    Metrics.inc(:wal_segment_writes)
-    Metrics.observe(:wal_flush_latency_ms, latency)
+    case write_entries_binary(entries_binary, file.buffer_size, file, config) do
+      {:ok, file} ->
+        case sync_wal(file, config) do
+          :ok ->
+            latency = System.monotonic_time(:millisecond) - start
+            Metrics.inc(:wal_flushes)
+            Metrics.inc(:wal_bytes_written, byte_size(entries_binary))
+            Metrics.inc(:wal_segment_writes)
+            Metrics.observe(:wal_flush_latency_ms, latency)
 
-    %{file | buffer: [], pending_writes: []}
+            {:ok, %{file | buffer: [], buffer_size: 0}}
+
+          {:error, reason} ->
+            {:error, reason, file}
+        end
+
+      {:error, reason, file} ->
+        {:error, reason, file}
+    end
   end
 
   defp write_entries_to_wal(entries, file, config) do
+    entries_binary = :erlang.term_to_binary(entries)
+    write_entries_binary(entries_binary, length(entries), file, config)
+  end
+
+  defp write_entries_binary(entries_binary, count, file, config) do
     compute_checksums = Map.get(config, :wal_compute_checksums, true)
 
-    # Serialize entries
-    entries_binary = :erlang.term_to_binary(entries)
-
-    # Build WAL record
-    count = length(entries)
+    # Build WAL record from the already-serialized batch.
     blob_size = byte_size(entries_binary)
 
     header =
@@ -491,14 +596,14 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     # Write to file
     case :file.write(file.fd, data) do
       :ok ->
-        %{file | file_size: file.file_size + data_size}
+        {:ok, %{file | file_size: file.file_size + data_size}}
 
-      error ->
+      {:error, reason} ->
         Logger.error(
-          "RaftEx.Infra.Persistence.LogWal: failed to write WAL entries: #{inspect(error)}"
+          "RaftEx.Infra.Persistence.LogWal: failed to write WAL entries: #{inspect(reason)}"
         )
 
-        file
+        {:error, reason, file}
     end
   end
 
@@ -529,16 +634,6 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     end)
   end
 
-  defp send_reply({pid, ref}, file) do
-    send(pid, {:wal_written, ref, file.first_index, file.last_index})
-  end
-
-  defp send_reply(pid, file) when is_pid(pid) do
-    send(pid, {:wal_written, file.first_index, file.last_index})
-  end
-
-  defp send_reply(_other, _file), do: :ok
-
   defp do_truncate(index, file) do
     # Remove entries up to and including index
     new_buffer = Enum.reject(file.buffer, fn {idx, _, _} -> idx <= index end)
@@ -546,7 +641,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     new_first_index =
       case new_buffer do
         [] -> index + 1
-        [{first_idx, _, _} | _] -> first_idx
+        _ -> new_buffer |> List.last() |> elem(0)
       end
 
     # Truncate WAL file
@@ -558,7 +653,52 @@ defmodule RaftEx.Infra.Persistence.LogWal do
         "new first_index=#{new_first_index}"
     )
 
-    %{file | buffer: new_buffer, first_index: new_first_index, file_size: 0}
+    %{
+      file
+      | buffer: new_buffer,
+        buffer_size: length(new_buffer),
+        first_index: new_first_index,
+        file_size: 0
+    }
+  end
+
+  defp apply_truncate_from(file, from_index, config) do
+    compute_checksums = Map.get(config, :wal_compute_checksums, true)
+    _ = sync_wal(file, config)
+    {_first, _last, disk_entries} = do_recover_file(file.path, compute_checksums)
+
+    entries =
+      Enum.reject(
+        disk_entries ++ Enum.reverse(file.buffer),
+        fn {idx, _, _} -> idx >= from_index end
+      )
+
+    :ok = :file.close(file.fd)
+    {:ok, fd} = :file.open(file.path, [:write, :binary, :raw, :truncate])
+
+    file = %{
+      file
+      | fd: fd,
+        file_size: 0,
+        buffer: [],
+        buffer_size: 0,
+        pending_sync: [],
+        pending_writes: []
+    }
+
+    with {:ok, file} <- write_entries_to_wal(entries, file, config),
+         :ok <- sync_wal(file, config) do
+      {first, last} =
+        case entries do
+          [] -> {from_index, from_index - 1}
+          _ -> {hd(entries) |> elem(0), List.last(entries) |> elem(0)}
+        end
+
+      {:ok, %{file | first_index: first, last_index: last}}
+    else
+      {:error, reason, file} -> {:error, reason, file}
+      {:error, reason} -> {:error, reason, file}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -581,7 +721,11 @@ defmodule RaftEx.Infra.Persistence.LogWal do
       {:ok, _info} ->
         case :file.open(wal_file, [:read, :binary, :raw]) do
           {:ok, fd} ->
-            entries = do_recover(fd, compute_checksums, [])
+            entries =
+              fd
+              |> do_recover(compute_checksums, [])
+              |> Enum.reverse()
+
             :file.close(fd)
             recovered_range(entries)
 
@@ -629,17 +773,20 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # decode those files; stop instead of returning half a log.
   defp do_recover_records(_fd, _version, _compute_checksums, acc), do: acc
 
+  # Records are accumulated newest-first so each batch is a single prepend;
+  # `do_recover_file/2` reverses once at the end. Appending to the accumulator
+  # made recovery quadratic in the number of records.
   defp recover_records_with_footer(fd, compute_checksums, entries_binary, acc) do
     if compute_checksums do
       case :file.read(fd, @footer_size) do
         {:ok, <<_crc::32-unsigned>>} ->
-          do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
+          do_recover(fd, compute_checksums, Enum.reverse(decode(entries_binary), acc))
 
         _ ->
           acc
       end
     else
-      do_recover(fd, compute_checksums, acc ++ decode(entries_binary))
+      do_recover(fd, compute_checksums, Enum.reverse(decode(entries_binary), acc))
     end
   end
 

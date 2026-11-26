@@ -52,3 +52,12 @@ RaftEx.Observability.metric(:commit_index)
 - The ETS store is flat (metric name only) and always available.
 - `Counters` is a thin compatibility layer over the ETS store; there is no
   external dependency. `counter_fields/0` lists the per-server field spec.
+
+## Atomicity
+
+- Counters use `:ets.update_counter/4` with a default tuple, so concurrent
+  increments are atomic and never lose an update.
+- Histogram count and sum are updated together through a single
+  `:ets.update_counter/4` call for integer observations; min and max are
+  best-effort and may reflect a stale extreme under concurrency.
+- `Metrics.init/0` is idempotent and retries table creation on a race.

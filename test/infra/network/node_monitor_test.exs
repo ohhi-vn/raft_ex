@@ -2,19 +2,9 @@ defmodule RaftEx.Infra.Network.NodeMonitorTest do
   use ExUnit.Case, async: false
 
   alias RaftEx.Infra.Network.NodeMonitor
+  alias RaftEx.TestSupport.DistributionHarness, as: Harness
 
-  defp ensure_distribution do
-    if Node.alive?() do
-      Node.set_cookie(:raft_ex)
-    else
-      unique = System.unique_integer([:positive])
-
-      case Node.start(:"raft_ex_monitor_#{unique}@127.0.0.1") do
-        {:ok, _pid} -> Node.set_cookie(:raft_ex)
-        {:error, _reason} -> :ok
-      end
-    end
-  end
+  defp ensure_distribution, do: Harness.ensure_distribution()
 
   test "starts and ignores unknown messages" do
     name = :"node_monitor_test_#{System.unique_integer([:positive])}"

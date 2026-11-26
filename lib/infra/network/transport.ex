@@ -5,6 +5,8 @@ defmodule RaftEx.Infra.Network.Transport do
 
   require Logger
 
+  alias RaftEx.Infra.Network.Distribution
+
   @type server_id :: {atom(), node()}
   @type rpc :: struct()
   @type opts :: keyword()
@@ -32,7 +34,7 @@ defmodule RaftEx.Infra.Network.Transport do
   defp connect_to_seeds([], _cookie), do: :ok
 
   defp connect_to_seeds(seeds, cookie) do
-    Node.set_cookie(cookie)
+    Distribution.set_cookie(cookie)
 
     seeds
     |> Enum.reject(&(&1 == node()))
@@ -142,14 +144,29 @@ defmodule RaftEx.Infra.Network.Transport do
     end
   end
 
-  defp do_send_remote({name, node}, msg) do
+  defp do_send_remote(server_id, msg) do
+    do_send_remote(server_id, msg, 3)
+  end
+
+  defp do_send_remote(server_id, _msg, 0) do
+    Logger.warning(
+      "RaftEx.Infra.Network.Transport: failed to send to #{inspect(server_id)} after retries"
+    )
+
+    {:error, :noconnection}
+  end
+
+  defp do_send_remote({name, node} = server_id, msg, attempts) do
     if Node.connect(node) do
-      # Include the sender pid so the receiving state machine can derive
-      # `rpc_from` and correlate replies (same shape as the local send path).
       send({name, node}, {self(), msg})
       :ok
     else
-      {:error, :noconnection}
+      Logger.warning(
+        "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
+      )
+
+      Process.sleep(100)
+      do_send_remote(server_id, msg, attempts - 1)
     end
   end
 
@@ -169,18 +186,45 @@ defmodule RaftEx.Infra.Network.Transport do
     end
   end
 
-  defp do_call_remote({name, node}, msg, timeout) do
+  defp do_call_remote(server_id, msg, timeout) do
+    do_call_remote(server_id, msg, timeout, 3)
+  end
+
+  defp do_call_remote(server_id, _msg, _timeout, 0) do
+    Logger.warning(
+      "RaftEx.Infra.Network.Transport: call failed to #{inspect(server_id)} after retries"
+    )
+
+    {:error, :noconnection}
+  end
+
+  defp do_call_remote({name, node} = server_id, msg, timeout, attempts) do
     if Node.connect(node) do
       try do
         reply = :rpc.call(node, :gen_statem, :call, [{name, node}, msg, timeout], timeout)
         {:ok, reply}
       catch
-        :exit, {:timeout, _} -> {:error, :timeout}
-        :exit, {:noconnection, _} -> {:error, :noconnection}
-        :exit, reason -> {:error, reason}
+        :exit, {:timeout, _} ->
+          {:error, :timeout}
+
+        :exit, {:noconnection, _} ->
+          Logger.warning(
+            "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
+          )
+
+          Process.sleep(100)
+          do_call_remote(server_id, msg, timeout, attempts - 1)
+
+        :exit, reason ->
+          {:error, reason}
       end
     else
-      {:error, :noconnection}
+      Logger.warning(
+        "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
+      )
+
+      Process.sleep(100)
+      do_call_remote(server_id, msg, timeout, attempts - 1)
     end
   end
 

@@ -18,13 +18,17 @@ defmodule RaftEx.Infra.Observability.Metrics do
   def init do
     case :ets.whereis(@table) do
       :undefined ->
-        :ets.new(@table, [
-          :named_table,
-          :public,
-          :set,
-          {:write_concurrency, true},
-          {:read_concurrency, true}
-        ])
+        try do
+          :ets.new(@table, [
+            :named_table,
+            :public,
+            :set,
+            {:write_concurrency, true},
+            {:read_concurrency, true}
+          ])
+        rescue
+          ArgumentError -> :ok
+        end
 
         :ok
 
@@ -38,12 +42,7 @@ defmodule RaftEx.Infra.Observability.Metrics do
   def inc(name, amount \\ 1) do
     init()
     key = {:counter, name}
-
-    case :ets.lookup(@table, key) do
-      [{^key, value}] -> :ets.insert(@table, {key, value + amount})
-      [] -> :ets.insert(@table, {key, amount})
-    end
-
+    :ets.update_counter(@table, key, {2, amount}, {key, 0})
     :ok
   end
 
@@ -57,19 +56,43 @@ defmodule RaftEx.Infra.Observability.Metrics do
 
   @doc "Record a latency observation (milliseconds) into a histogram."
   @spec observe(atom() | String.t(), number()) :: :ok
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def observe(name, value) do
     init()
     key = {:hist, name}
 
-    case :ets.lookup(@table, key) do
-      [{^key, count, sum, minv, maxv}] ->
-        :ets.insert(@table, {key, count + 1, sum + value, min(minv, value), max(maxv, value)})
+    if is_integer(value) do
+      # Count and sum are updated atomically; min/max are best-effort.
+      :ets.update_counter(@table, key, [{2, 1}, {3, value}], {key, 0, 0, value, value})
+      update_hist_extremes(key, value)
+    else
+      case :ets.lookup(@table, key) do
+        [{^key, count, sum, minv, maxv}] ->
+          :ets.insert(@table, {key, count + 1, sum + value, min(minv, value), max(maxv, value)})
 
-      [] ->
-        :ets.insert(@table, {key, 1, value, value, value})
+        [] ->
+          :ets.insert(@table, {key, 1, value, value, value})
+      end
     end
 
     :ok
+  end
+
+  defp update_hist_extremes(key, value) do
+    case :ets.lookup(@table, key) do
+      [{^key, _count, _sum, minv, maxv}] ->
+        updates = []
+
+        updates = if value < minv, do: [{4, value} | updates], else: updates
+        updates = if value > maxv, do: [{5, value} | updates], else: updates
+
+        if updates != [] do
+          :ets.update_element(@table, key, updates)
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   @doc "Read a single metric value (counter/gauge) or histogram tuple."

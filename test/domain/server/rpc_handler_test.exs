@@ -4,6 +4,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
   alias RaftEx.Domain.Server.{Cluster, Config, RpcHandler}
   alias RaftEx.Domain.Types
   alias RaftEx.Infra.Filesystem
+  alias RaftEx.Infra.Observability.Metrics
   alias RaftEx.Infra.Persistence.{Log, LogSnapshot, LogWal}
 
   @self_id {:server1, node()}
@@ -185,6 +186,23 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert Enum.any?(effects, &match?({:ra_log_event, {:written, _}}, &1))
     end
 
+    test "a conflicting first entry truncates once and writes the batch once" do
+      current = state(log: log([{1, 1, :old}, {2, 1, :old}]))
+      rpc = append_rpc(entries: [{1, 2, :new}, {2, 2, :newer}])
+
+      Metrics.reset()
+
+      {_next, state, effects} =
+        RpcHandler.handle_append_entries_rpc(rpc, current)
+
+      assert state.log.entries == %{1 => {1, 2, :new}, 2 => {2, 2, :newer}}
+      assert map_size(state.log.entries) == 2
+      assert state.log.range == {1, 2}
+      assert state.log.last_term == 2
+      assert Metrics.get(:wal_flushes) == 1
+      assert Enum.any?(effects, &match?({:ra_log_event, {:written, _}}, &1))
+    end
+
     test "rejects a missing previous log entry with a next-index hint" do
       rpc = append_rpc(prev_index: 4, prev_term: 1)
       {_next, state, effects} = RpcHandler.handle_append_entries_rpc(rpc, state())
@@ -313,6 +331,34 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert next == :receive_snapshot
       assert effects == []
       assert is_tuple(state.snapshot_state)
+    end
+
+    test "supersedes an in-flight transfer on a new first chunk" do
+      meta1 = %{index: 3, term: 2}
+      meta2 = %{index: 5, term: 2}
+
+      first1 = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta1,
+        chunk_state: :first,
+        data: snapshot_chunk(meta1)
+      }
+
+      {_next, state1, _} = RpcHandler.handle_install_snapshot_rpc(first1, state())
+      assert state1.snapshot_meta == meta1
+
+      first2 = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @leader,
+        meta: meta2,
+        chunk_state: :first,
+        data: snapshot_chunk(meta2)
+      }
+
+      {_next, state2, _} = RpcHandler.handle_install_snapshot_rpc(first2, state1)
+      assert state2.snapshot_meta == meta2
+      assert is_tuple(state2.snapshot_state)
     end
 
     test "completes a snapshot transfer on the last chunk" do

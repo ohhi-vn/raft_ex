@@ -158,7 +158,8 @@ defmodule RaftEx.Domain.Server.Cluster do
       commit_index_sent: 0,
       query_index: 0,
       status: :normal,
-      voter_status: %{membership: :voter, uid: nil}
+      voter_status: %{membership: :voter, uid: nil},
+      in_flight: []
     }
   end
 

@@ -57,3 +57,34 @@ then verify it rejoins and catches up from a snapshot.
 
 The shared cookie grants full node access. Never use a production cookie in
 tests, and never expose the distribution ports publicly.
+
+## Readiness, join, and recovery
+
+### Cluster formation readiness
+
+Every participating host calls `RaftEx.form_cluster/4` with the same cluster
+name, machine, and node list. The host that owns the first server id waits
+for all server ids to answer `RaftEx.ping/2` (up to `:timeout`, default
+15 s) before triggering an election. If a host is not ready in time,
+formation returns `{:error, {:servers_not_ready, ids}}` naming the missing
+servers.
+
+### Joining a late host
+
+A host that was not part of the initial cluster calls
+`RaftEx.join_cluster/5` with a reachable seed node:
+
+```elixir
+RaftEx.join_cluster(:my_cluster, machine, all_nodes, seed_node, timeout: 15_000)
+```
+
+If the seed cannot be reached, the call returns `{:error, :seed_unreachable}`
+and no local server is left half-joined. On success the new host's server is
+added as a member and `members/2` converges to include it.
+
+### Host reboot and rejoin
+
+Restart the host with the same data directory and node name, then reconnect
+and re-run formation or join. State is recovered from the WAL and the last
+complete snapshot; a partial or corrupt snapshot file is discarded during
+recovery. Verify convergence with `RaftEx.members/2` and `key_metrics/1`.

@@ -130,7 +130,7 @@ defmodule RaftEx.Infra.Persistence.Log do
     # Determine range
     range = compute_range(snapshot_index, entries, wal_last)
     next_index = compute_next_index(snapshot_index, entries, wal_last)
-    last_term = compute_last_term(snapshot_term, entries)
+    last_term = compute_last_term(snapshot_term, entries, wal_last)
 
     %__MODULE__{
       cfg: conf,
@@ -179,17 +179,14 @@ defmodule RaftEx.Infra.Persistence.Log do
     end
   end
 
-  defp compute_last_term(snapshot_term, entries) do
-    cond do
-      map_size(entries) > 0 ->
-        {_, {_, term, _}} = Enum.max_by(entries, fn {idx, _} -> idx end)
-        term
-
-      snapshot_term > 0 ->
-        snapshot_term
-
-      true ->
-        0
+  # The last WAL record holds the highest index, so its term is the log's last
+  # term. Looking it up is O(1); scanning the map for the maximum index was
+  # O(n) on every startup.
+  defp compute_last_term(snapshot_term, entries, wal_last) do
+    case Map.get(entries, wal_last) do
+      {_, term, _} -> term
+      nil when snapshot_term > 0 -> snapshot_term
+      nil -> 0
     end
   end
 
@@ -256,14 +253,45 @@ defmodule RaftEx.Infra.Persistence.Log do
 
     case do_wal_write(state.wal_name, log_uid, entries) do
       {:ok, _, _} ->
-        # WAL write succeeded, now update in-memory state
-        {:ok, Enum.reduce(entries, state, &append/2)}
+        # WAL write succeeded, now update in-memory state in one pass.
+        {:ok, apply_entries(entries, state)}
 
       {:error, reason} ->
         Logger.error("RaftEx.Infra.Persistence.Log: WAL write failed: #{inspect(reason)}")
         # Return error without modifying in-memory state
         {:error, reason}
     end
+  end
+
+  # Apply an already-durable batch. One ETS insert and one map fold per batch
+  # keeps the mem table and entries map in step without per-entry overhead.
+  defp apply_entries(entries, state) do
+    if state.mem_table do
+      :ets.insert(state.mem_table, entries)
+    end
+
+    new_entries =
+      Enum.reduce(entries, state.entries, fn {idx, _, _} = entry, acc ->
+        Map.put(acc, idx, entry)
+      end)
+
+    {first_idx, _, _} = hd(entries)
+    {last_idx, last_term, _} = List.last(entries)
+
+    range =
+      case state.range do
+        nil -> {first_idx, last_idx}
+        {start, _} -> {start, last_idx}
+      end
+
+    %{
+      state
+      | entries: new_entries,
+        last_term: last_term,
+        last_written_index_term: {last_idx, last_term},
+        next_index: last_idx + 1,
+        range: range
+    }
   end
 
   defp do_wal_write(nil, _uid, entries) do
@@ -303,26 +331,37 @@ defmodule RaftEx.Infra.Persistence.Log do
 
   def fold(from, to, fun, acc, %__MODULE__{range: {start, _ending}} = state, :error)
       when to >= from and to >= start do
-    entries_to_read =
-      state.entries
-      |> Enum.filter(fn {idx, _} -> idx >= from and idx <= to end)
-      |> Enum.sort_by(fn {idx, _} -> idx end)
-
     {final_acc, _} =
-      Enum.reduce(entries_to_read, {acc, state}, fn {_idx, entry}, {acc_acc, st} ->
+      state.entries
+      |> entries_in_range(from, to)
+      |> Enum.reduce({acc, state}, fn entry, {acc_acc, st} ->
         {fun.(entry, acc_acc), st}
       end)
 
     {final_acc, state}
   end
 
-  # `:return` folds scan the entries above the commit index during recovery.
-  # The scan function owns the accumulator, so it behaves like the plain fold.
   def fold(from, to, fun, acc, %__MODULE__{} = state, :return) do
     fold(from, to, fun, acc, state, :error)
   end
 
   def fold(_from, _to, _fun, acc, state, _strategy), do: {acc, state}
+
+  # A short range over a large log is probed index by index, which avoids
+  # scanning the whole entries map. A range wider than the map (a sparse log,
+  # or a range larger than the log) falls back to filtering the map.
+  defp entries_in_range(entries, from, to) do
+    span = to - from + 1
+
+    if span <= map_size(entries) do
+      for idx <- from..to, entry = Map.get(entries, idx), do: entry
+    else
+      entries
+      |> Enum.filter(fn {idx, _} -> idx >= from and idx <= to end)
+      |> Enum.sort_by(fn {idx, _} -> idx end)
+      |> Enum.map(fn {_idx, entry} -> entry end)
+    end
+  end
 
   @doc """
   Read specific entries by index.
@@ -700,17 +739,25 @@ defmodule RaftEx.Infra.Persistence.Log do
   Used when a leader sends conflicting entries at a given index.
   """
   @spec truncate(RaftEx.Domain.Types.index(), t()) :: t()
-  def truncate(from_index, %__MODULE__{entries: entries, range: _range} = state) do
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  def truncate(from_index, %__MODULE__{entries: entries, range: range} = state) do
     truncate_wal_from(state, from_index)
 
-    new_entries = Map.reject(entries, fn {idx, _} -> idx >= from_index end)
-    new_range = range_from_entries_or(new_entries, nil)
+    {new_entries, new_last} = truncate_entries(entries, range, from_index)
 
-    {new_last_index, new_last_term} =
-      case Enum.max_by(new_entries, fn {idx, _} -> idx end, fn -> nil end) do
-        {idx, {_, term, _}} -> {idx, term}
-        nil -> {0, 0}
+    new_range =
+      case new_last do
+        nil -> nil
+        {idx, _, _} -> normalize_range(range, idx)
       end
+
+    {new_last_index, new_last_term} = last_index_and_term(new_last)
+
+    if state.mem_table do
+      :ets.select_delete(state.mem_table, [
+        {{:"$1", :_, :_}, [{:>=, :"$1", from_index}], [true]}
+      ])
+    end
 
     %{
       state
@@ -721,6 +768,37 @@ defmodule RaftEx.Infra.Persistence.Log do
         next_index: if(new_last_index > 0, do: new_last_index + 1, else: from_index)
     }
   end
+
+  defp truncate_entries(entries, range, from_index) do
+    case range do
+      {_start, last} when last >= from_index ->
+        {Map.drop(entries, from_index..last), probe_entry(entries, from_index - 1)}
+
+      {_start, last} ->
+        {entries, Map.get(entries, last)}
+
+      nil ->
+        {entries, nil}
+    end
+  end
+
+  defp last_index_and_term(nil), do: {0, 0}
+  defp last_index_and_term({idx, term, _}), do: {idx, term}
+
+  # Entries are dense in normal operation, so the new last index is usually
+  # `from_index - 1`. Probe downward to tolerate sparse logs without scanning
+  # the whole map.
+  defp probe_entry(_entries, index) when index < 1, do: nil
+
+  defp probe_entry(entries, index) do
+    case Map.get(entries, index) do
+      nil -> probe_entry(entries, index - 1)
+      entry -> entry
+    end
+  end
+
+  defp normalize_range({start, _last}, idx) when start <= idx, do: {start, idx}
+  defp normalize_range(_range, idx), do: {idx, idx}
 
   defp truncate_wal_from(state, from_index) do
     uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil

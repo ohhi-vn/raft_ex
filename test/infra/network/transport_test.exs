@@ -2,80 +2,15 @@ defmodule RaftEx.Infra.Network.TransportTest do
   use ExUnit.Case, async: false
 
   alias RaftEx.Infra.Network.Transport
+  alias RaftEx.TestSupport.DistributionHarness, as: Harness
 
-  # Starts distribution (longnames on loopback) once for the whole run. Other
-  # test modules may have started it already, which is fine.
-  defp ensure_distribution do
-    if Node.alive?() do
-      Node.set_cookie(:raft_ex)
-    else
-      unique = System.unique_integer([:positive])
-
-      case Node.start(:"raft_ex_transport_#{unique}@127.0.0.1") do
-        {:ok, _pid} -> Node.set_cookie(:raft_ex)
-        {:error, _reason} -> :ok
-      end
-    end
-  end
+  # Reuse the node the suite started (if any) and adapt peers to its name mode.
+  defp ensure_distribution, do: Harness.ensure_distribution()
 
   # Boots a real (hidden) BEAM node in a subprocess so that Node.connect/1
   # succeeds and the remote branches of Transport can be exercised.
-  defp start_peer do
-    unique = System.unique_integer([:positive])
-    name = :"raft_ex_tpeer_#{unique}@127.0.0.1"
-    ctl = :"raft_ex_tpeer_ctl_#{unique}"
-
-    port =
-      Port.open({:spawn_executable, System.find_executable("elixir")}, [
-        :binary,
-        :exit_status,
-        :hide,
-        args: [
-          "--name",
-          Atom.to_string(name),
-          "--cookie",
-          "raft_ex",
-          "--hidden",
-          "-e",
-          "Process.register(self(), #{inspect(ctl)}); IO.puts(\"READY\"); " <>
-            "receive do :stop -> :ok after 30_000 -> :ok end"
-        ]
-      ])
-
-    await_ready(port)
-    %{name: name, ctl: ctl, port: port}
-  end
-
-  defp await_ready(port, acc \\ "") do
-    receive do
-      {^port, {:data, data}} ->
-        acc = acc <> data
-
-        if String.contains?(acc, "READY") do
-          :ok
-        else
-          await_ready(port, acc)
-        end
-
-      {^port, {:exit_status, status}} ->
-        raise "transport peer exited before ready (status #{status}): #{acc}"
-    after
-      15_000 -> raise "transport peer did not become ready: #{acc}"
-    end
-  end
-
-  defp stop_peer(%{name: name, ctl: ctl, port: port}) do
-    if Node.alive?() do
-      send({ctl, name}, :stop)
-      Node.disconnect(name)
-    end
-
-    try do
-      Port.close(port)
-    rescue
-      _ -> :ok
-    end
-  end
+  defp start_peer, do: Harness.start_peer("raft_ex_tpeer", hidden: true)
+  defp stop_peer(peer), do: Harness.stop_peer(peer)
 
   defmodule SilentServer do
     use GenServer
@@ -109,7 +44,7 @@ defmodule RaftEx.Infra.Network.TransportTest do
     assert :ok =
              Transport.start_monitoring(
                seeds: [peer.name, :"unknown_seed@127.0.0.1", node()],
-               cookie: :raft_ex
+               cookie: Harness.cookie()
              )
   end
 

@@ -2,6 +2,7 @@ defmodule RaftEx.Infra.Network.NodeDiscoveryTest do
   use ExUnit.Case, async: false
 
   alias RaftEx.Infra.Network.NodeDiscovery
+  alias RaftEx.TestSupport.DistributionHarness, as: Harness
 
   defmodule CallbackProbe do
     def handle_topology_change(nodes, cluster_name, parent) do
@@ -9,81 +10,17 @@ defmodule RaftEx.Infra.Network.NodeDiscoveryTest do
     end
   end
 
-  defp ensure_distribution do
-    if Node.alive?() do
-      Node.set_cookie(:raft_ex)
-    else
-      unique = System.unique_integer([:positive])
-
-      case Node.start(:"raft_ex_discovery_#{unique}@127.0.0.1") do
-        {:ok, _pid} -> Node.set_cookie(:raft_ex)
-        {:error, _reason} -> :ok
-      end
-    end
-  end
+  defp ensure_distribution, do: Harness.ensure_distribution()
 
   # This peer is *visible* so that Distribution.cluster_nodes/0 sees it once
   # connected, which is what drives the topology-change branches.
-  defp start_peer do
-    unique = System.unique_integer([:positive])
-    name = :"raft_ex_npeer_#{unique}@127.0.0.1"
-    ctl = :"raft_ex_npeer_ctl_#{unique}"
-
-    port =
-      Port.open({:spawn_executable, System.find_executable("elixir")}, [
-        :binary,
-        :exit_status,
-        :hide,
-        args: [
-          "--name",
-          Atom.to_string(name),
-          "--cookie",
-          "raft_ex",
-          "-e",
-          "Process.register(self(), #{inspect(ctl)}); IO.puts(\"READY\"); " <>
-            "receive do :stop -> :ok after 30_000 -> :ok end"
-        ]
-      ])
-
-    await_ready(port)
-    %{name: name, ctl: ctl, port: port}
-  end
-
-  defp await_ready(port, acc \\ "") do
-    receive do
-      {^port, {:data, data}} ->
-        acc = acc <> data
-
-        if String.contains?(acc, "READY") do
-          :ok
-        else
-          await_ready(port, acc)
-        end
-
-      {^port, {:exit_status, status}} ->
-        raise "discovery peer exited before ready (status #{status}): #{acc}"
-    after
-      15_000 -> raise "discovery peer did not become ready: #{acc}"
-    end
-  end
-
-  defp stop_peer(%{name: name, ctl: ctl, port: port}) do
-    if Node.alive?() do
-      send({ctl, name}, :stop)
-      Node.disconnect(name)
-    end
-
-    try do
-      Port.close(port)
-    rescue
-      _ -> :ok
-    end
-  end
+  defp start_peer, do: Harness.start_peer("raft_ex_npeer")
+  defp stop_peer(peer), do: Harness.stop_peer(peer)
 
   defp state do
     %NodeDiscovery{
       seeds: [],
-      cookie: :raft_ex,
+      cookie: Harness.cookie(),
       discovery_interval: 60_000,
       cluster_name: :test_cluster,
       machine: self(),
@@ -104,7 +41,7 @@ defmodule RaftEx.Infra.Network.NodeDiscoveryTest do
         NodeDiscovery.start_link(
           name: name,
           seeds: [peer.name],
-          cookie: :raft_ex,
+          cookie: Harness.cookie(),
           discovery_interval: 60_000,
           cluster_name: :test_cluster,
           machine: self(),

@@ -180,13 +180,42 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
         Metrics.set({:replication_lag_ms, peer_id}, lag)
 
+        peer0 = Map.get(cluster0, peer_id, %{})
+        in_flight = Map.get(peer0, :in_flight, [])
+        acked0 = Map.get(peer0, :acked_in_flight, [])
+
+        acked =
+          if last_index in acked0, do: acked0, else: acked0 ++ [last_index]
+
+        {match_index, new_in_flight} =
+          if in_flight == [] do
+            {max(Map.get(peer0, :match_index, 0), last_index), []}
+          else
+            # Advance over contiguous acknowledged prefixes only.
+            m0 = Map.get(peer0, :match_index, 0)
+            {m, remaining} =
+              advance_contiguous(m0, in_flight, acked)
+
+            # Fallback when no exact in-flight match was found.
+            m =
+              if m == m0 and not Enum.any?(in_flight, fn {_p, l} -> l == last_index end) do
+                max(m0, last_index)
+              else
+                m
+              end
+
+            {m, remaining}
+          end
+
         cluster =
           Cluster.update_peer(
             peer_id,
             %{
-              match_index: last_index,
-              next_index: next_index,
-              status: :normal
+              match_index: match_index,
+              next_index: max(next_index || (match_index + 1), match_index + 1),
+              status: :normal,
+              in_flight: new_in_flight,
+              acked_in_flight: acked
             },
             cluster0
           )
@@ -236,7 +265,9 @@ defmodule RaftEx.Domain.Server.RpcHandler do
             peer_id,
             %{
               next_index: new_next_index,
-              status: :normal
+              status: :normal,
+              in_flight: [],
+              acked_in_flight: []
             },
             state.cluster
           )
@@ -279,6 +310,11 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       # Leader's term is behind - reject
       leader_term < current_term ->
         reply = build_install_snapshot_reply(current_term, state, 0, 0)
+
+        case snapshot_dir(state) do
+          dir -> File.rm(Path.join(dir, "snapshot.dat"))
+        end
+
         state = state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
         effects = [{:send_rpc, leader_id, reply}]
         {:follower, state, effects}
@@ -307,6 +343,16 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   defp handle_first_snapshot_chunk(meta, data, leader_id, state) do
     Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
+
+    # Close any in-flight partial transfer being superseded.
+    case Map.get(state, :snapshot_state) do
+      prev when is_tuple(prev) ->
+        fd = elem(prev, tuple_size(prev) - 1)
+        if is_port(fd) or is_pid(fd), do: :file.close(fd)
+
+      _ ->
+        :ok
+    end
 
     with :ok <- Filesystem.make_dir(snap_dir),
          {:ok, accept_state} <- LogSnapshot.begin_accept(snap_dir, meta),
@@ -593,50 +639,37 @@ defmodule RaftEx.Domain.Server.RpcHandler do
 
   defp append_entries([], _log, state), do: {state.log, []}
 
-  defp append_entries(entries, _log0, state) do
-    # Filter out entries we already have
-    {new_entries, state} =
-      Enum.reduce(entries, {[], state}, fn {idx, term, _cmd} = entry, {acc, st} ->
-        case Log.fetch_term(idx, st.log) do
-          {^term, _} ->
-            # Already have this entry with same term - skip
-            {acc, st}
+  defp append_entries(entries, log, _state) do
+    case first_missing_or_mismatched(entries, log) do
+      nil ->
+        # Every entry is already present with the same term.
+        {log, []}
 
-          _ ->
-            # Need to append this entry
-            # First, delete any conflicting entries after this index
-            log = truncate_log_from(st.log, idx)
-            st = %{st | log: log}
+      {idx, _, _} ->
+        # Everything from the first conflict onward is replaced. Truncate once,
+        # then write the surviving suffix in a single WAL batch.
+        log = Log.truncate(idx, log)
+        entries_to_write = Enum.drop_while(entries, fn {i, _, _} -> i < idx end)
 
-            # Append the entry
-            new_log = Log.append(entry, st.log)
-            st = %{st | log: new_log}
+        case Log.write(entries_to_write, log) do
+          {:ok, new_log} ->
+            effects = [{:ra_log_event, {:written, entries_to_write}}]
+            {new_log, effects}
 
-            {[entry | acc], st}
+          {:error, reason} ->
+            Logger.error("Failed to write log entries: #{inspect(reason)}")
+            {log, []}
         end
-      end)
-
-    # Write entries to log
-    if new_entries != [] do
-      entries_to_write = Enum.reverse(new_entries)
-
-      case Log.write(entries_to_write, state.log) do
-        {:ok, new_log} ->
-          _state = %{state | log: new_log}
-          effects = [{:ra_log_event, {:written, entries_to_write}}]
-          {new_log, effects}
-
-        {:error, reason} ->
-          Logger.error("Failed to write log entries: #{inspect(reason)}")
-          {state.log, []}
-      end
-    else
-      {state.log, []}
     end
   end
 
-  defp truncate_log_from(log, from_index) do
-    Log.truncate(from_index, log)
+  defp first_missing_or_mismatched(entries, log) do
+    Enum.find(entries, fn {idx, term, _cmd} ->
+      case Log.fetch_term(idx, log) do
+        {^term, _} -> false
+        _ -> true
+      end
+    end)
   end
 
   defp update_commit_index(leader_commit, %{log: log, commit_index: commit_index} = state) do
@@ -681,6 +714,23 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     {last_index, _} = Log.last_index_term(log)
     next_index = last_index + 1
     {next_index, state}
+  end
+
+  defp advance_contiguous(match_index, in_flight, acked) do
+    advance_contiguous(match_index, in_flight, acked, in_flight)
+  end
+
+  defp advance_contiguous(match_index, [], _acked, _orig), do: {match_index, []}
+
+  defp advance_contiguous(match_index, in_flight, acked, _orig) do
+    case Enum.find(in_flight, fn {p, l} -> p == match_index and l in acked end) do
+      nil ->
+        {match_index, in_flight}
+
+      {p, l} ->
+        remaining = List.delete(in_flight, {p, l})
+        advance_contiguous(l, remaining, acked, remaining)
+    end
   end
 
   defp update_term(state, new_term) do

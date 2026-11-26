@@ -103,18 +103,33 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
         "#{:ets.info(tbl_name, :size)} record(s)"
     )
 
-    {:ok, %{table: tbl_name, ets_table: tbl_name}}
+    {:ok, %{table: tbl_name, ets_table: tbl_name, pending_sync: [], sync_scheduled?: false}}
   end
 
   @impl GenServer
-  def handle_call({:store, uid, key, value}, _from, %{table: tbl} = state) do
-    write_meta(tbl, uid, key, value, _sync = true)
-    {:reply, :ok, state}
+  def handle_call({:store, uid, key, value}, from, %{table: tbl} = state) do
+    row =
+      case :ets.lookup(tbl, uid) do
+        [] -> {uid, nil, nil, nil}
+        [r] -> r
+      end
+
+    updated = set_field(key, value, row)
+    :ets.insert(tbl, updated)
+    :dets.insert(tbl, updated)
+
+    state = %{state | pending_sync: [{from} | state.pending_sync]}
+    state = schedule_sync(state)
+    {:noreply, state}
   end
 
-  def handle_call({:delete, uid}, _from, %{table: tbl} = state) do
-    delete_uid(tbl, uid, _sync = true)
-    {:reply, :ok, state}
+  def handle_call({:delete, uid}, from, %{table: tbl} = state) do
+    :dets.delete(tbl, uid)
+    :ets.delete(tbl, uid)
+
+    state = %{state | pending_sync: [{from} | state.pending_sync]}
+    state = schedule_sync(state)
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -129,16 +144,35 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
   end
 
   @impl GenServer
-  def terminate(_reason, %{table: tbl, ets_table: ets_tbl}) do
+  def handle_info(:sync_commit, %{table: tbl} = state) do
     :dets.sync(tbl)
-    :dets.close(tbl)
-    # Clean up ETS table to prevent resource leak
-    :ets.delete(ets_tbl)
+
+    Enum.each(state.pending_sync, fn
+      {from} -> GenServer.reply(from, :ok)
+    end)
+
+    {:noreply, %{state | pending_sync: [], sync_scheduled?: false}}
   end
 
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
+  defp schedule_sync(%{sync_scheduled?: true} = state), do: state
+
+  defp schedule_sync(state) do
+    send(self(), :sync_commit)
+    %{state | sync_scheduled?: true}
+  end
+
+  @impl GenServer
+  def terminate(_reason, %{table: tbl, ets_table: ets_tbl, pending_sync: pending}) do
+    if pending != [] do
+      :dets.sync(tbl)
+      Enum.each(pending, fn {from} -> GenServer.reply(from, :ok) end)
+    end
+
+    :dets.sync(tbl)
+    :dets.close(tbl)
+    :ets.delete(ets_tbl)
+    :ok
+  end
 
   defp write_meta(tbl, uid, key, value, sync) do
     current =

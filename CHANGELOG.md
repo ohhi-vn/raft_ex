@@ -5,10 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.0] - 2026-11-26
+
+### Added
+- **Pipelined AppendEntries**: leader now tracks in-flight AppendEntries per follower, handles out-of-order acknowledgements, applies bounded backpressure, and processes deferred `:pipeline_rpcs` events.
+- **Expanded test coverage**: the suite now exceeds 1,100 tests, including a generated decision-table suite for election/quorum, range and sequence boundaries, a distributed suite covering partitions, leader changes and node joins/removals across real BEAM peers, and focused coverage for `Cluster`, `Distribution`, `Counters`, `MetricNames`, `Metrics`, `SharedWal` and the public `RaftEx.Observability` API. Overall line coverage is ~94%; `Counters`, `MetricNames` and `RaftEx.Observability` are at 100%.
+
+### Changed
+- **Performance**: optimized WAL append/recovery (reversed buffer, group commit, single serialization, linear recovery), `Log.fold/6` range lookups, batched mem-table inserts, `Log.truncate/2` via `Map.drop/2`, batched `RpcHandler.append_entries/3`, atomic metrics counters, group-committed `LogMeta`, lazy segment loading, and reversed segment index accumulator.
+- **Benchmarks**: added a dependency-free benchmark suite (`scripts/bench.exs`, `bench/`) with JSON output, `--record`/`--compare`/`--threshold`, and `docs/performance.md` with before/after numbers.
+
+### Fixed
+- **RPC error mapping**: `RaftEx.App.ServerRuntime.safe_call/3` now converts `:erpc` exceptions such as `{:erpc, :noconnection}` into `{:error, reason}` instead of letting a bare `ErlangError` escape to callers.
+- **Cluster formation and joins**: `Cluster.form_cluster/4` no longer waits for local servers before starting them, removing a timeout that only passed when leftovers from earlier tests were still running. `Cluster.join_cluster/5` treats a missing seed server as a fresh cluster and no longer fails when the joining node hosts no servers.
+- **Distribution handshake**: cookie changes are no longer applied to an already-running node (which broke EPMD handshakes for later peers), and network test helpers now adapt peer names to short/long-name mode so `--sname` distributed runs work.
+
 ## [0.5.1]
 
 ### Fixed
-- **Distributed vote correlation**: `RaftEx.App.ServerRuntime.handle_vote_reply/3` and `handle_pre_vote_reply/3` now resolve the peer id from the sender pid when no local tracking entry exists (remote peers), instead of using `nil`. Stale replies whose term no longer matches are ignored instead of falling through to a non-matching clause. This prevents remote votes from being collapsed into a single `nil` voter and stops term-escalation livelocks in multi-node clusters.
+- **Distributed vote correlation**: `RaftEx.Domain.Server.Election.handle_vote_reply/4` and `handle_pre_vote_reply/4` now resolve the peer id from the sender pid when no local tracking entry exists (remote peers), instead of using `nil`. Stale replies whose term no longer matches are ignored instead of falling through to a non-matching clause. This prevents remote votes from being collapsed into a single `nil` voter and stops term-escalation livelocks in multi-node clusters.
 
 ## [0.5.0] - 2026-11-26
 
@@ -134,7 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.0.1] - Initial Release
 
 ### Features
-- Initial experimental Elixir port of RabbitMQ RA Raft consensus algorithm
+- Initial experimental Elixir Raft consensus algorithm
 - Leader election with pre-vote support
 - Write-ahead log (WAL) with batched writes
 - Log replication and snapshotting

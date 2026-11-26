@@ -1,7 +1,7 @@
 defmodule RaftEx.Infra.Persistence.LogTest do
   use ExUnit.Case, async: true
 
-  alias RaftEx.Infra.Persistence.{Log, LogMeta, LogSnapshot}
+  alias RaftEx.Infra.Persistence.{Log, LogMeta, LogSnapshot, LogWal}
 
   defmodule FailingWal do
     use GenServer
@@ -134,6 +134,40 @@ defmodule RaftEx.Infra.Persistence.LogTest do
       assert truncated.range == {1, 1}
     end
 
+    test "truncate drops the conflicting suffix and clears the mem table" do
+      table = :"truncate_mem_#{System.unique_integer([:positive])}"
+      :ets.new(table, [:set, :named_table, :public])
+      :ets.insert(table, [{1, 1, :a}, {2, 2, :b}, {3, 3, :c}])
+
+      state = %{
+        log([{1, 1, :a}, {2, 2, :b}, {3, 3, :c}])
+        | mem_table: table,
+          cfg: %{uid: "truncate_conflict"},
+          wal_name: :"missing_wal_#{System.unique_integer([:positive])}"
+      }
+
+      truncated = Log.truncate(2, state)
+
+      assert Map.keys(truncated.entries) == [1]
+      assert truncated.range == {1, 1}
+      assert truncated.last_term == 1
+      assert truncated.last_written_index_term == {1, 1}
+      assert truncated.next_index == 2
+      assert :ets.tab2list(table) == [{1, 1, :a}]
+
+      :ets.delete(table)
+    end
+
+    test "truncate probes past gaps in a sparse log" do
+      state = log([{1, 1, :a}, {5, 5, :e}])
+
+      truncated = Log.truncate(3, state)
+
+      assert Map.keys(truncated.entries) == [1]
+      assert truncated.range == {1, 1}
+      assert truncated.last_term == 1
+    end
+
     test "can_write?, has_pending? and overview" do
       state = log()
       assert Log.can_write?(state)
@@ -166,6 +200,29 @@ defmodule RaftEx.Infra.Persistence.LogTest do
       assert updated.next_index == 2
     end
 
+    test "write batches the mem-table insert and merges entries in one pass" do
+      table = :"write_mem_#{System.unique_integer([:positive])}"
+      :ets.new(table, [:set, :named_table, :public])
+
+      state = %{
+        log([{1, 1, :a}])
+        | mem_table: table,
+          cfg: %{uid: "batch_write"},
+          wal_name: nil
+      }
+
+      assert {:ok, updated} = Log.write([{2, 2, :b}, {3, 3, :c}], state)
+
+      assert updated.entries |> Map.keys() |> Enum.sort() == [1, 2, 3]
+      assert updated.range == {1, 3}
+      assert updated.last_term == 3
+      assert updated.last_written_index_term == {3, 3}
+      assert updated.next_index == 4
+      assert :ets.tab2list(table) |> Enum.sort() == [{2, 2, :b}, {3, 3, :c}]
+
+      :ets.delete(table)
+    end
+
     test "fold reads an inclusive range" do
       state = log([{1, 2, :one}, {2, 2, :two}, {3, 2, :three}])
 
@@ -176,6 +233,36 @@ defmodule RaftEx.Infra.Persistence.LogTest do
     test "fold outside the range is a no-op" do
       state = log([{1, 2, :one}])
       assert Log.fold(5, 7, fn e, a -> [e | a] end, [], state) == {[], state}
+    end
+
+    test "fold reads a dense range by probing indexes" do
+      entries = Enum.map(1..100, fn idx -> {idx, 1, {:cmd, idx}} end)
+      state = log(entries)
+
+      {folded, _} =
+        Log.fold(40, 42, fn e, a -> [e | a] end, [], state)
+
+      assert Enum.reverse(folded) == [
+               {40, 1, {:cmd, 40}},
+               {41, 1, {:cmd, 41}},
+               {42, 1, {:cmd, 42}}
+             ]
+    end
+
+    test "fold skips gaps in a sparse log" do
+      state = log([{1, 1, :a}, {3, 1, :c}, {10, 1, :j}])
+
+      {folded, _} = Log.fold(1, 10, fn e, a -> [e | a] end, [], state)
+
+      assert Enum.reverse(folded) == [{1, 1, :a}, {3, 1, :c}, {10, 1, :j}]
+    end
+
+    test "fold handles a range larger than the log" do
+      state = log([{1, 1, :a}, {2, 1, :b}])
+
+      {folded, _} = Log.fold(1, 1_000_000, fn e, a -> [e | a] end, [], state)
+
+      assert Enum.reverse(folded) == [{1, 1, :a}, {2, 1, :b}]
     end
 
     test "sparse_read returns only present indexes" do
@@ -263,6 +350,31 @@ defmodule RaftEx.Infra.Persistence.LogTest do
       assert state.range == {4, 4}
       assert state.next_index == 5
       assert state.snapshot_state == :snap_state
+      Log.close(state)
+    end
+
+    test "init takes the last term from the highest WAL index" do
+      uid = "log_init_wal_term_#{System.unique_integer([:positive])}"
+      data_dir = RaftEx.TestSupport.tmp_dir("log_init_wal_term")
+      meta_name = start_meta(data_dir)
+      wal_name = :"log_init_wal_#{System.unique_integer([:positive])}"
+
+      start_supervised!(%{
+        id: wal_name,
+        start:
+          {LogWal, :start_link,
+           [%{names: %{wal: wal_name}, data_dir: data_dir, wal_compute_checksums: true}]}
+      })
+
+      entries = [{1, 2, :a}, {2, 5, :b}, {3, 9, :c}]
+      assert {:ok, 1, 3} = LogWal.append(wal_name, uid, entries)
+
+      state = Log.init(init_config(uid, data_dir, meta_name))
+
+      assert state.last_term == 9
+      assert state.range == {1, 3}
+      assert state.next_index == 4
+      assert state.entries[3] == {3, 9, :c}
       Log.close(state)
     end
 

@@ -11,6 +11,7 @@ defmodule RaftEx.App.ServerRuntime do
 
   alias RaftEx.Domain.LeakyIntegrator
   alias RaftEx.Domain.Server
+  alias RaftEx.Domain.Server.Cluster
   alias RaftEx.Domain.Server.Election
   alias RaftEx.Domain.Utils
   alias RaftEx.Infra.Network.Transport
@@ -188,6 +189,17 @@ defmodule RaftEx.App.ServerRuntime do
 
   def leader({:call, from}, :trigger_election, state) do
     {:keep_state, state, [{:reply, from, {:error, :already_leader}}]}
+  end
+
+  def leader(:info, :pipeline_rpcs, state0) do
+    {state1, rpc_effs} = make_rpcs(state0)
+
+    if rpc_effs == [] do
+      {:keep_state, state1, []}
+    else
+      {state2, actions} = handle_effects(:leader, rpc_effs, :cast, state1)
+      {:keep_state, state2, actions}
+    end
   end
 
   def leader(:info, {:send_snapshot_chunk, peer_id}, state0) do
@@ -594,6 +606,8 @@ defmodule RaftEx.App.ServerRuntime do
       {:badrpc, reason} -> {:error, reason}
       reply -> reply
     end
+  rescue
+    error -> {:error, rpc_error_reason(error)}
   catch
     :exit, {:timeout, _} -> :timeout
     :exit, {:noproc, _} -> {:error, :noproc}
@@ -604,6 +618,8 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp safe_call(server_id, msg, timeout) do
     :gen_statem.call(server_id, msg, timeout)
+  rescue
+    error -> {:error, rpc_error_reason(error)}
   catch
     :exit, {:timeout, _} -> :timeout
     :exit, {:noproc, _} -> {:error, :noproc}
@@ -611,6 +627,13 @@ defmodule RaftEx.App.ServerRuntime do
     :exit, {:shutdown, _} -> {:error, :shutdown}
     :exit, {reason, _} -> {:error, reason}
   end
+
+  # :erpc raises (rather than exits) for some transport failures, e.g.
+  # {:erpc, :noconnection}. Map them onto the same error shape as the exit
+  # clauses above so callers never see a bare ErlangError.
+  defp rpc_error_reason(%ErlangError{original: {:erpc, reason}}), do: reason
+  defp rpc_error_reason(%ErlangError{original: reason}), do: reason
+  defp rpc_error_reason(_error), do: :bad_rpc
 
   defp do_init(%{id: id, cluster_name: cluster_name} = config) do
     key = Utils.ra_server_id_to_local_name(id)
@@ -873,7 +896,12 @@ defmodule RaftEx.App.ServerRuntime do
               term: term
             }
 
-            state = Map.put(state0, :snapshot_sends, Map.put(sends, peer_id, send_state))
+            state =
+              state0
+              |> Map.put(:snapshot_sends, Map.put(sends, peer_id, send_state))
+
+            state = update_peer_status(state, peer_id, {:sending_snapshot, self(), 0})
+
             send_next_snapshot_chunk(peer_id, send_state, state, actions)
 
           _err ->
@@ -884,7 +912,9 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp handle_effect(:leader, {:clear_snapshot_send, peer_id}, _, state0, actions) do
     sends = Map.delete(Map.get(state0, :snapshot_sends, %{}), peer_id)
-    {Map.put(state0, :snapshot_sends, sends), actions}
+    state = Map.put(state0, :snapshot_sends, sends)
+    state = update_peer_status(state, peer_id, :normal)
+    {state, actions}
   end
 
   defp handle_effect(
@@ -1023,7 +1053,9 @@ defmodule RaftEx.App.ServerRuntime do
 
       {:error, _reason} ->
         sends = Map.delete(Map.get(state0, :snapshot_sends, %{}), peer_id)
-        {Map.put(state0, :snapshot_sends, sends), actions}
+        state = Map.put(state0, :snapshot_sends, sends)
+        state = update_peer_status(state, peer_id, :normal)
+        {state, actions}
     end
   end
 
@@ -1047,6 +1079,17 @@ defmodule RaftEx.App.ServerRuntime do
 
   defp snapshot_dir(_state) do
     Path.join(System.tmp_dir!(), "raft_ex_snapshot")
+  end
+
+  defp update_peer_status(state, peer_id, status) do
+    ss = state.server_state
+
+    if is_map(ss.cluster) and Map.has_key?(ss.cluster, peer_id) do
+      new_ss = %{ss | cluster: Cluster.update_peer(peer_id, %{status: status}, ss.cluster)}
+      %{state | server_state: new_ss}
+    else
+      state
+    end
   end
 
   defp meta_name_from_sc(%{names: %{log_meta: name}}), do: name

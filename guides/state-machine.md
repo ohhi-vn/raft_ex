@@ -1,6 +1,7 @@
 # State Machines
 
-Implement the `RaftEx.Domain.Machine` behaviour to define your replicated state machine.
+Implement the `RaftEx.Domain.Machine` behaviour to define your replicated
+state machine.
 
 ## Required callbacks
 
@@ -10,8 +11,11 @@ Implement the `RaftEx.Domain.Machine` behaviour to define your replicated state 
 
 ## Auxiliary commands
 
-Use `aux_command/2` for read-only or side-effecting operations that don't go through consensus.
+Use `aux_command/2` for read-only or side-effecting operations that don't
+go through consensus.
 
 ## Versioning
 
-State machines are versioned; RaftEx tracks `machine_version` for compatibility during upgrades.
+State machines are versioned; RaftEx tracks `machine_version` for
+compatibility during upgrades. Use `noop` entries to ship a new machine
+version without changing application state.

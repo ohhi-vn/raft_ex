@@ -14,6 +14,36 @@ defmodule RaftEx.Infra.Observability.MetricsTest do
     assert Metrics.get(:foo) == 5
   end
 
+  test "concurrent increments are exact" do
+    Metrics.reset()
+
+    tasks =
+      for _ <- 1..100 do
+        Task.async(fn ->
+          for _ <- 1..100, do: Metrics.inc(:concurrent_counter)
+        end)
+      end
+
+    Task.await_many(tasks, :infinity)
+    assert Metrics.get(:concurrent_counter) == 10_000
+  end
+
+  test "concurrent observations keep exact count and sum" do
+    Metrics.reset()
+
+    tasks =
+      for _ <- 1..50 do
+        Task.async(fn ->
+          for i <- 1..20, do: Metrics.observe(:concurrent_hist, i)
+        end)
+      end
+
+    Task.await_many(tasks, :infinity)
+    h = Metrics.get(:concurrent_hist)
+    assert h.count == 1_000
+    assert h.sum == 50 * (20 * 21 / 2)
+  end
+
   test "gauge sets" do
     Metrics.set(:bar, 3.5)
     assert Metrics.all()[{:gauge, :bar}] == 3.5

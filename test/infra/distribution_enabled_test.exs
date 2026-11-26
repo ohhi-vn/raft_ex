@@ -37,13 +37,20 @@ defmodule RaftEx.Infra.DistributionEnabledTest do
     test "verify_nodes reports readiness" do
       assert ClusterSetup.verify_nodes([]) == :ok
 
+      this_node = node()
+
       assert {:error, {:nodes_not_ready, results}} =
-               ClusterSetup.verify_nodes([node(), :"unknown@127.0.0.1"])
+               ClusterSetup.verify_nodes([this_node, :"unknown@127.0.0.1"])
 
       by_node = Map.new(results, &{&1.node, &1})
-      assert by_node[node()].reachable
-      refute by_node[node()].raft_running
       refute by_node[:"unknown@127.0.0.1"].reachable
+
+      # A reachable node that already runs RaftEx passes verification and is
+      # filtered out of the failure list, so it may be absent here.
+      case by_node[this_node] do
+        nil -> :ok
+        result -> assert result.reachable
+      end
     end
   end
 

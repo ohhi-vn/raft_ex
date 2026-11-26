@@ -12,6 +12,7 @@ defmodule RaftEx.Infra.Persistence.LogMetaTest do
     )
 
     Process.put(:log_meta_test_name, name)
+    Process.put(:log_meta_test_dir, data_dir)
     :ok
   end
 
@@ -26,6 +27,49 @@ defmodule RaftEx.Infra.Persistence.LogMetaTest do
     assert LogMeta.fetch(name, uid, :current_term) == 2
     assert LogMeta.fetch(name, uid, :voted_for) == {:server1, node()}
     assert LogMeta.fetch(name, uid, :last_applied) == 5
+  end
+
+  test "concurrent store_sync callers all persist their values" do
+    name = name()
+    uids = Enum.map(1..20, &"concurrent-uid-#{&1}")
+
+    tasks =
+      Enum.map(uids, fn uid ->
+        Task.async(fn ->
+          assert :ok = LogMeta.store_sync(name, uid, :current_term, 7)
+          assert :ok = LogMeta.store_sync(name, uid, :last_applied, 9)
+        end)
+      end)
+
+    Task.await_many(tasks, :infinity)
+
+    for uid <- uids do
+      assert LogMeta.fetch(name, uid, :current_term) == 7
+      assert LogMeta.fetch(name, uid, :last_applied) == 9
+    end
+  end
+
+  test "persisted values survive a restart" do
+    name = name()
+    dir = Process.get(:log_meta_test_dir)
+    uid = "restart-uid"
+
+    assert :ok = LogMeta.store_sync(name, uid, :current_term, 11)
+    assert :ok = LogMeta.store_sync(name, uid, :voted_for, {:leader, node()})
+
+    :ok = stop_supervised(LogMeta)
+
+    # Reopen the same data directory under a fresh process name.
+    new_name = :"log_meta_reopened_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {LogMeta, %{name: :log_meta_reopened, names: %{log_meta: new_name}, data_dir: dir}}
+    )
+
+    assert LogMeta.fetch(new_name, uid, :current_term) == 11
+    assert LogMeta.fetch(new_name, uid, :voted_for) == {:leader, node()}
+
+    :ok = stop_supervised(LogMeta)
   end
 
   test "fetch with a default" do

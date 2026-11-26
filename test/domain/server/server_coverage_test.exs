@@ -310,11 +310,15 @@ defmodule RaftEx.Domain.ServerCoverageTest do
 
     test "install-snapshot result from a known peer updates match indexes" do
       reply = %Types.InstallSnapshotResult{term: 2, last_index: 5, last_term: 2}
-      s = %{state() | rpc_from: @peer2}
+      cluster = default_cluster()
+      peer = %{cluster[@peer2] | status: {:sending_snapshot, self(), 0}}
+      cluster = Map.put(cluster, @peer2, peer)
+      s = %{state() | rpc_from: @peer2, cluster: cluster}
 
       assert {:leader, new_state, effects} = Server.handle_leader(reply, s)
       assert new_state.cluster[@peer2].match_index == 5
       assert new_state.cluster[@peer2].next_index == 6
+      assert new_state.cluster[@peer2].status == :normal
       assert {:clear_snapshot_send, @peer2} in effects
       assert {:next_event, :info, :pipeline_rpcs} in effects
     end
@@ -837,6 +841,16 @@ defmodule RaftEx.Domain.ServerCoverageTest do
       assert [{:send_rpc, @peer2, %Types.AppendEntriesRpc{} = rpc}] = effects
       assert rpc.prev_log_index == 5
       assert rpc.prev_log_term == 2
+    end
+
+    test "AppendEntries payload contains exactly the requested batch" do
+      l = log([{1, 1, :a}, {2, 1, :b}, {3, 1, :c}])
+      cluster = Map.put(default_cluster(), @peer2, %{default_cluster()[@peer2] | next_index: 2})
+
+      {_state, effects} = Server.make_rpcs(state(log: l, cluster: cluster))
+
+      assert [{:send_rpc, @peer2, %Types.AppendEntriesRpc{} = rpc}] = effects
+      assert rpc.entries == [{2, 1, :b}]
     end
   end
 

@@ -101,3 +101,121 @@ The leader SHALL include its commit index in periodic heartbeats and a follower 
 - **GIVEN** a follower that has replicated entries but has not applied them
 - **WHEN** it receives a heartbeat with a higher commit index
 - **THEN** it applies the newly committed entries without waiting for another AppendEntries payload
+
+### Requirement: Batch-proportional replication work
+
+Replication SHALL read only the entries in the requested AppendEntries range, SHALL write the acceptable entries of one AppendEntries request in a single WAL write, and SHALL apply only the newly committed index range.
+
+#### Scenario: Leader reads only the batch
+
+- **GIVEN** a leader with 10,000 log entries and a follower that needs entries 9,001 through 9,010
+- **WHEN** the leader builds the AppendEntries request
+- **THEN** it reads ten entries and sends those ten entries
+
+#### Scenario: Follower writes one batch
+
+- **GIVEN** a follower receiving ten acceptable entries in one AppendEntries request
+- **WHEN** it appends them
+- **THEN** it performs one WAL write for the ten entries
+
+#### Scenario: Apply only new commits
+
+- **GIVEN** a server with `last_applied` 500 and a new commit index of 550
+- **WHEN** it applies committed entries
+- **THEN** it applies indexes 501 through 550 only
+
+### Requirement: Monotonic hot-path cost
+
+The cost of appending one entry, reading one replication batch, and applying one committed batch SHALL NOT grow with the total number of entries already in the log.
+
+#### Scenario: Append cost is independent of log size
+
+- **GIVEN** a log holding 1,000 entries and a log holding 100,000 entries
+- **WHEN** one entry is appended to each
+- **THEN** the append performs a constant number of index and buffer operations in both cases
+
+#### Scenario: Apply cost follows the batch
+
+- **GIVEN** a server applying a batch of 100 entries at log index 50,000
+- **WHEN** it applies the batch
+- **THEN** the work is proportional to 100 entries, not to 50,000
+
+### Requirement: Bounded in-flight AppendEntries
+
+The leader SHALL limit the number of unacknowledged AppendEntries requests in flight to a single follower to a configured pipeline depth, and SHALL NOT send a new request while that follower's in-flight count is at the limit.
+
+#### Scenario: Request sent within depth
+
+- **GIVEN** a follower with zero in-flight requests and a pipeline depth of 3
+- **WHEN** the leader has entries to replicate
+- **THEN** the leader sends an AppendEntries request and records it as in-flight
+
+#### Scenario: Limit reached
+
+- **GIVEN** a follower with 3 in-flight requests and a pipeline depth of 3
+- **WHEN** the leader has additional entries to replicate
+- **THEN** the leader does not send another request until an acknowledgement arrives
+
+### Requirement: Out-of-order acknowledgement handling
+
+The leader SHALL accept AppendEntries replies that arrive out of order, and SHALL advance a follower's match index only when a contiguous prefix of entries has been acknowledged by that follower.
+
+#### Scenario: Later reply arrives first
+
+- **GIVEN** two in-flight requests covering entries 1-5 and 6-10
+- **WHEN** the reply for the second request arrives before the first
+- **THEN** the leader records the second as acknowledged but does not advance match index past 5 until the first reply arrives
+
+#### Scenario: Contiguous prefix advances match index
+
+- **GIVEN** acknowledgements for entries 1-5 and 6-10 have both arrived
+- **WHEN** the leader processes the acknowledgements
+- **THEN** match index advances to 10
+
+### Requirement: Rejection handling without blocking
+
+When an in-flight AppendEntries request is rejected, the leader SHALL reduce the follower's next index using the reply's hint or by one, SHALL mark that request as resolved, and SHALL retry replication for the follower without waiting for the remaining in-flight requests to complete.
+
+#### Scenario: Rejection frees the slot
+
+- **GIVEN** a follower with 2 in-flight requests where one is rejected
+- **WHEN** the rejection is processed
+- **THEN** the in-flight count decreases and a new request may be sent
+
+#### Scenario: Retry after rejection
+
+- **GIVEN** a rejected request with a next-index hint of 6
+- **WHEN** the leader retries replication
+- **THEN** it sends entries starting at index 6
+
+### Requirement: Backpressure under slow follower
+
+When a follower's in-flight queue is full, the leader SHALL skip sending to that follower, SHALL record a `replication_backpressure` metric, and SHALL retry on the next tick or acknowledgement instead of blocking or growing unbounded memory.
+
+#### Scenario: Skip and metric
+
+- **GIVEN** a follower whose in-flight queue is full
+- **WHEN** the leader attempts to replicate
+- **THEN** no request is sent to that follower and the `replication_backpressure` counter is incremented
+
+#### Scenario: Retry later
+
+- **GIVEN** a follower that was skipped due to backpressure
+- **WHEN** an acknowledgement arrives and frees a slot
+- **THEN** the leader sends the pending entries
+
+### Requirement: Adaptive batch sizing
+
+The leader SHALL size each AppendEntries batch for a follower based on the follower's lag and the available pipeline capacity, so that a follower with more available capacity receives a larger batch and a follower at the limit receives a batch of at least one entry.
+
+#### Scenario: Larger batch for lagging follower with capacity
+
+- **GIVEN** a follower lagging by 100 entries with 3 of 3 slots free
+- **WHEN** the leader builds a request
+- **THEN** the batch size is greater than the minimum of one
+
+#### Scenario: Minimum batch at limit
+
+- **GIVEN** a follower with zero free pipeline slots
+- **WHEN** a slot frees and the leader builds a request
+- **THEN** the batch contains at least one entry

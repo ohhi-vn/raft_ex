@@ -29,7 +29,7 @@ defmodule RaftEx.App.Cluster do
           {:ok, [RaftEx.Domain.Types.server_id()]} | {:error, term()}
   def form_cluster(cluster_name, machine, nodes, opts \\ []) do
     system = Keyword.get(opts, :system, :default)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = Keyword.get(opts, :timeout, 15_000)
     seed_node = Keyword.get(opts, :seed_node, hd(Enum.sort(nodes)))
 
     server_ids = Distribution.build_server_ids(nodes)
@@ -50,28 +50,87 @@ defmodule RaftEx.App.Cluster do
           {:ok, [RaftEx.Domain.Types.server_id()]} | {:error, term()}
   def join_cluster(cluster_name, machine, all_nodes, seed_node, opts \\ []) do
     system = Keyword.get(opts, :system, :default)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = Keyword.get(opts, :timeout, 15_000)
 
     ensure_distribution_started!()
 
     server_ids = Distribution.build_server_ids(all_nodes)
     local_servers = Enum.filter(server_ids, fn {_, n} -> n == node() end)
 
-    for sid <- local_servers do
-      RaftEx.start_server(system, cluster_name, sid, machine, server_ids)
+    # Nothing to start or add locally: joining from a node that hosts no
+    # servers is a no-op, even when the seed node is not reachable.
+    if local_servers == [] do
+      Logger.warning("RaftEx.App.Cluster: no local servers to join cluster")
+      {:ok, []}
+    else
+      do_join(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout)
     end
+  end
 
-    :timer.sleep(200)
-
+  defp do_join(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout) do
     seed_leader = find_any_server_on(seed_node, server_ids)
 
-    if seed_leader == nil do
-      Logger.warning("RaftEx.App.Cluster: no server found on seed node #{inspect(seed_node)}")
+    # Verify the seed is reachable before starting anything locally.
+    if seed_leader != nil and not server_reachable?(seed_leader) do
+      Logger.warning("RaftEx.App.Cluster: seed unreachable #{inspect(seed_node)}")
+      {:error, :seed_unreachable}
     else
-      add_local_members(seed_leader, local_servers, timeout)
-    end
+      for sid <- local_servers do
+        RaftEx.start_server(system, cluster_name, sid, machine, server_ids)
+      end
 
-    {:ok, local_servers}
+      :timer.sleep(200)
+
+      if seed_leader == nil do
+        Logger.warning("RaftEx.App.Cluster: no server found on seed node #{inspect(seed_node)}")
+        {:ok, local_servers}
+      else
+        add_local_members(seed_leader, local_servers, timeout)
+        wait_for_membership(seed_leader, local_servers, timeout)
+        {:ok, local_servers}
+      end
+    end
+  end
+
+  defp server_reachable?(server_id) do
+    case RaftEx.ping(server_id, 2_000) do
+      {:pong, _} ->
+        true
+
+      # The node is up but nobody has started the seed server yet. That is the
+      # normal case when joining a brand-new single-node cluster, so let the
+      # join proceed and start the local servers below.
+      {:error, :noproc} ->
+        true
+
+      other ->
+        Logger.warning("RaftEx.App.Cluster: seed ping #{inspect(server_id)} -> #{inspect(other)}")
+        false
+    end
+  end
+
+  defp wait_for_membership(_seed_leader, [], _timeout), do: :ok
+
+  defp wait_for_membership(seed_leader, local_servers, timeout) when timeout <= 0 do
+    _ = seed_leader
+    _ = local_servers
+    :ok
+  end
+
+  defp wait_for_membership(seed_leader, local_servers, timeout) do
+    case RaftEx.members(seed_leader, 2_000) do
+      {:ok, members, _leader} ->
+        if Enum.all?(local_servers, &(&1 in members)) do
+          :ok
+        else
+          Process.sleep(200)
+          wait_for_membership(seed_leader, local_servers, timeout - 200)
+        end
+
+      _ ->
+        Process.sleep(200)
+        wait_for_membership(seed_leader, local_servers, timeout - 200)
+    end
   end
 
   defp add_local_members(seed_leader, local_servers, timeout) do
@@ -145,10 +204,20 @@ defmodule RaftEx.App.Cluster do
 
   defp add_missing_member(system, cluster_name, machine, new_id, local_id, server_ids) do
     case RaftEx.add_member(local_id, new_id, 5_000) do
+      {:ok, {:error, :already_member}, leader} ->
+        Logger.info(
+          "RaftEx.App.Cluster: #{inspect(new_id)} already a member, leader: #{inspect(leader)}"
+        )
+
+        if leader, do: Leaderboard.record(cluster_name, leader, server_ids)
+
       {:ok, _, leader} ->
         Logger.info("RaftEx.App.Cluster: added #{inspect(new_id)}, leader: #{inspect(leader)}")
 
-        Leaderboard.record(cluster_name, leader, server_ids)
+        if leader, do: Leaderboard.record(cluster_name, leader, server_ids)
+
+      {:error, :already_member} ->
+        Logger.info("RaftEx.App.Cluster: #{inspect(new_id)} already a member")
 
       {:timeout, _} ->
         Logger.warning("RaftEx.App.Cluster: timeout adding #{inspect(new_id)}")
@@ -206,50 +275,119 @@ defmodule RaftEx.App.Cluster do
 
   defp do_form(system, cluster_name, machine, all_server_ids, local_servers, _seed_node, timeout) do
     if hd(all_server_ids) in local_servers do
-      seed_id = hd(all_server_ids)
-
-      case RaftEx.start_server(system, cluster_name, seed_id, machine, all_server_ids) do
-        :ok ->
-          try do
-            RaftEx.trigger_election(seed_id, timeout)
-          catch
-            :exit, {:timeout, _} ->
-              {:error, {:timeout, seed_id}}
-          else
-            :ok ->
-              for sid <- tl(local_servers) do
-                RaftEx.start_server(system, cluster_name, sid, machine, all_server_ids)
-              end
-
-              wait_for_leader(cluster_name, timeout)
-
-              {:ok, local_servers}
-          end
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      form_on_seed_host(system, cluster_name, machine, all_server_ids, local_servers, timeout)
     else
-      for sid <- local_servers do
+      Enum.each(local_servers, fn sid ->
         RaftEx.start_server(system, cluster_name, sid, machine, all_server_ids)
-      end
+      end)
 
       {:ok, local_servers}
     end
   end
 
-  defp wait_for_leader(_cluster_name, timeout) when timeout <= 0 do
+  defp form_on_seed_host(system, cluster_name, machine, all_server_ids, local_servers, timeout) do
+    seed_id = hd(all_server_ids)
+
+    case RaftEx.start_server(system, cluster_name, seed_id, machine, all_server_ids) do
+      {:error, reason} ->
+        {:error, reason}
+
+      :ok ->
+        form_seed_after_start(
+          system,
+          cluster_name,
+          machine,
+          all_server_ids,
+          local_servers,
+          timeout,
+          seed_id
+        )
+    end
+  end
+
+  defp form_seed_after_start(
+         system,
+         cluster_name,
+         machine,
+         all_server_ids,
+         local_servers,
+         timeout,
+         seed_id
+       ) do
+    # Only the seed is started at this point. Waiting for every server here
+    # would wait for local servers that are started below (and for remote
+    # servers that start themselves via their own form_cluster call), so it
+    # could never succeed and made the timeout depend on leftovers from
+    # previous tests.
+    with :ok <- wait_for_servers([seed_id], timeout),
+         :ok <- trigger_election_safe(seed_id, timeout) do
+      Enum.each(tl(local_servers), fn sid ->
+        RaftEx.start_server(system, cluster_name, sid, machine, all_server_ids)
+      end)
+
+      # Remote nodes may still be forming their local servers; give them the
+      # remaining budget without making local formation fail if they are slow.
+      _ = wait_for_servers(all_server_ids -- local_servers, timeout)
+
+      wait_for_leader(cluster_name, timeout, all_server_ids)
+      {:ok, local_servers}
+    end
+  end
+
+  defp trigger_election_safe(seed_id, timeout) do
+    case RaftEx.trigger_election(seed_id, timeout) do
+      :ok -> :ok
+      other -> {:error, other}
+    end
+  catch
+    :exit, {:timeout, _} -> {:error, {:timeout, seed_id}}
+    :exit, reason -> {:error, reason}
+  end
+
+  defp wait_for_servers(all_server_ids, timeout) when timeout <= 0 do
+    missing =
+      Enum.reject(all_server_ids, fn id ->
+        case RaftEx.ping(id, 1_000) do
+          {:pong, _} -> true
+          _ -> false
+        end
+      end)
+
+    if missing == [], do: :ok, else: {:error, {:servers_not_ready, missing}}
+  end
+
+  defp wait_for_servers(all_server_ids, timeout) do
+    missing =
+      Enum.reject(all_server_ids, fn id ->
+        case RaftEx.ping(id, 1_000) do
+          {:pong, _} -> true
+          _ -> false
+        end
+      end)
+
+    if missing == [] do
+      :ok
+    else
+      Process.sleep(200)
+      wait_for_servers(all_server_ids, timeout - 200)
+    end
+  end
+
+  defp wait_for_leader(_cluster_name, timeout, _all_server_ids) when timeout <= 0 do
     :ok
   end
 
-  defp wait_for_leader(cluster_name, timeout) do
-    case Leaderboard.lookup_leader(cluster_name) do
-      nil ->
-        Process.sleep(100)
-        wait_for_leader(cluster_name, timeout - 100)
+  defp wait_for_leader(cluster_name, timeout, all_server_ids) do
+    seed_id = List.first(all_server_ids)
 
-      _leader ->
+    case RaftEx.members(seed_id, 2_000) do
+      {:ok, _members, leader} when not is_nil(leader) ->
+        Leaderboard.record(cluster_name, leader, all_server_ids)
         :ok
+
+      _ ->
+        Process.sleep(100)
+        wait_for_leader(cluster_name, timeout - 100, all_server_ids)
     end
   end
 
@@ -260,15 +398,36 @@ defmodule RaftEx.App.Cluster do
   end
 
   defp find_leader_via_members(cluster_name) do
-    case Leaderboard.lookup_members(cluster_name) do
+    members =
+      case Leaderboard.lookup_members(cluster_name) do
+        nil -> local_cluster_members(cluster_name)
+        m -> m
+      end
+
+    case members do
       nil ->
         {:error, :unknown_cluster}
 
+      [] ->
+        {:error, :unknown_cluster}
+
       members ->
-        case find_leader_in_members(members) do
-          nil -> {:error, :no_leader_found}
-          leader -> {:ok, leader}
-        end
+        retry_find_leader(members, 5)
+    end
+  end
+
+  defp retry_find_leader(_members, 0) do
+    {:error, :no_leader_found}
+  end
+
+  defp retry_find_leader(members, attempts) do
+    case find_leader_in_members(members) do
+      nil ->
+        Process.sleep(200)
+        retry_find_leader(members, attempts - 1)
+
+      leader ->
+        {:ok, leader}
     end
   end
 
@@ -279,6 +438,21 @@ defmodule RaftEx.App.Cluster do
         _ -> nil
       end
     end)
+  end
+
+  defp local_cluster_members(cluster_name) do
+    case RaftEx.overview(:default) do
+      :system_not_started ->
+        nil
+
+      overview ->
+        ids =
+          overview.servers
+          |> Enum.filter(fn {_name, info} -> info.cluster == cluster_name end)
+          |> Enum.map(fn {name, _info} -> {name, node()} end)
+
+        if ids == [], do: nil, else: ids
+    end
   end
 
   defp ensure_distribution_started! do

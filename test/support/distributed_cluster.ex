@@ -19,7 +19,9 @@ defmodule RaftEx.TestSupport.DistributedCluster do
   Spawns `n` peer nodes. Each peer has raft_ex on its code path and the app
   started. Returns a list of `{peer, node}` tuples.
   """
-  def start_peers(n, _opts \\ []) do
+  def start_peers(n, opts \\ []) do
+    hosts = Keyword.get(opts, :hosts)
+
     code_paths = :code.get_path() |> Enum.map(&to_charlist/1)
 
     dep_ebins =
@@ -30,30 +32,49 @@ defmodule RaftEx.TestSupport.DistributedCluster do
       Enum.flat_map(code_paths ++ dep_ebins, fn p -> [~c"-pa", p] end)
 
     for i <- 1..n do
-      name = :"raft_peer_#{i}_#{System.unique_integer([:positive])}"
-
-      {:ok, peer, node} =
-        :peer.start(%{
-          name: name,
-          args: args
-        })
-
-      # Start the application on the peer.
-      {:ok, _} = :rpc.call(node, Application, :ensure_all_started, [:raft_ex])
-
-      # Start the RaftEx system on the peer with a temp data dir.
-      data_dir = "/tmp/raft_peer_data_#{i}_#{System.unique_integer([:positive])}"
-      :rpc.call(node, File, :mkdir_p!, [data_dir])
-      :ok = :rpc.call(node, RaftEx, :start_in, [data_dir])
-
-      {peer, node}
+      start_one_peer(i, hosts, args)
     end
+  end
+
+  defp start_one_peer(i, hosts, args) do
+    name = :"raft_peer_#{i}_#{System.unique_integer([:positive])}"
+
+    host = peer_host(i, hosts)
+
+    peer_opts =
+      if host do
+        %{name: name, args: args, host: String.to_charlist(host)}
+      else
+        %{name: name, args: args}
+      end
+
+    {:ok, peer, node} = :peer.start(peer_opts)
+
+    {:ok, _} = :rpc.call(node, Application, :ensure_all_started, [:raft_ex])
+
+    data_dir = "/tmp/raft_peer_data_#{i}_#{System.unique_integer([:positive])}"
+    :rpc.call(node, File, :mkdir_p!, [data_dir])
+    :ok = :rpc.call(node, RaftEx, :start_in, [data_dir])
+
+    {peer, node}
+  end
+
+  defp peer_host(_i, nil), do: nil
+
+  defp peer_host(_i, []), do: nil
+
+  defp peer_host(i, hosts) do
+    Enum.at(hosts, rem(i - 1, length(hosts)))
   end
 
   @doc "Stops all peers."
   def stop_peers(peers) do
     for {peer, _node} <- peers do
-      :peer.stop(peer)
+      try do
+        :peer.stop(peer)
+      catch
+        _, _ -> :ok
+      end
     end
 
     :ok
@@ -99,20 +120,39 @@ defmodule RaftEx.TestSupport.DistributedCluster do
 
     Process.sleep(1_000)
 
-    leader =
-      Enum.find_value(1..20, fn _ ->
-        Process.sleep(250)
-        discover_leader(ids)
-      end)
+    leader = elect_leader(ids)
 
     if leader == nil, do: raise("no leader elected")
     {name, leader, ids, peer_nodes}
   end
 
+  defp elect_leader(ids) do
+    Enum.reduce_while(1..4, nil, fn attempt, _acc ->
+      found = wait_for_leader(ids, 30, 250) || retry_election(ids, attempt)
+      if found, do: {:halt, found}, else: {:cont, nil}
+    end)
+  end
+
+  defp wait_for_leader(ids, attempts, interval) do
+    Enum.find_value(1..attempts, fn _ ->
+      Process.sleep(interval)
+      discover_leader(ids)
+    end)
+  end
+
+  defp retry_election(ids, attempt) do
+    target = Enum.at(ids, rem(attempt - 1, length(ids)))
+    :rpc.call(elem(target, 1), RaftEx, :trigger_election, [target], 5_000)
+    wait_for_leader(ids, 20, 250)
+  end
+
+  # Ping reports the role without appending a command to the log. Using
+  # process_command here used to write entries while probing each server, which
+  # left the peers with divergent logs and caused election churn.
   defp discover_leader(ids) do
     Enum.find_value(ids, fn id ->
-      case :rpc.call(elem(id, 1), RaftEx, :process_command, [id, {:get}, 5_000]) do
-        {:ok, _, found} -> found
+      case :rpc.call(elem(id, 1), RaftEx, :ping, [id, 2_000]) do
+        {:pong, :leader} -> id
         _ -> nil
       end
     end)

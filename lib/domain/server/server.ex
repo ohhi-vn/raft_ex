@@ -307,7 +307,7 @@ defmodule RaftEx.Domain.Server do
       cluster =
         Cluster.update_peer(
           peer_id,
-          %{match_index: reply.last_index, next_index: reply.last_index + 1},
+          %{match_index: reply.last_index, next_index: reply.last_index + 1, status: :normal},
           state.cluster
         )
 
@@ -1371,37 +1371,39 @@ defmodule RaftEx.Domain.Server do
        %{next_index: ni, status: :normal, commit_index_sent: cis, match_index: mi} = peer0},
       {s0, more0, effs}
       when ni < next_log_idx or cis < ci ->
-        process_peer_replication(%{
-          peer_id: peer_id,
-          peer0: peer0,
-          ni: ni,
-          mi: mi,
-          ci: ci,
-          next_log_idx: next_log_idx,
-          more0: more0,
-          effs: effs,
-          s0: s0,
-          batch_size: batch_size,
-          max_pipeline: max_pipeline
-        })
+        process_peer_replication(
+          peer_id,
+          peer0,
+          ni,
+          mi,
+          ci,
+          next_log_idx,
+          more0,
+          effs,
+          s0,
+          batch_size,
+          max_pipeline
+        )
 
       _, acc ->
         acc
     end)
   end
 
-  defp process_peer_replication(ctx) do
-    peer_id = ctx.peer_id
-    peer0 = ctx.peer0
-    ni = ctx.ni
-    mi = ctx.mi
-    ci = ctx.ci
-    next_log_idx = ctx.next_log_idx
-    more0 = ctx.more0
-    effs = ctx.effs
-    s0 = ctx.s0
-    batch_size = ctx.batch_size
-    max_pipeline = ctx.max_pipeline
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp process_peer_replication(
+         peer_id,
+         peer0,
+         ni,
+         mi,
+         ci,
+         next_log_idx,
+         more0,
+         effs,
+         s0,
+         batch_size,
+         max_pipeline
+       ) do
     count = Map.get(peer0, :backpressure_count, 0)
 
     if count > 0 do
@@ -1414,11 +1416,14 @@ defmodule RaftEx.Domain.Server do
       if in_flight < max_pipeline do
         {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, [])
 
+        in_flight_entry = {ni - 1, new_ni - 1}
+
         peer =
           peer0
           |> Map.put(:next_index, new_ni)
           |> Map.put(:commit_index_sent, ci)
           |> Map.put(:backpressure_count, 0)
+          |> Map.update(:in_flight, [in_flight_entry], fn list -> list ++ [in_flight_entry] end)
 
         new_more = more0 or (new_ni < next_log_idx and new_ni - mi - 1 < max_pipeline)
         {put_peer(peer_id, peer, s), new_more, [eff | effs]}

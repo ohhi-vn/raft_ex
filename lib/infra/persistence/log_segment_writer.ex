@@ -417,7 +417,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         {[{entry_index, off, byte_size(bin)} | acc], off + byte_size(bin)}
       end)
 
-    new_index_entries = Enum.reverse(rev_new_index)
+    new_index_entries = rev_new_index
     data = IO.iodata_to_binary(binaries)
 
     case File.open(path, [:append, :binary]) do
@@ -435,7 +435,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           | range: {first, new_last},
             entry_count: new_count,
             size_bytes: new_size,
-            index: idx ++ new_index_entries
+            index: new_index_entries ++ idx
         }
 
         {:ok, updated_segment}
@@ -501,7 +501,6 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     |> Enum.reduce([], fn {_idx, offset, length}, acc ->
       read_indexed_entry(segment.path, offset, length, acc)
     end)
-    |> Enum.reverse()
   end
 
   defp read_indexed_entry(path, offset, length, acc) do
@@ -630,51 +629,53 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   # Recovery
   # ---------------------------------------------------------------------------
 
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   defp load_segment(path) do
-    case File.read(path) do
-      {:ok, data} ->
-        load_segment_from_data(path, data)
+    case :file.open(path, [:read, :binary, :raw]) do
+      {:ok, fd} ->
+        header_result = :file.pread(fd, 0, @header_size)
+        size_result = :file.position(fd, :eof)
+        :file.close(fd)
+
+        with {:ok, header_data} <- header_result,
+             {:ok, size} <- size_result,
+             %{first: first, last: last, count: count} <- parse_header(header_data) do
+          index = load_segment_index(path, count)
+
+          %{
+            id: System.unique_integer([:positive]),
+            path: path,
+            range: {first, last},
+            entry_count: count,
+            size_bytes: size,
+            sealed: true,
+            fd: nil,
+            index: index
+          }
+        else
+          _ -> nil
+        end
 
       _ ->
         nil
     end
   end
 
-  defp load_segment_from_data(path, data) do
-    case parse_header(data) do
-      %{first: first, last: last, count: count} ->
-        {:ok, %{size: size}} = File.stat(path)
-        index = load_or_build_index(path, data, count)
-
-        %{
-          id: System.unique_integer([:positive]),
-          path: path,
-          range: {first, last},
-          entry_count: count,
-          size_bytes: size,
-          sealed: true,
-          fd: nil,
-          index: index
-        }
-
-      nil ->
-        Logger.warning(
-          "RaftEx.Infra.Persistence.LogSegmentWriter: corrupted segment file #{path}"
-        )
-
-        nil
-    end
-  end
-
-  defp load_or_build_index(path, data, count) do
+  defp load_segment_index(path, count) do
     case load_sidecar(path, count) do
       {:ok, idx} ->
         idx
 
       :error ->
-        {_entries, idx} = parse_segment_with_index(data)
-        write_sidecar(path, idx)
-        idx
+        case File.read(path) do
+          {:ok, data} ->
+            {_entries, idx} = parse_segment_with_index(data)
+            write_sidecar(path, idx)
+            idx
+
+          _ ->
+            []
+        end
     end
   end
 
@@ -687,7 +688,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   defp parse_segment_with_index(_), do: {[], []}
 
   defp parse_segment_entries(<<>>, entries_acc, index_acc, _off) do
-    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
+    {Enum.reverse(entries_acc), index_acc}
   end
 
   defp parse_segment_entries(
@@ -708,7 +709,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   end
 
   defp parse_segment_entries(_, entries_acc, index_acc, _off) do
-    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
+    {Enum.reverse(entries_acc), index_acc}
   end
 
   # ---------------------------------------------------------------------------
@@ -862,8 +863,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
 
     cond do
       idx == target -> {:found, mid}
-      idx < target -> do_binary_search(list, target, mid + 1, hi)
-      true -> do_binary_search(list, target, lo, mid - 1)
+      target > idx -> do_binary_search(list, target, lo, mid - 1)
+      true -> do_binary_search(list, target, mid + 1, hi)
     end
   end
 end

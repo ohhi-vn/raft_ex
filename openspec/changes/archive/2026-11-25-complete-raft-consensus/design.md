@@ -31,7 +31,6 @@ See `proposal.md` for motivation and the six delta specs for the behaviour contr
 - Real multi-host network partition testing. Tests use multiple servers on one node.
 - Performance work (pipelining, batching, `gen_batch_server`), metrics completion, or machine-version upgrades beyond the existing no-op path.
 - Changing the public command/query return shapes except where they are currently broken.
-- Full Ra API parity.
 
 ## Decisions
 

@@ -5,12 +5,20 @@ defmodule RaftEx.Infra.Network.Distribution do
 
   require Logger
 
+  @doc false
+  def set_cookie(_cookie) do
+    # Changing the cookie of an already running node breaks its EPMD handshake
+    # with new peers. Before distribution starts, :nonode@nohost has no cookie
+    # to change either, so this compatibility hook is a no-op in both cases.
+    :ok
+  end
+
   @doc """
   Start distributed Erlang for the current node.
   """
   def start(opts \\ []) do
     cookie = Access.get(opts, :cookie, :raft_ex)
-    Node.set_cookie(cookie)
+    set_cookie(cookie)
 
     case Node.start(:hidden) do
       {:ok, pid} when is_pid(pid) ->
@@ -18,8 +26,10 @@ defmodule RaftEx.Infra.Network.Distribution do
         pid
 
       {:error, :already_started} ->
-        Logger.debug("RaftEx.Infra.Network.Distribution: node already started")
-        :ok
+        already_started()
+
+      {:error, {:already_started, _pid}} ->
+        already_started()
 
       {:error, reason} ->
         Logger.error(
@@ -30,18 +40,18 @@ defmodule RaftEx.Infra.Network.Distribution do
     end
   end
 
+  defp already_started do
+    Logger.debug("RaftEx.Infra.Network.Distribution: node already started")
+    :ok
+  end
+
   @doc """
   Connect to a list of seed nodes.
   """
   @spec connect_to_seeds([node()], atom()) :: [node()]
   def connect_to_seeds(seeds, cookie \\ :raft_ex) do
     if Node.alive?() do
-      try do
-        Node.set_cookie(cookie)
-      rescue
-        _ -> :ok
-      end
-
+      _ = cookie
       Enum.filter(seeds, fn seed -> seed != node() and connect_seed(seed) end)
     else
       Logger.warning(

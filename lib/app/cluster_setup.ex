@@ -64,7 +64,7 @@ defmodule RaftEx.App.ClusterSetup do
   Start distributed Erlang with the given cookie.
   """
   def start_distribution(cookie \\ :raft_ex) do
-    Node.set_cookie(cookie)
+    Distribution.set_cookie(cookie)
 
     case Node.start(:hidden) do
       {:ok, pid} when is_pid(pid) ->
@@ -92,7 +92,7 @@ defmodule RaftEx.App.ClusterSetup do
   Connect to a remote node and verify it is reachable.
   """
   def connect_node(node, cookie \\ :raft_ex) do
-    Node.set_cookie(cookie)
+    Distribution.set_cookie(cookie)
 
     case Node.connect(node) do
       true ->
@@ -108,7 +108,7 @@ defmodule RaftEx.App.ClusterSetup do
   @doc """
   Verify that all given nodes are reachable and running RaftEx.
   """
-  def verify_nodes(nodes, timeout \\ 5_000) do
+  def verify_nodes(nodes, timeout \\ 15_000) do
     results =
       Enum.map(nodes, fn n ->
         reachable = n == node() or Node.connect(n)

@@ -1,8 +1,8 @@
 defmodule RaftEx.MixProject do
   use Mix.Project
 
-  @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.5.1"
+  @source_url "https://github.com/ohhi-vn/raft_ex"
+  @version "0.6.0"
 
   def project do
     [
@@ -62,7 +62,9 @@ defmodule RaftEx.MixProject do
 
       # Code quality
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:credo, "~> 1.7.19", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7.19", only: [:dev, :test], runtime: false},
+      {:ex_slop, "~> 0.4.5", only: [:dev, :test], runtime: false},
+      {:ex_dna, "~> 1.5", only: [:dev, :test], runtime: false}
     ]
   end
 
@@ -73,12 +75,12 @@ defmodule RaftEx.MixProject do
   defp package do
     [
       maintainers: ["Maintainer Name"],
-      licenses: ["MPL-2.0", "Apache-2.0"],
+      licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
         "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
       },
-      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE LICENSE-APACHE2 LICENSE-MPL-RabbitMQ)
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 

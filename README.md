@@ -10,19 +10,25 @@ RaftEx implements Raft with leader election (pre-vote), log replication (WAL + f
 chunked snapshots, dynamic membership, consistent queries, leadership transfer, and
 pluggable state machines. See `docs/metrics.md` and `guides/` for details.
 
-## Status
+## Features
 
-- ✅ Core: election, replication, snapshots, membership, queries, leadership transfer, WAL
-- 🚧 Partial: multi-host distributed clusters, snapshot transfer breadth
-- ❌ Planned: shared WAL, pipelined AppendEntries, performance
-
-Tests: 861 passing, ~98% coverage. See `openspec/specs/` for behavioural specs.
+- Leader election with pre-vote
+- Log replication with per-server WAL and fsync
+- Chunked snapshot transfer (single and multi-chunk)
+- Dynamic membership changes (add/remove/promote/demote)
+- Consistent and local queries
+- Leadership transfer
+- Pluggable versioned state machines
+- Multi-host distributed clusters
+- Pipelined AppendEntries with backpressure
+- Observability and metrics
+- Performance benchmark suite
 
 ## Installation
 
 ```elixir
 def deps do
-  [{:raft_ex, "~> 0.5"}]
+  [{:raft_ex, "~> 0.6"}]
 end
 ```
 
@@ -45,19 +51,10 @@ machine = {:machine, MyMachine, %{}}
 - Metrics: `docs/metrics.md`
 - Changelog: `CHANGELOG.md`
 
-## Quality
-
-```bash
-mix deps.get
-mix precommit   # compile, format, credo, tests
-mix docs --warnings-as-errors
-```
-
 ## License
 
-Dual-licensed under MPL-2.0 and Apache-2.0. See LICENSE files.
+Licensed under Apache-2.0.
 
 ## Acknowledgments
 
-- Original: [RabbitMQ RA](https://github.com/rabbitmq/ra)
 - Raft paper: https://raft.github.io/raft.pdf
