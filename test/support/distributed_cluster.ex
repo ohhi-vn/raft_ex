@@ -10,6 +10,8 @@ defmodule RaftEx.TestSupport.DistributedCluster do
 
   @ebin_path Path.expand("_build/test/lib/raft_ex/ebin", File.cwd!())
 
+  alias RaftEx.Domain.Utils, as: Utils
+
   @doc "Returns the compiled ebin path for raft_ex."
   def ebin_path, do: @ebin_path
 
@@ -73,7 +75,7 @@ defmodule RaftEx.TestSupport.DistributedCluster do
     # Start each server on its own peer node.
     results =
       Enum.map(ids, fn id ->
-        uid = :rpc.call(elem(id, 1), RaftEx, :new_uid, [RaftEx.Domain.Utils.to_binary(name)])
+        uid = :rpc.call(elem(id, 1), RaftEx, :new_uid, [Utils.to_binary(name)])
 
         config = %{
           id: id,
@@ -87,7 +89,7 @@ defmodule RaftEx.TestSupport.DistributedCluster do
         :rpc.call(elem(id, 1), RaftEx, :start_server, [:default, config], timeout)
       end)
 
-    if Enum.any?(results, &(&1 != :ok)) do
+    unless Enum.all?(results, &(&1 == :ok)) do
       raise "failed to start servers: #{inspect(results)}"
     end
 
@@ -100,17 +102,20 @@ defmodule RaftEx.TestSupport.DistributedCluster do
     leader =
       Enum.find_value(1..20, fn _ ->
         Process.sleep(250)
-
-        Enum.find_value(ids, fn id ->
-          case :rpc.call(elem(id, 1), RaftEx, :process_command, [id, {:get}, 5_000]) do
-            {:ok, _, found} -> found
-            _ -> nil
-          end
-        end)
+        discover_leader(ids)
       end)
 
     if leader == nil, do: raise("no leader elected")
     {name, leader, ids, peer_nodes}
+  end
+
+  defp discover_leader(ids) do
+    Enum.find_value(ids, fn id ->
+      case :rpc.call(elem(id, 1), RaftEx, :process_command, [id, {:get}, 5_000]) do
+        {:ok, _, found} -> found
+        _ -> nil
+      end
+    end)
   end
 
   @doc "Runs a function on the node owning `id` via RPC."

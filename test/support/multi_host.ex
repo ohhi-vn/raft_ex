@@ -30,10 +30,10 @@ defmodule RaftEx.TestSupport.MultiHost do
 
   @doc "Skip-friendly guard for use in setup."
   def skip_unless_enabled do
-    if not enabled?() do
-      {:skip, "RAFT_EX_HOSTS not set; skipping multi-host test"}
-    else
+    if enabled?() do
       :ok
+    else
+      {:skip, "RAFT_EX_HOSTS not set; skipping multi-host test"}
     end
   end
 end

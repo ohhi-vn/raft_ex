@@ -170,7 +170,20 @@ defmodule RaftEx.App.ServerRuntime do
       RaftEx.Leaderboard.record(cluster_name, leader_id, members)
     end
 
-    {:keep_state, state, actions1}
+    # Send an immediate heartbeat/AppendEntries round so peers learn about the
+    # new leader before their election timeouts fire; otherwise a 2-voter (or
+    # slow) cluster ping-pongs leadership indefinitely.
+    {state2, rpc_effs} = make_rpcs(state)
+    effects = Server.tick(state2.server_state)
+    ss2 = Server.log_tick(state2.server_state)
+
+    {state3, actions2} =
+      handle_effects(:leader, rpc_effs ++ effects ++ [{:aux, :tick}], :cast, %{
+        state2
+        | server_state: ss2
+      })
+
+    {:keep_state, state3, set_tick_timer(state3, actions1 ++ actions2)}
   end
 
   def leader({:call, from}, :trigger_election, state) do
@@ -681,8 +694,11 @@ defmodule RaftEx.App.ServerRuntime do
          {from_pid, _ref},
          %{server_state: ss0, election_context: ctx0} = state0
        ) do
-    # Look up peer_id from the mapping stored when RPC was sent
-    peer_id = Process.get({:election_peer, from_pid})
+    # Look up peer_id from the mapping stored when RPC was sent (local peers),
+    # or fall back to resolving it from the sender pid (remote peers).
+    peer_id =
+      Process.get({:election_peer, from_pid}) ||
+        if is_pid(from_pid), do: pid_to_server_id(from_pid), else: nil
 
     {should_start_election, ctx, effects} =
       Election.handle_pre_vote_reply(reply, ctx0, ss0, peer_id)
@@ -704,8 +720,12 @@ defmodule RaftEx.App.ServerRuntime do
          {from_pid, _ref},
          %{server_state: ss0, election_context: ctx0} = state0
        ) do
-    # Look up peer_id from the mapping stored when RPC was sent
-    peer_id = Process.get({:election_peer, from_pid})
+    # Look up peer_id from the mapping stored when RPC was sent (local peers),
+    # or fall back to resolving it from the sender pid (remote peers, where no
+    # tracking entry was recorded).
+    peer_id =
+      Process.get({:election_peer, from_pid}) ||
+        if is_pid(from_pid), do: pid_to_server_id(from_pid), else: nil
 
     {result, ctx, effects} =
       Election.handle_vote_reply(reply, ctx0, ss0, peer_id)

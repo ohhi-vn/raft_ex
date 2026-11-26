@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.1]
+
+### Fixed
+- **Distributed vote correlation**: `RaftEx.App.ServerRuntime.handle_vote_reply/3` and `handle_pre_vote_reply/3` now resolve the peer id from the sender pid when no local tracking entry exists (remote peers), instead of using `nil`. Stale replies whose term no longer matches are ignored instead of falling through to a non-matching clause. This prevents remote votes from being collapsed into a single `nil` voter and stops term-escalation livelocks in multi-node clusters.
 
 ## [0.5.0] - 2026-11-26
 

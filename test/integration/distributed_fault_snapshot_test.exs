@@ -5,6 +5,7 @@ defmodule RaftEx.Distributed.FaultSnapshotTest do
   @moduletag :faults
 
   alias RaftEx.TestSupport.DistributedCluster, as: DC
+  alias RaftEx.TestSupport.FaultInjection
 
   setup do
     if System.get_env("RAFT_EX_FAULTS") != "1" or not Node.alive?() do
@@ -40,7 +41,7 @@ defmodule RaftEx.Distributed.FaultSnapshotTest do
 
       # Best-effort suspend via RPC is not available cross-node; instead sleep to
       # simulate delay, then verify the cluster stays healthy.
-      RaftEx.TestSupport.FaultInjection.delay(200)
+      FaultInjection.delay(200)
 
       assert {:ok, _, _} = DC.rpc(leader, RaftEx, :process_command, [leader, {:get}, 5_000])
 

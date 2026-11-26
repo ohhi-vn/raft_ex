@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/manhvu/raft_ex"
-  @version "0.5.0"
+  @version "0.5.1"
 
   def project do
     [
@@ -100,7 +100,7 @@ defmodule RaftEx.MixProject do
       main: "readme",
       extras: ["README.md", "CHANGELOG.md", "docs/metrics.md"] ++ guides,
       groups_for_extras: [
-        "Guides": guides
+        Guides: guides
       ],
       source_url: @source_url,
       source_ref: "v#{@version}",

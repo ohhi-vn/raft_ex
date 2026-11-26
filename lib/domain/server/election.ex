@@ -354,6 +354,13 @@ defmodule RaftEx.Domain.Server.Election do
     {:ongoing, context, []}
   end
 
+  # Stale reply from an earlier election (or a reply whose term we have
+  # already moved past): ignore it so a late message cannot crash the
+  # candidate or spuriously escalate the term.
+  def handle_vote_reply(_reply, context, _state, _peer_id) do
+    {:ongoing, context, []}
+  end
+
   @doc """
   Handle a pre-vote reply from a peer.
 
@@ -409,6 +416,11 @@ defmodule RaftEx.Domain.Server.Election do
     context =
       Map.update(context, :votes_rejected, MapSet.new([peer_id]), &MapSet.put(&1, peer_id))
 
+    {false, context, []}
+  end
+
+  # Stale pre-vote reply: ignore it.
+  def handle_pre_vote_reply(_reply, context, _state, _peer_id) do
     {false, context, []}
   end
 

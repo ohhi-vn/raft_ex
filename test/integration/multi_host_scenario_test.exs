@@ -6,12 +6,12 @@ defmodule RaftEx.MultiHost.ScenarioTest do
   alias RaftEx.TestSupport.DistributedCluster, as: DC
 
   setup do
-    if not Node.alive?() do
-      %{peers: nil, skip?: true}
-    else
+    if Node.alive?() do
       peers = DC.start_peers(3)
       on_exit(fn -> DC.stop_peers(peers) end)
       %{peers: peers, skip?: false, n: 3}
+    else
+      %{peers: nil, skip?: true}
     end
   end
 
