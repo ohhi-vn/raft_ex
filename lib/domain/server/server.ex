@@ -36,7 +36,7 @@ defmodule RaftEx.Domain.Server do
   alias RaftEx.Domain.{Conn, Invariant, Machine, Pipeline, Types}
   alias RaftEx.Domain.Server.{Cluster, Config, Effects, Election, RpcHandler}
   alias RaftEx.Domain.Utils
-  alias RaftEx.Infra.Observability.Metrics
+  alias RaftEx.Infra.Observability.{Counters, Metrics}
   alias RaftEx.Infra.Persistence.{Log, LogMeta}
 
   # ---------------------------------------------------------------------------
@@ -77,7 +77,11 @@ defmodule RaftEx.Domain.Server do
           uid: uid,
           counter: counter,
           log_id: log_id,
-          initial_access_pattern: :sequential
+          initial_access_pattern: :sequential,
+          segment_storage:
+            Map.get(config, :segment_storage, Map.get(system_config, :segment_storage, false)),
+          log_window_size:
+            Map.get(config, :log_window_size, Map.get(system_config, :log_window_size, 8192))
         })
       )
 
@@ -106,11 +110,41 @@ defmodule RaftEx.Domain.Server do
       effective_machine_module: mac_mod,
       effective_handle_aux_fun: Machine.which_aux_fun(mac_mod),
       max_pipeline_count: Map.get(config, :max_pipeline_count, 4096),
+      max_append_entries_rpc_batch_size:
+        Map.get(
+          config,
+          :max_append_entries_rpc_batch_size,
+          Map.get(
+            system_config,
+            :max_append_entries_rpc_batch_size,
+            Map.get(system_config, :default_max_append_entries_rpc_batch_size, 128)
+          )
+        ),
       counter: counter,
       system_config: system_config,
       command_plugs: command_plugs,
-      rpc_plugs: rpc_plugs
+      rpc_plugs: rpc_plugs,
+      compaction_entry_threshold:
+        Map.get(
+          config,
+          :compaction_entry_threshold,
+          Map.get(system_config, :compaction_entry_threshold, 8192)
+        ),
+      compaction_wal_bytes:
+        Map.get(
+          config,
+          :compaction_wal_bytes,
+          Map.get(system_config, :compaction_wal_bytes, 134_217_728)
+        ),
+      compaction_interval_ms:
+        Map.get(
+          config,
+          :compaction_interval_ms,
+          Map.get(system_config, :compaction_interval_ms, 120_000)
+        )
     }
+
+    now_ms = System.monotonic_time(:millisecond)
 
     %{
       cfg: cfg,
@@ -133,7 +167,9 @@ defmodule RaftEx.Domain.Server do
       pending_consistent_queries: [],
       previous_cluster: nil,
       rpc_from: nil,
-      initial_members: initial_nodes
+      initial_members: initial_nodes,
+      last_auto_compact_ms: now_ms,
+      entries_since_compact: 0
     }
   end
 
@@ -207,8 +243,103 @@ defmodule RaftEx.Domain.Server do
 
   @doc false
   @spec handle_leader(term(), map()) :: {atom(), map(), list()}
+  def handle_leader({:commands, cmds}, %{cfg: cfg} = state0) when is_list(cmds) do
+    Enum.each(cmds, fn _ -> incr_counter(cfg, :commands, 1) end)
+
+    # Normalize casts to the 4-tuple shape, then run each command through
+    # the command plugs. Halted commands get their own error reply and
+    # never reach the log.
+    {ready, halted_effects} =
+      Enum.reduce(cmds, {[], []}, fn cmd, {ok_acc, eff_acc} ->
+        cmd =
+          case cmd do
+            {:"$usr", data, mode} -> {:"$usr", %{}, data, mode}
+            _ -> cmd
+          end
+
+        conn = %Conn{type: :command, request: %{command: cmd}}
+        conn = Pipeline.run(conn, cfg.command_plugs)
+
+        if conn.halted do
+          resp = conn.resp || {:error, :halted}
+
+          eff =
+            case cmd do
+              {_, %{from: from}, _, _} when not is_nil(from) ->
+                [{:reply, from, {:wrap_reply, resp}}]
+
+              _ ->
+                []
+            end
+
+          {ok_acc, eff ++ eff_acc}
+        else
+          {[Map.get(conn.request, :command, cmd) | ok_acc], eff_acc}
+        end
+      end)
+
+    ready = Enum.reverse(ready)
+
+    case ready do
+      [] ->
+        {:leader, state0, halted_effects}
+
+      cmds when cmds != [] ->
+        if Enum.all?(cmds, &match?({:"$usr", _, _, _}, &1)) do
+          # Homogeneous user-command batch: one WAL write for all entries.
+          {state, effects, write_result} = append_command_batch(cmds, state0)
+
+          case write_result do
+            :ok ->
+              {:leader, state, halted_effects ++ effects}
+
+            {:error, :wal_down} ->
+              condition = %{predicate_fun: &wal_down_condition/2, transition_to: :leader}
+
+              {:await_condition, Map.put(state, :condition, condition), halted_effects ++ effects}
+
+            {:error, _} ->
+              {:leader, state, halted_effects ++ effects}
+          end
+        else
+          # Mixed batch (cluster changes): fall back to sequential handling
+          # so single-change validation and ordering stay exactly as today.
+          {state, effects} =
+            Enum.reduce(cmds, {state0, halted_effects}, fn cmd, {st, effs} ->
+              case handle_leader({:command, cmd}, st) do
+                {:leader, st1, effs1} ->
+                  {st1, effs ++ effs1}
+
+                {:await_condition, st1, effs1} ->
+                  {Map.put(st1, :__batch_await__, true), effs ++ effs1}
+
+                {_, st1, effs1} ->
+                  {st1, effs ++ effs1}
+              end
+            end)
+
+          if Map.get(state, :__batch_await__, false) do
+            state = Map.delete(state, :__batch_await__)
+            condition = %{predicate_fun: &wal_down_condition/2, transition_to: :leader}
+            {:await_condition, Map.put(state, :condition, condition), effects}
+          else
+            {:leader, state, effects}
+          end
+        end
+    end
+  end
+
   def handle_leader({:command, cmd}, %{cfg: cfg} = state0) do
     incr_counter(cfg, :commands, 1)
+
+    # Casts carry no caller to attribute; normalize them to the same
+    # 4-tuple shape calls use so they append and apply identically
+    # (with an empty context instead of a caller reference).
+    cmd =
+      case cmd do
+        {:"$usr", data, mode} -> {:"$usr", %{}, data, mode}
+        _ -> cmd
+      end
 
     conn = %Conn{type: :command, request: %{command: cmd}}
     conn = Pipeline.run(conn, cfg.command_plugs)
@@ -272,12 +403,22 @@ defmodule RaftEx.Domain.Server do
         %{rpc_from: peer_id, cluster: cluster} = state
       )
       when is_map_key(cluster, peer_id) do
-    {state, effects} = RpcHandler.handle_append_entries_reply(reply, state)
-    {:leader, state, effects}
+    {state2, effects} = RpcHandler.handle_append_entries_reply(reply, state)
+
+    if Enum.member?(effects, {:become, :follower}) do
+      {:follower, state2, List.delete(effects, {:become, :follower})}
+    else
+      {:leader, state2, effects}
+    end
   end
 
-  def handle_leader(%Types.AppendEntriesReply{}, state) do
-    {:leader, state, []}
+  def handle_leader(%Types.AppendEntriesReply{} = reply, state) do
+    if reply.term > state.current_term do
+      {new_state, effects} = adopt_term(reply.term, state, nil)
+      {:follower, new_state, effects}
+    else
+      {:leader, state, []}
+    end
   end
 
   def handle_leader(
@@ -285,14 +426,101 @@ defmodule RaftEx.Domain.Server do
         %{rpc_from: peer_id, cluster: cluster} = state
       )
       when is_map_key(cluster, peer_id) do
-    cluster = Cluster.update_peer(peer_id, %{query_index: reply.query_index}, cluster)
-    state = %{state | cluster: cluster}
-    {state, effects} = evaluate_consistent_heartbeats(state)
-    {:leader, state, effects}
+    if reply.term > state.current_term do
+      {new_state, effects} = adopt_term(reply.term, state, nil)
+      {:follower, new_state, effects}
+    else
+      now_ms = System.monotonic_time(:millisecond)
+
+      cluster =
+        Cluster.update_peer(
+          peer_id,
+          %{query_index: reply.query_index, last_ack: now_ms},
+          cluster
+        )
+
+      state = %{state | cluster: cluster}
+      {state, effects} = evaluate_consistent_heartbeats(state)
+      {:leader, state, effects}
+    end
   end
 
-  def handle_leader(%Types.HeartbeatReply{}, state) do
-    {:leader, state, []}
+  def handle_leader(%Types.HeartbeatReply{} = reply, state) do
+    if reply.term > state.current_term do
+      {new_state, effects} = adopt_term(reply.term, state, nil)
+      {:follower, new_state, effects}
+    else
+      {:leader, state, []}
+    end
+  end
+
+  def handle_leader(%Types.RequestVoteRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      {adopted, effects} = adopt_term(rpc.term, state, nil)
+      {:follower, new_state, effects2} = handle_follower(rpc, adopted)
+      {:follower, new_state, effects ++ effects2}
+    else
+      reply = %Types.RequestVoteResult{term: state.current_term, vote_granted: false}
+      {:leader, state, [{:send_rpc, rpc.candidate_id, reply}]}
+    end
+  end
+
+  def handle_leader(%Types.PreVoteRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      {adopted, effects} = adopt_term(rpc.term, state, nil)
+      {:follower, new_state, effects2} = handle_follower(rpc, adopted)
+      {:follower, new_state, effects ++ effects2}
+    else
+      reply = %Types.PreVoteResult{
+        term: state.current_term,
+        token: Map.get(rpc, :token),
+        vote_granted: false
+      }
+
+      {:leader, state, [{:send_rpc, rpc.candidate_id, reply}]}
+    end
+  end
+
+  def handle_leader(%Types.AppendEntriesRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      handle_follower(rpc, state)
+    else
+      reply = %Types.AppendEntriesReply{
+        term: state.current_term,
+        success: false,
+        next_index: 0,
+        last_index: 0,
+        last_term: 0
+      }
+
+      {:leader, state, [{:send_rpc, rpc.leader_id, reply}]}
+    end
+  end
+
+  def handle_leader(%Types.HeartbeatRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      handle_follower(rpc, state)
+    else
+      {:leader, state, []}
+    end
+  end
+
+  def handle_leader(%Types.InstallSnapshotRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      handle_follower(rpc, state)
+    else
+      {:leader, state, []}
+    end
+  end
+
+  def handle_leader(%Types.TimeoutNowRpc{} = rpc, state) do
+    if rpc.term > state.current_term do
+      {adopted, effects} = adopt_term(rpc.term, state, nil)
+      {:follower, new_state, effects2} = handle_follower(rpc, adopted)
+      {:follower, new_state, effects ++ effects2}
+    else
+      {:leader, state, []}
+    end
   end
 
   def handle_leader(
@@ -304,10 +532,17 @@ defmodule RaftEx.Domain.Server do
       {new_state, effects} = adopt_term(reply.term, state, nil)
       {:follower, new_state, effects}
     else
+      now_ms = System.monotonic_time(:millisecond)
+
       cluster =
         Cluster.update_peer(
           peer_id,
-          %{match_index: reply.last_index, next_index: reply.last_index + 1, status: :normal},
+          %{
+            match_index: reply.last_index,
+            next_index: reply.last_index + 1,
+            status: :normal,
+            last_ack: now_ms
+          },
           state.cluster
         )
 
@@ -354,6 +589,12 @@ defmodule RaftEx.Domain.Server do
     if term > cur do
       effects = [{:store_meta, :current_term, term}, {:store_meta, :voted_for, voted_for}]
       state = %{state | current_term: term, voted_for: voted_for, leader_id: nil}
+
+      case state do
+        %{cfg: %{id: id}} -> Counters.set_gauge(id, :term, term)
+        _ -> :ok
+      end
+
       {state, effects}
     else
       {state, []}
@@ -367,78 +608,105 @@ defmodule RaftEx.Domain.Server do
   @doc false
   @spec handle_follower(term(), map()) :: {atom(), map(), list()}
   def handle_follower(%Types.AppendEntriesRpc{} = rpc, state0) do
-    cfg = state0.cfg
-    conn = %Conn{type: :rpc, request: %{rpc: rpc}}
-    conn = Pipeline.run(conn, cfg.rpc_plugs)
+    case run_rpc_pipeline(rpc, state0) do
+      {:halted, conn} ->
+        rpc = Map.get(conn.request, :rpc, rpc)
 
-    if conn.halted do
-      rpc = Map.get(conn.request, :rpc, rpc)
+        reply =
+          conn.resp ||
+            %Types.AppendEntriesReply{
+              term: state0.current_term,
+              success: false,
+              next_index: 0,
+              last_index: 0,
+              last_term: 0
+            }
 
-      reply =
-        conn.resp ||
-          %Types.AppendEntriesReply{
-            term: state0.current_term,
-            success: false,
-            next_index: 0,
-            last_index: 0,
-            last_term: 0
-          }
+        {:follower, state0, [{:send_rpc, rpc.leader_id, reply}]}
 
-      {:follower, state0, [{:send_rpc, rpc.leader_id, reply}]}
-    else
-      rpc = Map.get(conn.request, :rpc, rpc)
-      RpcHandler.handle_append_entries_rpc(rpc, state0)
+      {:cont, rpc} ->
+        RpcHandler.handle_append_entries_rpc(rpc, state0)
     end
   end
 
   def handle_follower(%Types.PreVoteRpc{} = rpc, state) do
-    {granted, effects0} = Election.handle_pre_vote_request(rpc, state)
+    case run_rpc_pipeline(rpc, state) do
+      {:halted, _} ->
+        reply = %Types.PreVoteResult{
+          term: state.current_term,
+          token: rpc.token,
+          vote_granted: false
+        }
 
-    reply = %Types.PreVoteResult{
-      term: state.current_term,
-      token: rpc.token,
-      vote_granted: granted
-    }
+        {:follower, state, [{:send_rpc, rpc.candidate_id, reply}]}
 
-    {:follower, state, effects0 ++ [{:send_rpc, rpc.candidate_id, reply}]}
+      {:cont, rpc} ->
+        {granted, effects0} = Election.handle_pre_vote_request(rpc, state)
+
+        reply = %Types.PreVoteResult{
+          term: state.current_term,
+          token: rpc.token,
+          vote_granted: granted
+        }
+
+        {:follower, state, effects0 ++ [{:send_rpc, rpc.candidate_id, reply}]}
+    end
   end
 
   def handle_follower(%Types.RequestVoteRpc{} = rpc, state) do
-    {granted, new_state, effects} =
-      Election.handle_vote_request(rpc, state)
+    case run_rpc_pipeline(rpc, state) do
+      {:halted, _} ->
+        reply = %Types.RequestVoteResult{term: state.current_term, vote_granted: false}
+        {:follower, state, [{:send_rpc, rpc.candidate_id, reply}]}
 
-    reply = %Types.RequestVoteResult{
-      term: new_state.current_term,
-      vote_granted: granted
-    }
+      {:cont, rpc} ->
+        {granted, new_state, effects} = Election.handle_vote_request(rpc, state)
 
-    {:follower, new_state, effects ++ [{:send_rpc, rpc.candidate_id, reply}]}
+        reply = %Types.RequestVoteResult{
+          term: new_state.current_term,
+          vote_granted: granted
+        }
+
+        {:follower, new_state, effects ++ [{:send_rpc, rpc.candidate_id, reply}]}
+    end
   end
 
   def handle_follower(%Types.InstallSnapshotRpc{} = rpc, state) do
-    RpcHandler.handle_install_snapshot_rpc(rpc, state)
+    case run_rpc_pipeline(rpc, state) do
+      {:halted, _} ->
+        reply = %Types.InstallSnapshotResult{
+          term: state.current_term,
+          last_index: 0,
+          last_term: 0
+        }
+
+        {:follower, state, [{:send_rpc, rpc.leader_id, reply}]}
+
+      {:cont, rpc} ->
+        RpcHandler.handle_install_snapshot_rpc(rpc, state)
+    end
   end
 
   def handle_follower(%Types.TimeoutNowRpc{} = rpc, state) do
-    if rpc.term >= state.current_term do
-      Metrics.inc(:leadership_transfers_completed)
+    case run_rpc_pipeline(rpc, state) do
+      {:halted, _} ->
+        {:follower, state, []}
 
-      state =
-        if rpc.term > state.current_term do
-          %{state | current_term: rpc.term, voted_for: nil, leader_id: nil}
-        else
-          %{state | leader_id: nil}
-        end
-
-      {:candidate, state, []}
-    else
-      {:follower, state, []}
+      {:cont, rpc} ->
+        do_handle_timeout_now(rpc, state)
     end
   end
 
   def handle_follower(%Types.HeartbeatRpc{} = rpc, state) do
-    {state, effects} = RpcHandler.handle_heartbeat_rpc(rpc, state)
-    {:follower, state, effects}
+    case run_rpc_pipeline(rpc, state) do
+      {:halted, _} ->
+        reply = %Types.HeartbeatReply{query_index: 0, term: state.current_term}
+        {:follower, state, [{:send_rpc, rpc.leader_id, reply}]}
+
+      {:cont, rpc} ->
+        {state, effects} = RpcHandler.handle_heartbeat_rpc(rpc, state)
+        {:follower, state, effects}
+    end
   end
 
   def handle_follower({:ra_log_event, :major_compaction}, state) do
@@ -447,7 +715,11 @@ defmodule RaftEx.Domain.Server do
   end
 
   def handle_follower(:election_timeout, state) do
-    call_for_election(:pre_vote, state)
+    if voter?(state) do
+      call_for_election(:pre_vote, state)
+    else
+      {:follower, state, []}
+    end
   end
 
   def handle_follower({:local_query, query_fun}, state) do
@@ -469,6 +741,52 @@ defmodule RaftEx.Domain.Server do
   end
 
   def handle_follower(_msg, state), do: {:follower, state, []}
+
+  # Runs the configured RPC plug pipeline over an incoming RPC. Returns
+  # `{:halted, conn}` when a plug halted the request and `{:cont, rpc}`
+  # (possibly transformed by plugs) otherwise. With the default empty
+  # pipeline the request passes through unchanged.
+  @spec run_rpc_pipeline(map(), map()) :: {:halted, Conn.t()} | {:cont, map()}
+  defp run_rpc_pipeline(rpc, %{cfg: cfg}) do
+    conn = %Conn{type: :rpc, request: %{rpc: rpc}}
+    conn = Pipeline.run(conn, cfg.rpc_plugs)
+
+    if conn.halted do
+      {:halted, conn}
+    else
+      {:cont, Map.get(conn.request, :rpc, rpc)}
+    end
+  end
+
+  defp do_handle_timeout_now(rpc, state) do
+    cond do
+      rpc.term != state.current_term ->
+        {:follower, state, []}
+
+      state.leader_id == nil or rpc.leader_id != state.leader_id ->
+        {:follower, state, []}
+
+      true ->
+        Metrics.inc(:leadership_transfers_completed)
+
+        # Persist the observed term before campaigning so a crash cannot
+        # resurrect the old term. adopt_term is a no-op when equal but keeps
+        # the durable contract explicit.
+        {new_state, effects} = adopt_term(rpc.term, %{state | leader_id: nil})
+
+        {:candidate, new_state, effects}
+    end
+  end
+
+  defp voter?(state) do
+    try do
+      get_membership(state) == :voter
+    rescue
+      _ -> true
+    catch
+      _, _ -> true
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private — query helpers
@@ -625,15 +943,11 @@ defmodule RaftEx.Domain.Server do
   def new?(%{log: log}), do: Log.next_index(log) == 1
   def fully_persisted?(%{log: log}), do: Log.last_written(log) == Log.last_index_term(log)
 
-  def get_membership(%{membership: membership})
-      when is_atom(membership) and membership != nil,
-      do: membership
-
   def get_membership(%{cfg: %Config{id: id, uid: uid}, cluster: cluster} = state) do
     Cluster.get_membership(cluster, id, uid, Map.get(state, :membership, :voter))
   end
 
-  def get_membership(cluster, %{cfg: %Config{id: id, uid: uid}} = state) do
+  def get_membership(cluster, %{cfg: %Config{id: id, uid: uid}} = state) when is_map(cluster) do
     Cluster.get_membership(cluster, id, uid, Map.get(state, :membership, :voter))
   end
 
@@ -689,6 +1003,10 @@ defmodule RaftEx.Domain.Server do
   # Persistence
   # ---------------------------------------------------------------------------
 
+  # Persist at most every N applied entries; smaller advances ride the
+  # WAL replay on restart, while clean shutdown forces a final store (11.1).
+  @persist_applied_interval 64
+
   @doc "Persist `last_applied` to durable meta if it has advanced."
   @spec persist_last_applied(map()) :: map()
   def persist_last_applied(%{persisted_last_applied: pla, last_applied: la} = state)
@@ -700,12 +1018,52 @@ defmodule RaftEx.Domain.Server do
     la = min(la0, lwi)
     pla = Map.get(state, :persisted_last_applied, 0)
 
-    if la > pla do
+    if la - pla >= @persist_applied_interval do
       :ok = LogMeta.store_sync(meta_name(cfg), uid, :last_applied, la)
+      publish_apply_gauges(state, la)
       Map.put(state, :persisted_last_applied, la)
     else
       state
     end
+  end
+
+  # Partial states (e.g. unit-test fixtures without apply tracking) have
+  # nothing to persist.
+  def persist_last_applied(state), do: state
+
+  @doc "Force-persist `last_applied` (used on clean shutdown)."
+  @spec persist_last_applied!(map()) :: map()
+  def persist_last_applied!(%{last_applied: la0, log: log, cfg: %Config{uid: uid} = cfg} = state) do
+    {lwi, _} = Log.last_written(log)
+    la = min(la0, lwi)
+    pla = Map.get(state, :persisted_last_applied, 0)
+
+    if la > pla do
+      :ok = LogMeta.store_sync(meta_name(cfg), uid, :last_applied, la)
+      publish_apply_gauges(state, la)
+      Map.put(state, :persisted_last_applied, la)
+    else
+      state
+    end
+  end
+
+  defp publish_apply_gauges(%{cfg: %Config{id: id}, log: log} = state, la) do
+    {lwi, _} = Log.last_written(log)
+    {last_idx, _} = Log.last_index_term(log)
+
+    snap_idx =
+      case Log.snapshot_index_term(log) do
+        {idx, _} when is_integer(idx) -> idx
+        _ -> 0
+      end
+
+    Counters.set_gauge(id, :last_applied, la)
+    Counters.set_gauge(id, :last_written_index, lwi)
+    Counters.set_gauge(id, :last_index, last_idx)
+    Counters.set_gauge(id, :snapshot_index, snap_idx)
+    Counters.set_gauge(id, :commit_index, Map.get(state, :commit_index, 0))
+    Counters.set_gauge(id, :commit_latency, Map.get(state, :commit_latency, 0))
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -715,10 +1073,19 @@ defmodule RaftEx.Domain.Server do
   @doc "Build AppendEntries RPCs for all peers (used on heartbeat / tick)."
   @spec make_rpcs(map()) :: {map(), list()}
   def make_rpcs(state) do
-    Enum.reduce(peers(state), {state, []}, fn {peer_id, peer}, {s0, effs} ->
-      {_, eff, s} = make_rpc_effect(peer_id, peer, 1, s0)
-      {s, [eff | effs]}
-    end)
+    {state, _more, effs} = make_pipelined_rpc_effects(state, [], true)
+    {state, effs}
+  end
+
+  @doc """
+  Build replication RPCs for lagging peers only (used for ack-triggered
+  catch-up). Unlike `make_rpcs/1`, up-to-date peers get no heartbeat here;
+  the periodic tick covers those.
+  """
+  @spec make_pipeline_rpcs(map()) :: {map(), list()}
+  def make_pipeline_rpcs(state) do
+    {state, _more, effs} = make_pipelined_rpc_effects(state, [], false)
+    {state, effs}
   end
 
   # ---------------------------------------------------------------------------
@@ -897,7 +1264,12 @@ defmodule RaftEx.Domain.Server do
       end)
 
     self_vote = %Types.PreVoteResult{term: term, token: token, vote_granted: true}
-    state = update_term_and_voted_for(term, id, state0)
+
+    # Pre-vote must not persist a vote in the current term; the durable
+    # self-vote is deferred until the real candidate phase. Recording
+    # voted_for here would block a legitimate candidate later (fail-closed
+    # elections require persistence only when actually granting).
+    state = state0
 
     {:pre_vote, Map.merge(state, %{leader_id: nil, votes: 0, pre_vote_token: token}),
      [{:next_event, :cast, self_vote}, {:send_vote_requests, vote_rpcs}]}
@@ -910,25 +1282,6 @@ defmodule RaftEx.Domain.Server do
   # Private — term management
   # ---------------------------------------------------------------------------
 
-  defp update_term_and_voted_for(
-         term,
-         voted_for,
-         %{cfg: %Config{uid: uid} = cfg, current_term: cur_term} = state
-       ) do
-    if term == cur_term and voted_for == Map.get(state, :voted_for) do
-      state
-    else
-      meta = meta_name(cfg)
-      LogMeta.store(meta, uid, :current_term, term)
-      LogMeta.store_sync(meta, uid, :voted_for, voted_for)
-      incr_counter(cfg, :term_and_voted_for_updates, 1)
-
-      state
-      |> Map.merge(%{current_term: term, voted_for: voted_for})
-      |> Map.update!(:cluster, &Cluster.reset_query_indexes/1)
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private — quorum and commit advancement
   # ---------------------------------------------------------------------------
@@ -940,28 +1293,120 @@ defmodule RaftEx.Domain.Server do
     maybe_emit_pending_release_cursor(state1, effects1)
   end
 
-  defp increment_commit_index(
-         %{current_term: ct, cfg: %Config{id: id}, cluster: cluster, log: log, commit_index: ci0} =
-           state0
-       ) do
+  @doc """
+  Advance `commit_index` to `candidate` when the entry there belongs to the
+  current term. The index never moves backwards: a candidate at or below the
+  current index is a no-op. Returns `{advanced?, state}`.
+  """
+  @spec advance_commit_index(map(), non_neg_integer()) :: {boolean(), map()}
+  def advance_commit_index(%{current_term: ct, commit_index: ci0} = state0, candidate)
+      when is_integer(candidate) and candidate > 0 do
+    if candidate <= ci0 do
+      {false, state0}
+    else
+      case fetch_term(candidate, state0) do
+        {^ct, state} ->
+          Metrics.inc(:quorum_reached)
+          Metrics.inc(:commit_advanced)
+          Metrics.set(:commit_index, candidate)
+
+          case state do
+            %{cfg: %{id: id}} ->
+              Counters.set_gauge(id, :commit_index, candidate)
+              Counters.set_gauge(id, :term, ct)
+
+            _ ->
+              :ok
+          end
+
+          {true, Map.put(state, :commit_index, candidate)}
+
+        {_, state} ->
+          # Prior-term entries can never commit by replica count alone.
+          {false, state}
+      end
+    end
+  end
+
+  def advance_commit_index(state, _candidate), do: {false, state}
+
+  defp increment_commit_index(%{cfg: %Config{id: id}, cluster: cluster, log: log} = state0) do
     {lwi, _} = Log.last_written(log)
     indexes = Cluster.voter_match_indexes(id, cluster, lwi)
     potential_ci = Cluster.agreed_commit(indexes)
 
-    case fetch_term(potential_ci, state0) do
-      {^ct, state} ->
-        if potential_ci > ci0 do
-          Metrics.inc(:quorum_reached)
-          Metrics.inc(:commit_advanced)
-          Metrics.set(:commit_index, potential_ci)
-        end
+    {_advanced?, state} = advance_commit_index(state0, potential_ci)
+    state
+  end
 
-        Map.put(state, :commit_index, potential_ci)
+  @doc """
+  Check automatic-compaction thresholds (entry count, WAL bytes, elapsed
+  time) and emit a compaction trigger when one fires.
 
-      {_, state} ->
-        state
+  A snapshot transfer in progress defers compaction; the next check retries
+  (14.2). Firing resets the entry counter and timestamp so one trigger
+  produces one snapshot (14.1).
+  """
+  @spec maybe_auto_compact(map(), integer()) :: {map(), list()}
+  def maybe_auto_compact(%{cfg: %Config{} = cfg} = state, now_ms) do
+    entry_thr = cfg.compaction_entry_threshold
+    wal_thr = cfg.compaction_wal_bytes
+    interval = cfg.compaction_interval_ms
+
+    since = Map.get(state, :entries_since_compact, 0)
+    last = Map.get(state, :last_auto_compact_ms, now_ms)
+
+    due =
+      (is_integer(entry_thr) and since >= entry_thr) or
+        (is_integer(wal_thr) and wal_bytes(state) >= wal_thr) or
+        (is_integer(interval) and now_ms - last >= interval)
+
+    cond do
+      not due ->
+        {state, []}
+
+      transfer_in_progress?(state) ->
+        {state, []}
+
+      true ->
+        state =
+          Map.merge(state, %{last_auto_compact_ms: now_ms, entries_since_compact: 0})
+
+        {state, [{:next_event, :info, {:ra_log_event, :major_compaction}}]}
     end
   end
+
+  # A snapshot transfer is in flight when this server is receiving one or
+  # any peer is being sent one.
+  defp transfer_in_progress?(%{snapshot_state: accept}) when not is_nil(accept), do: true
+
+  defp transfer_in_progress?(%{cluster: cluster}) when is_map(cluster) do
+    Enum.any?(cluster, fn
+      {_, %{status: {:sending_snapshot, _, _}}} -> true
+      _ -> false
+    end)
+  end
+
+  defp transfer_in_progress?(_), do: false
+
+  defp wal_bytes(%{log: %Log{data_dir: dir}}) when is_binary(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.starts_with?(&1, "wal"))
+        |> Enum.reduce(0, fn f, acc ->
+          case File.stat(Path.join(dir, f)) do
+            {:ok, %{size: s}} -> acc + s
+            _ -> acc
+          end
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  defp wal_bytes(_), do: 0
 
   # ---------------------------------------------------------------------------
   # Private — log application
@@ -982,8 +1427,10 @@ defmodule RaftEx.Domain.Server do
          effects0,
          %{
            last_applied: last_applied,
+           leader_id: leader_id,
            cfg:
              %Config{
+               id: id,
                machine_version: mac_ver,
                effective_machine_version: eff_mac_ver,
                effective_machine_module: mac_mod
@@ -997,9 +1444,13 @@ defmodule RaftEx.Domain.Server do
     {last_idx, _} = Log.last_index_term(log0)
     to = min(last_idx, apply_to)
 
-    fold_acc = {mac_mod, last_applied, state0, mac_state0, effects0, notifys0, nil}
+    # Batch-level shared context (11.4): the machine version and the
+    # leader check are identical for every entry in the batch, so compute
+    # them once instead of re-deriving them per entry.
+    shared = %{mac_ver: eff_mac_ver, leader?: is_nil(leader_id) or leader_id == id}
+    fold_acc = {mac_mod, last_applied, state0, mac_state0, effects0, notifys0, nil, shared}
 
-    {{_, applied_to, state, mac_state, effects, notifys, last_ts}, log} =
+    {{_, applied_to, state, mac_state, effects, notifys, last_ts, _}, log} =
       Log.fold(from, to, apply_fun, fold_acc, log0)
 
     commit_latency =
@@ -1007,13 +1458,34 @@ defmodule RaftEx.Domain.Server do
 
     final_effects = Effects.make_notify_effects(notifys, Enum.reverse(effects))
 
-    {%{
-       state
-       | last_applied: applied_to,
-         log: log,
-         commit_latency: commit_latency,
-         machine_state: mac_state
-     }, final_effects}
+    # Publish per-batch apply progress (11.6): one gauge write per batch,
+    # not per entry.
+    case state do
+      %{cfg: %{id: id}} ->
+        Counters.set_gauge(id, :last_applied, applied_to)
+        Counters.set_gauge(id, :commit_latency, commit_latency)
+
+      _ ->
+        :ok
+    end
+
+    state =
+      Map.merge(state, %{
+        last_applied: applied_to,
+        log: log,
+        commit_latency: commit_latency,
+        machine_state: mac_state,
+        entries_since_compact:
+          Map.get(state, :entries_since_compact, 0) + max(applied_to - last_applied, 0)
+      })
+
+    # Automatic compaction check (14.1): entry, WAL-byte, and time
+    # thresholds; deferred while a transfer is in flight (14.2). Times use
+    # the monotonic clock, matching `last_auto_compact_ms`.
+    {state, auto_effects} =
+      maybe_auto_compact(state, System.monotonic_time(:millisecond))
+
+    {state, final_effects ++ auto_effects}
   end
 
   defp do_apply_entries(_apply_to, _, notifys, effects, state) when is_list(effects) do
@@ -1024,17 +1496,17 @@ defmodule RaftEx.Domain.Server do
   defp apply_entry(
          _,
          {mod, la, %{cfg: %Config{machine_version: mv, effective_machine_version: em}} = state,
-          mac_st, effects, notifys, last_ts}
+          mac_st, effects, notifys, last_ts, shared}
        )
        when mv < em,
-       do: {mod, la, state, mac_st, effects, notifys, last_ts}
+       do: {mod, la, state, mac_st, effects, notifys, last_ts, shared}
 
   # User command.
   defp apply_entry(
          {idx, term, {:"$usr", cmd_meta, cmd, reply_mode}},
-         {module, _la, state, mac_st, effects0, notifys0, last_ts}
+         {module, _la, state, mac_st, effects0, notifys0, last_ts, shared}
        ) do
-    mac_ver = state.cfg.effective_machine_version
+    mac_ver = shared.mac_ver
     meta = build_command_meta(idx, term, mac_ver, reply_mode, cmd_meta)
     ts = Map.get(cmd_meta, :ts, last_ts)
     {next_mac_st, reply, mac_effs} = Machine.apply(module, meta, cmd, mac_st)
@@ -1043,22 +1515,22 @@ defmodule RaftEx.Domain.Server do
 
     # Only the leader owns the caller's reply alias. Followers applying the
     # same committed entry must not send a second reply to the client.
-    leader? = is_nil(state.leader_id) or state.leader_id == state.cfg.id
-
+    # `leader?` is constant for the whole batch (computed once in
+    # `do_apply_entries/5`), not re-derived per entry.
     {effects, notifys} =
-      if leader? do
+      if shared.leader? do
         Effects.add_reply(cmd_meta, reply, reply_mode, machine_effects, notifys0)
       else
         {machine_effects, notifys0}
       end
 
-    {module, idx, state, next_mac_st, effects, notifys, ts}
+    {module, idx, state, next_mac_st, effects, notifys, ts, shared}
   end
 
   # Cluster change.
   defp apply_entry(
          {idx, _term, {:"$ra_cluster_change", cmd_meta, new_cluster, reply_mode}},
-         {mod, _, state0, mac_st, effects0, notifys0, last_ts}
+         {mod, _, state0, mac_st, effects0, notifys0, last_ts, shared}
        ) do
     {effects, notifys} = Effects.add_reply(cmd_meta, :ok, reply_mode, effects0, notifys0)
 
@@ -1084,7 +1556,7 @@ defmodule RaftEx.Domain.Server do
           }
       end
 
-    {mod, idx, state, mac_st, effects, notifys, last_ts}
+    {mod, idx, state, mac_st, effects, notifys, last_ts, shared}
   end
 
   # Noop / machine-version upgrade entry.
@@ -1101,7 +1573,7 @@ defmodule RaftEx.Domain.Server do
                 effective_machine_version: old_mac_ver
               } = cfg0,
             current_term: ct
-          } = state0, mac_st, effects, notifys, last_ts}
+          } = state0, mac_st, effects, notifys, last_ts, shared}
        ) do
     cluster_change_perm = ct == term or state0.cluster_change_permitted
 
@@ -1122,24 +1594,25 @@ defmodule RaftEx.Domain.Server do
 
         apply_entry(
           {idx, term, {:"$usr", meta, {:machine_version, old_mac_ver, next_mac_ver}, :none}},
-          {module, la, state, mac_st, effects, notifys, last_ts}
+          {module, la, state, mac_st, effects, notifys, last_ts,
+           %{shared | mac_ver: next_mac_ver}}
         )
 
       next_mac_ver > old_mac_ver ->
         Logger.debug("#{log_id}: unknown machine version #{next_mac_ver}")
         cfg = %{cfg0 | effective_machine_version: next_mac_ver}
-        {cur_module, la, %{state0 | cfg: cfg}, mac_st, effects, notifys, last_ts}
+        {cur_module, la, %{state0 | cfg: cfg}, mac_st, effects, notifys, last_ts, shared}
 
       true ->
         state = %{state0 | cluster_change_permitted: cluster_change_perm}
-        {cur_module, idx, state, mac_st, effects, notifys, last_ts}
+        {cur_module, idx, state, mac_st, effects, notifys, last_ts, shared}
     end
   end
 
   # Cluster delete.
   defp apply_entry(
          {idx, _, {:"$ra_cluster", cmd_meta, :delete, reply_type}},
-         {module, _, state0, mac_st, effects0, notifys0, _last_ts}
+         {module, _, state0, mac_st, effects0, notifys0, _last_ts, _shared}
        ) do
     {effects1, notifys} = Effects.add_reply(cmd_meta, :ok, reply_type, effects0, notifys0)
     eol_effects = Machine.state_enter(module, :eol, mac_st)
@@ -1154,6 +1627,12 @@ defmodule RaftEx.Domain.Server do
   # ---------------------------------------------------------------------------
   # Private — command meta construction
   # ---------------------------------------------------------------------------
+
+  # Fast path for the common cast shape: skip the per-entry reduce when
+  # there is nothing to merge (11.4).
+  defp build_command_meta(idx, term, mac_ver, reply_mode, cmd_meta) when cmd_meta == %{} do
+    %{index: idx, machine_version: mac_ver, term: term, reply_mode: reply_mode}
+  end
 
   defp build_command_meta(idx, term, mac_ver, reply_mode, cmd_meta) do
     build_command_meta(idx, term, mac_ver, Map.put(cmd_meta, :reply_mode, reply_mode))
@@ -1236,8 +1715,10 @@ defmodule RaftEx.Domain.Server do
             {:not_appended, :not_caught_up, state, effects}
 
           true ->
+            existing_uid = get_in(peer, [:voter_status, :uid])
+
             new_cluster =
-              put_in(cluster, [target, :voter_status], %{membership: :voter, uid: nil})
+              put_in(cluster, [target, :voter_status], %{membership: :voter, uid: existing_uid})
 
             append_cluster_change(new_cluster, from, reply_mode, state, effects)
         end
@@ -1266,8 +1747,13 @@ defmodule RaftEx.Domain.Server do
             {:not_appended, :last_voter, state, effects}
 
           true ->
+            existing_uid = get_in(peer, [:voter_status, :uid])
+
             new_cluster =
-              put_in(cluster, [target, :voter_status], %{membership: :non_voter, uid: nil})
+              put_in(cluster, [target, :voter_status], %{
+                membership: :non_voter,
+                uid: existing_uid
+              })
 
             append_cluster_change(new_cluster, from, reply_mode, state, effects)
         end
@@ -1310,6 +1796,53 @@ defmodule RaftEx.Domain.Server do
     end
   end
 
+  # Append a homogeneous batch of user commands with a single `Log.write/2`
+  # (one WAL write + one sync for the whole batch). Returns `{state, effects,
+  # write_result}` where effects carry the pipelined replication work, quorum
+  # evaluation, and per-command `:after_log_append` replies. On a write error
+  # every caller in the batch gets an error reply and the log is untouched.
+  defp append_command_batch(cmds, %{log: log0, current_term: term} = state0) do
+    base = Log.next_index(log0)
+
+    entries =
+      Enum.with_index(cmds, fn cmd, i -> {base + i, term, cmd} end)
+
+    try do
+      case Log.write(entries, log0) do
+        {:ok, log} ->
+          {state, _, effects1} =
+            make_pipelined_rpc_effects(%{state0 | log: log}, [], false)
+
+          {state2, effects2} = evaluate_quorum(state, effects1)
+
+          effects =
+            cmds
+            |> Enum.with_index(fn cmd, i -> {cmd, base + i} end)
+            |> Enum.reduce(effects2, fn {cmd, idx}, acc ->
+              Effects.after_log_append_reply(cmd, idx, term, acc)
+            end)
+
+          {state2, effects, :ok}
+
+        {:error, reason} ->
+          effects =
+            Enum.reduce(cmds, [], fn cmd, acc ->
+              Effects.append_error_reply(cmd, reason, acc)
+            end)
+
+          {state0, effects, {:error, reason}}
+      end
+    rescue
+      _ ->
+        effects =
+          Enum.reduce(cmds, [], fn cmd, acc ->
+            Effects.append_error_reply(cmd, :wal_down, acc)
+          end)
+
+        {state0, effects, {:error, :wal_down}}
+    end
+  end
+
   defp append_cluster_change(
          cluster,
          from,
@@ -1349,7 +1882,7 @@ defmodule RaftEx.Domain.Server do
   # Private — RPC effects
   # ---------------------------------------------------------------------------
 
-  defp make_pipelined_rpc_effects(state, effects, _force) do
+  defp make_pipelined_rpc_effects(state, effects, heartbeat_current?) do
     %{
       cfg: %Config{
         id: id,
@@ -1363,31 +1896,109 @@ defmodule RaftEx.Domain.Server do
 
     next_log_idx = Log.next_index(log)
 
-    Enum.reduce(cluster, {state, false, effects}, fn
+    # 9.5: peers servable from the log share a single ascending read for the
+    # whole pass instead of one fold + reverse per peer. Peers whose next
+    # index points into a compacted region keep the per-peer snapshot path.
+    snap_idx =
+      case Log.snapshot_index_term(log) do
+        {idx, _} -> idx
+        _ -> nil
+      end
+
+    servable_from = if is_integer(snap_idx), do: snap_idx + 1, else: 1
+
+    targets =
+      for {peer_id,
+           %{next_index: ni, status: :normal, commit_index_sent: cis, match_index: mi} = peer0} <-
+            cluster,
+          peer_id != id,
+          ni < next_log_idx or cis < ci,
+          do: {peer_id, peer0, ni, mi}
+
+    shared =
+      case Enum.filter(targets, fn {_, _, ni, _} -> ni >= servable_from end) do
+        [] ->
+          nil
+
+        servable ->
+          min_ni = servable |> Enum.map(fn {_, _, ni, _} -> ni end) |> Enum.min()
+          {desc, _} = Log.fold(min_ni, next_log_idx - 1, fn e, a -> [e | a] end, [], log)
+          {Enum.reverse(desc), min_ni}
+      end
+
+    {state, more, effects, served} =
+      Enum.reduce(targets, {state, false, effects, MapSet.new()}, fn {peer_id, peer0, ni, mi},
+                                                                     {s0, more0, effs, served0} ->
+        shared_for =
+          case shared do
+            {asc, base} when ni >= base -> {asc, ni - base}
+            _ -> nil
+          end
+
+        {s, more, effs} =
+          process_peer_replication(
+            peer_id,
+            peer0,
+            ni,
+            mi,
+            ci,
+            next_log_idx,
+            more0,
+            effs,
+            s0,
+            batch_size,
+            max_pipeline,
+            shared_for
+          )
+
+        {s, more, effs, MapSet.put(served0, peer_id)}
+      end)
+
+    if heartbeat_current? do
+      send_heartbeats(state, more, effects, served, id, ci)
+    else
+      {state, more, effects}
+    end
+  end
+
+  # Heartbeats for up-to-date, normal peers skipped by the replication pass.
+  defp send_heartbeats(state, more, effects, served, id, ci) do
+    Enum.reduce(state.cluster, {state, more, effects}, fn
       {^id, _}, acc ->
         acc
 
-      {peer_id,
-       %{next_index: ni, status: :normal, commit_index_sent: cis, match_index: mi} = peer0},
-      {s0, more0, effs}
-      when ni < next_log_idx or cis < ci ->
-        process_peer_replication(
-          peer_id,
-          peer0,
-          ni,
-          mi,
-          ci,
-          next_log_idx,
-          more0,
-          effs,
-          s0,
-          batch_size,
-          max_pipeline
-        )
+      {peer_id, %{status: :normal, next_index: ni, commit_index_sent: cis} = peer0},
+      {s0, more0, effs} ->
+        if not MapSet.member?(served, peer_id) and ni >= Log.next_index(s0.log) and cis >= ci do
+          {s, eff} = make_heartbeat_effect(peer_id, peer0, s0)
+          {s, more0, [eff | effs]}
+        else
+          {s0, more0, effs}
+        end
 
       _, acc ->
         acc
     end)
+  end
+
+  # An empty AppendEntries that carries only the commit index. It advances
+  # neither `next_index` nor the in-flight window.
+  defp make_heartbeat_effect(peer_id, peer0, state) do
+    %{log: log0, current_term: term, commit_index: ci, cfg: %Config{id: id}} = state
+    {last_idx, last_term} = Log.last_index_term(log0)
+
+    rpc = %Types.AppendEntriesRpc{
+      entries: [],
+      term: term,
+      leader_id: id,
+      prev_log_index: last_idx,
+      prev_log_term: last_term,
+      leader_commit: ci
+    }
+
+    Metrics.inc(:append_entries_sent)
+    peer = Map.put(peer0, :commit_index_sent, ci)
+    {put_peer(peer_id, peer, state), {:send_rpc, peer_id, rpc}}
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
@@ -1402,7 +2013,8 @@ defmodule RaftEx.Domain.Server do
          effs,
          s0,
          batch_size,
-         max_pipeline
+         max_pipeline,
+         shared
        ) do
     count = Map.get(peer0, :backpressure_count, 0)
 
@@ -1414,7 +2026,7 @@ defmodule RaftEx.Domain.Server do
       effective_batch = max(1, min(batch_size, max_pipeline - in_flight))
 
       if in_flight < max_pipeline do
-        {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, [])
+        {new_ni, eff, s} = make_rpc_effect(peer_id, peer0, effective_batch, s0, shared)
 
         in_flight_entry = {ni - 1, new_ni - 1}
 
@@ -1423,7 +2035,10 @@ defmodule RaftEx.Domain.Server do
           |> Map.put(:next_index, new_ni)
           |> Map.put(:commit_index_sent, ci)
           |> Map.put(:backpressure_count, 0)
-          |> Map.update(:in_flight, [in_flight_entry], fn list -> list ++ [in_flight_entry] end)
+          |> Map.update(:in_flight, :queue.from_list([in_flight_entry]), fn
+            q when is_list(q) -> :queue.from_list(q ++ [in_flight_entry])
+            q -> :queue.in(in_flight_entry, q)
+          end)
 
         new_more = more0 or (new_ni < next_log_idx and new_ni - mi - 1 < max_pipeline)
         {put_peer(peer_id, peer, s), new_more, [eff | effs]}
@@ -1435,50 +2050,85 @@ defmodule RaftEx.Domain.Server do
     end
   end
 
-  defp make_rpc_effect(peer_id, %{next_index: next} = _peer, batch_size, state, cache \\ []) do
+  defp make_rpc_effect(peer_id, %{next_index: next} = _peer, batch_size, state, shared) do
     prev_idx = next - 1
     %{log: log0} = state
 
     Metrics.inc(:append_entries_sent)
 
-    case Log.fetch_term(prev_idx, log0) do
-      {prev_term, log} when is_integer(prev_term) ->
-        make_append_entries_rpc(
-          peer_id,
-          prev_idx,
-          prev_term,
-          batch_size,
-          %{state | log: log},
-          cache
-        )
+    case shared do
+      {asc_entries, offset} when is_list(asc_entries) and is_integer(offset) and offset >= 0 ->
+        # 9.5: slice this peer's batch out of the pass-wide shared read.
+        prev_term =
+          if offset == 0 do
+            elem(Log.fetch_term(prev_idx, log0), 0)
+          else
+            case Enum.at(asc_entries, offset - 1) do
+              {_, t, _} -> t
+              _ -> nil
+            end
+          end
 
-      {nil, log} ->
-        %{cfg: %Config{id: id}, current_term: term} = state
+        if is_integer(prev_term) do
+          last_idx = Log.next_index(log0) - 1
+          to = min(last_idx, prev_idx + batch_size)
+          entries = Enum.slice(asc_entries, offset, max(to - prev_idx, 0))
 
-        case Log.snapshot_index_term(log) do
-          {^prev_idx, prev_term} ->
+          rpc = %Types.AppendEntriesRpc{
+            entries: entries,
+            term: state.current_term,
+            leader_id: state.cfg.id,
+            prev_log_index: prev_idx,
+            prev_log_term: prev_term,
+            leader_commit: state.commit_index
+          }
+
+          {to + 1, {:send_rpc, peer_id, rpc}, state}
+        else
+          # Shared window does not cover prev (truncated corner): per-peer.
+          make_rpc_effect(peer_id, %{next_index: next}, batch_size, state, nil)
+        end
+
+      _ ->
+        case Log.fetch_term(prev_idx, log0) do
+          {prev_term, log} when is_integer(prev_term) ->
             make_append_entries_rpc(
               peer_id,
               prev_idx,
               prev_term,
               batch_size,
               %{state | log: log},
-              cache
+              []
             )
 
-          {snap_idx, _} when not is_nil(snap_idx) ->
-            snap_state = Log.snapshot_state(log)
-            {snap_idx, {:send_snapshot, peer_id, {snap_state, id, term}}, %{state | log: log}}
+          {nil, log} ->
+            %{cfg: %Config{id: id}, current_term: term} = state
 
-          _ ->
-            make_append_entries_rpc(
-              peer_id,
-              0,
-              0,
-              batch_size,
-              %{state | log: log},
-              cache
-            )
+            case Log.snapshot_index_term(log) do
+              {^prev_idx, prev_term} ->
+                make_append_entries_rpc(
+                  peer_id,
+                  prev_idx,
+                  prev_term,
+                  batch_size,
+                  %{state | log: log},
+                  []
+                )
+
+              {snap_idx, _} when not is_nil(snap_idx) ->
+                snap_state = Log.snapshot_state(log)
+                {snap_idx, {:send_snapshot, peer_id, {snap_state, id, term}}, %{state | log: log}}
+
+              _ ->
+                make_append_entries_rpc(
+                  peer_id,
+                  0,
+                  0,
+                  batch_size,
+                  %{state | log: log},
+                  []
+                )
+            end
         end
     end
   end
@@ -1694,16 +2344,79 @@ defmodule RaftEx.Domain.Server do
 
   defp become(:leader, %{cluster: cluster, log: log0} = state) do
     log = Log.release_resources(map_size(cluster), :sequential, log0)
-    %{state | log: log, cluster_change_permitted: false}
+
+    state
+    |> Map.put(:log, log)
+    |> Map.put(:cluster_change_permitted, false)
+    |> Map.put(:became_leader_at, System.monotonic_time(:millisecond))
   end
 
   defp become(:follower, %{log: log0} = state) do
     log = Log.release_resources(1, :random, log0)
     cluster1 = Cluster.reset_peer_statuses(state.cluster)
-    %{state | log: log, cluster: cluster1}
+
+    state
+    |> Map.put(:log, log)
+    |> Map.put(:cluster, cluster1)
+    |> Map.put(:leader_id, nil)
+    |> Map.put(:transfer_leadership, nil)
+    |> Map.delete(:became_leader_at)
   end
 
   defp become(_, state), do: state
+
+  @doc """
+  Check-quorum: verify a majority of voters has been heard from within
+  `timeout_ms`. Returns `{:leader, state, []}` when quorum holds or during
+  the grace period after election, and `{:follower, state, []}` when the
+  majority is lost, so a partitioned leader steps down.
+  """
+  @spec check_quorum(map(), integer(), non_neg_integer()) :: {atom(), map(), list()}
+  def check_quorum(%{cfg: %Config{id: self_id}, cluster: cluster} = state, now_ms, timeout_ms) do
+    became_at = Map.get(state, :became_leader_at, now_ms)
+
+    if now_ms - became_at < timeout_ms do
+      {:leader, state, []}
+    else
+      voters = Cluster.voters(cluster)
+      total = length(voters)
+      needed = div(total, 2) + 1
+
+      self_voter? =
+        case Map.get(cluster, self_id) do
+          %{voter_status: %{membership: :voter}} -> true
+          %{voter_status: %{membership: _}} -> false
+          _ -> true
+        end
+
+      fresh_self = if self_voter?, do: 1, else: 0
+
+      fresh_peers =
+        Enum.count(voters, fn id ->
+          id != self_id and
+            case Map.get(cluster, id) do
+              %{last_ack: last} when is_integer(last) and last != 0 ->
+                diff = now_ms - last
+                diff >= 0 and diff <= timeout_ms
+
+              _ ->
+                false
+            end
+        end)
+
+      if fresh_self + fresh_peers >= needed do
+        {:leader, state, []}
+      else
+        new_state =
+          state
+          |> Map.put(:leader_id, nil)
+          |> Map.put(:transfer_leadership, nil)
+          |> Map.delete(:became_leader_at)
+
+        {:follower, new_state, []}
+      end
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Private — cluster scan (recovery)
@@ -1769,7 +2482,24 @@ defmodule RaftEx.Domain.Server do
             nil -> {0, 0}
           end
 
-        cluster = Cluster.new(id, initial_nodes)
+        cluster =
+          case Log.snapshot_cluster(log) do
+            snap_cluster when is_map(snap_cluster) and map_size(snap_cluster) > 0 ->
+              restored =
+                Enum.reduce(snap_cluster, %{}, fn {member_id, %{voter_status: vs}}, acc ->
+                  Map.put(acc, member_id, Cluster.new_peer() |> Map.put(:voter_status, vs))
+                end)
+
+              if Map.has_key?(restored, id) do
+                restored
+              else
+                Map.put(restored, id, Cluster.new_peer())
+              end
+
+            _ ->
+              Cluster.new(id, initial_nodes)
+          end
+
         {cluster, initial_mac_ver, mac_st, {idx, term}}
     end
   end
@@ -1805,11 +2535,7 @@ defmodule RaftEx.Domain.Server do
   defp maybe_recover_from_recovery_checkpoint(last_applied, _commit_index, _snap_state, state),
     do: {last_applied, state}
 
-  defp incr_counter(%Config{counter: cnt}, field, n) when not is_nil(cnt) do
-    # :counters.add would go here when counter integration is added
-    _ = {cnt, field, n}
-    :ok
+  defp incr_counter(%Config{id: id} = _cfg, field, n) do
+    Counters.inc(id, field, n)
   end
-
-  defp incr_counter(_, _, _), do: :ok
 end

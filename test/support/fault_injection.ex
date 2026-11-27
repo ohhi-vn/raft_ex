@@ -16,6 +16,37 @@ defmodule RaftEx.TestSupport.FaultInjection do
     :ok
   end
 
+  @doc "Hard-kill a pid with `:kill` (untrappable) and return `:ok`."
+  def hard_kill(pid) when is_pid(pid) do
+    Process.exit(pid, :kill)
+    :ok
+  end
+
+  @doc "Wait until `pid` is dead, polling up to `timeout_ms` (default 5s)."
+  def assert_dead(pid, timeout_ms \\ 5_000) when is_pid(pid) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_assert_dead(pid, deadline)
+  end
+
+  defp do_assert_dead(pid, deadline) do
+    if not Process.alive?(pid) do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) > deadline do
+        raise "process #{inspect(pid)} still alive after hard_kill"
+      else
+        Process.sleep(10)
+        do_assert_dead(pid, deadline)
+      end
+    end
+  end
+
+  @doc "Hard-kill `pid` and wait for it to die. Returns `:ok`."
+  def hard_kill_and_wait(pid, timeout_ms \\ 5_000) when is_pid(pid) do
+    hard_kill(pid)
+    assert_dead(pid, timeout_ms)
+  end
+
   @doc "Make a data directory read-only to simulate a disk failure."
   def disk_failure_readonly(dir) do
     File.chmod!(dir, 0o555)

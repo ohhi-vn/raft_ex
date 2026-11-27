@@ -40,42 +40,64 @@ defmodule RaftEx.Infra.Observability.Metrics do
   @doc "Increment a counter by `amount` (default 1)."
   @spec inc(atom() | String.t(), number()) :: :ok
   def inc(name, amount \\ 1) do
-    init()
     key = {:counter, name}
-    :ets.update_counter(@table, key, {2, amount}, {key, 0})
-    :ok
+
+    try do
+      :ets.update_counter(@table, key, {2, amount}, {key, 0})
+      :ok
+    rescue
+      ArgumentError ->
+        init()
+        :ets.update_counter(@table, key, {2, amount}, {key, 0})
+        :ok
+    end
   end
 
   @doc "Set a gauge value."
   @spec set(atom() | String.t(), number()) :: :ok
   def set(name, value) do
-    init()
-    :ets.insert(@table, {{:gauge, name}, value})
-    :ok
+    try do
+      :ets.insert(@table, {{:gauge, name}, value})
+      :ok
+    rescue
+      ArgumentError ->
+        init()
+        :ets.insert(@table, {{:gauge, name}, value})
+        :ok
+    end
   end
 
   @doc "Record a latency observation (milliseconds) into a histogram."
   @spec observe(atom() | String.t(), number()) :: :ok
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def observe(name, value) do
-    init()
     key = {:hist, name}
 
-    if is_integer(value) do
-      # Count and sum are updated atomically; min/max are best-effort.
-      :ets.update_counter(@table, key, [{2, 1}, {3, value}], {key, 0, 0, value, value})
-      update_hist_extremes(key, value)
-    else
-      case :ets.lookup(@table, key) do
-        [{^key, count, sum, minv, maxv}] ->
-          :ets.insert(@table, {key, count + 1, sum + value, min(minv, value), max(maxv, value)})
-
-        [] ->
-          :ets.insert(@table, {key, 1, value, value, value})
-      end
+    try do
+      do_observe(key, value)
+    rescue
+      ArgumentError ->
+        init()
+        do_observe(key, value)
     end
 
     :ok
+  end
+
+  defp do_observe(key, value) when is_integer(value) do
+    # Count and sum are updated atomically; min/max are best-effort.
+    :ets.update_counter(@table, key, [{2, 1}, {3, value}], {key, 0, 0, value, value})
+    update_hist_extremes(key, value)
+  end
+
+  defp do_observe(key, value) do
+    case :ets.lookup(@table, key) do
+      [{^key, count, sum, minv, maxv}] ->
+        :ets.insert(@table, {key, count + 1, sum + value, min(minv, value), max(maxv, value)})
+
+      [] ->
+        :ets.insert(@table, {key, 1, value, value, value})
+    end
   end
 
   defp update_hist_extremes(key, value) do
@@ -98,8 +120,11 @@ defmodule RaftEx.Infra.Observability.Metrics do
   @doc "Read a single metric value (counter/gauge) or histogram tuple."
   @spec get(atom() | String.t()) :: term()
   def get(name) do
-    init()
-    lookup_counter(name) || lookup_gauge(name) || lookup_hist(name)
+    try do
+      lookup_counter(name) || lookup_gauge(name) || lookup_hist(name)
+    rescue
+      ArgumentError -> nil
+    end
   end
 
   defp lookup_counter(name) do
@@ -126,9 +151,11 @@ defmodule RaftEx.Infra.Observability.Metrics do
   @doc "Read all metrics as a map."
   @spec all() :: map()
   def all do
-    init()
-
-    :ets.tab2list(@table)
+    try do
+      :ets.tab2list(@table)
+    rescue
+      ArgumentError -> []
+    end
     |> Enum.reduce(%{}, fn
       {{:counter, name}, v}, acc ->
         Map.put(acc, {:counter, name}, v)
@@ -147,8 +174,11 @@ defmodule RaftEx.Infra.Observability.Metrics do
   @doc "Reset all metrics."
   @spec reset() :: :ok
   def reset do
-    init()
-    :ets.delete_all_objects(@table)
-    :ok
+    try do
+      :ets.delete_all_objects(@table)
+      :ok
+    rescue
+      ArgumentError -> :ok
+    end
   end
 end

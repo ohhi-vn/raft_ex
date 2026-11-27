@@ -55,10 +55,26 @@ defmodule RaftEx.Infra.Network.Transport do
 
   @doc """
   Sends an RPC message to a server.
+
+  Never blocks the caller: remote sends use `:nosuspend`/`:noconnect` and
+  fail fast with `{:error, reason}` when the peer is unreachable, so a
+  partitioned peer can never delay replication to reachable peers. Callers
+  retry on their own schedule (tick, acknowledgement-triggered pipeline, or
+  node-up reconciliation) instead of sleeping inline.
+
+  Pass `sender: server_id` in `opts` to attribute the message without a
+  remote lookup on the receiving side.
   """
   @spec send_rpc(server_id(), rpc(), opts()) :: :ok | {:error, term()}
-  def send_rpc({name, node} = server_id, rpc, _opts \\ []) do
-    msg = {:gen_cast, {:rpc, rpc}}
+  def send_rpc({name, node} = server_id, rpc, opts \\ []) do
+    msg =
+      case Keyword.get(opts, :sender) do
+        {sname, snode} = sender when is_atom(sname) and is_atom(snode) ->
+          {:gen_cast, {:rpc, sender, rpc}}
+
+        _ ->
+          {:gen_cast, {:rpc, rpc}}
+      end
 
     if node == node() do
       do_send_local(name, msg)
@@ -80,14 +96,15 @@ defmodule RaftEx.Infra.Network.Transport do
   end
 
   @doc """
-  Casts a message to a server asynchronously.
+  Casts a message to a server asynchronously. Never blocks: a partitioned
+  peer yields `{:error, reason}` immediately instead of stalling the caller.
   """
   @spec cast(server_id(), term()) :: :ok | {:error, term()}
   def cast({name, node} = server_id, msg) do
     if node == node() do
       do_cast_local(name, msg)
     else
-      do_cast_remote(server_id, msg)
+      do_send_remote(server_id, msg)
     end
   end
 
@@ -144,30 +161,25 @@ defmodule RaftEx.Infra.Network.Transport do
     end
   end
 
-  defp do_send_remote(server_id, msg) do
-    do_send_remote(server_id, msg, 3)
-  end
+  defp do_send_remote({name, node} = server_id, msg) do
+    # Non-blocking: `:nosuspend` means a partitioned peer cannot stall the
+    # caller; failures surface as `{:error, reason}` for the caller to
+    # handle (rollback, suspect marking, scheduled retry) instead of
+    # sleeping inline. The outer tuple preserves pid attribution for legacy
+    # receivers; the `{:rpc, sender, ...}` envelope inside `msg` carries
+    # the server id.
+    :erlang.send({name, node}, {self(), msg}, [:nosuspend])
+    :ok
+  catch
+    _, :noconnection ->
+      {:error, :noconnection}
 
-  defp do_send_remote(server_id, _msg, 0) do
-    Logger.warning(
-      "RaftEx.Infra.Network.Transport: failed to send to #{inspect(server_id)} after retries"
-    )
-
-    {:error, :noconnection}
-  end
-
-  defp do_send_remote({name, node} = server_id, msg, attempts) do
-    if Node.connect(node) do
-      send({name, node}, {self(), msg})
-      :ok
-    else
-      Logger.warning(
-        "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
+    _, reason ->
+      Logger.debug(
+        "RaftEx.Infra.Network.Transport: send to #{inspect(server_id)} failed: #{inspect(reason)}"
       )
 
-      Process.sleep(100)
-      do_send_remote(server_id, msg, attempts - 1)
-    end
+      {:error, reason}
   end
 
   defp do_call_local(name, msg, timeout) do
@@ -186,45 +198,21 @@ defmodule RaftEx.Infra.Network.Transport do
     end
   end
 
-  defp do_call_remote(server_id, msg, timeout) do
-    do_call_remote(server_id, msg, timeout, 3)
-  end
+  defp do_call_remote({name, node}, msg, timeout) do
+    # Single attempt, no inline sleeps: callers decide their own retry
+    # schedule. A failed call returns an error immediately.
+    try do
+      reply = :rpc.call(node, :gen_statem, :call, [{name, node}, msg, timeout], timeout)
+      {:ok, reply}
+    catch
+      :exit, {:timeout, _} ->
+        {:error, :timeout}
 
-  defp do_call_remote(server_id, _msg, _timeout, 0) do
-    Logger.warning(
-      "RaftEx.Infra.Network.Transport: call failed to #{inspect(server_id)} after retries"
-    )
+      :exit, {:noconnection, _} ->
+        {:error, :noconnection}
 
-    {:error, :noconnection}
-  end
-
-  defp do_call_remote({name, node} = server_id, msg, timeout, attempts) do
-    if Node.connect(node) do
-      try do
-        reply = :rpc.call(node, :gen_statem, :call, [{name, node}, msg, timeout], timeout)
-        {:ok, reply}
-      catch
-        :exit, {:timeout, _} ->
-          {:error, :timeout}
-
-        :exit, {:noconnection, _} ->
-          Logger.warning(
-            "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
-          )
-
-          Process.sleep(100)
-          do_call_remote(server_id, msg, timeout, attempts - 1)
-
-        :exit, reason ->
-          {:error, reason}
-      end
-    else
-      Logger.warning(
-        "RaftEx.Infra.Network.Transport: no connection to #{inspect(node)} (#{attempts} attempts left)"
-      )
-
-      Process.sleep(100)
-      do_call_remote(server_id, msg, timeout, attempts - 1)
+      :exit, reason ->
+        {:error, reason}
     end
   end
 
@@ -236,15 +224,6 @@ defmodule RaftEx.Infra.Network.Transport do
       pid ->
         :gen_statem.cast(pid, msg)
         :ok
-    end
-  end
-
-  defp do_cast_remote({name, node}, msg) do
-    if Node.connect(node) do
-      send({name, node}, {:gen_cast, msg})
-      :ok
-    else
-      {:error, :noconnection}
     end
   end
 

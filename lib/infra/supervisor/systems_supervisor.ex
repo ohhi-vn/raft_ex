@@ -36,19 +36,33 @@ defmodule RaftEx.Infra.Supervisor.SystemsSupervisor do
   def stop_system(config) when is_map(config), do: stop_system(config.name)
 
   def stop_system(name) when is_atom(name) do
-    children = DynamicSupervisor.which_children(__MODULE__)
-
-    stored = :persistent_term.get(pid_key(name), nil)
-    pid = find_child_pid(children, name, stored)
-
     result =
-      case pid do
-        nil -> :ok
-        child_pid -> DynamicSupervisor.terminate_child(__MODULE__, child_pid)
+      try do
+        children = DynamicSupervisor.which_children(__MODULE__)
+
+        stored = :persistent_term.get(pid_key(name), nil)
+        pid = find_child_pid(children, name, stored)
+
+        case pid do
+          nil -> :ok
+          child_pid -> DynamicSupervisor.terminate_child(__MODULE__, child_pid)
+        end
+      catch
+        :exit, _ -> :ok
       end
 
-    :persistent_term.erase(pid_key(name))
-    :persistent_term.erase({:"$ra_system", name})
+    try do
+      :persistent_term.erase(pid_key(name))
+    rescue
+      _ -> :ok
+    end
+
+    try do
+      :persistent_term.erase({:"$ra_system", name})
+    rescue
+      _ -> :ok
+    end
+
     result
   end
 

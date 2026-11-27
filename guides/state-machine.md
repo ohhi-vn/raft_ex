@@ -6,7 +6,7 @@ state machine.
 ## Required callbacks
 
 - `init/1` — initial state.
-- `apply/3` — apply a committed command, return `{reply, new_state}`.
+- `apply/3` — apply a committed command, return `{new_state, reply}` (or `{new_state, reply, effects}`).
 - `snapshot/1` and `restore/2` — for snapshots.
 
 ## Auxiliary commands

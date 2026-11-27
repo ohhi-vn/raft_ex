@@ -55,6 +55,10 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # crc32
   @footer_size 4
 
+  # Upper bound for a single WAL record payload. Records declaring more are
+  # treated as corrupt and stop recovery instead of allocating unbounded memory.
+  @max_blob_size 64_000_000
+
   # Default flush interval in milliseconds
   @default_flush_interval 50
 
@@ -108,10 +112,39 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   - `:wal_max_batch_size` - Maximum entries per batch write
   - `:wal_sync_method` - `:datasync`, `:fsync`, or `:none`
   - `:wal_compute_checksums` - Whether to compute CRC32 checksums
+
+  The supervisor-style aliases `:max_size_bytes`, `:max_batch_size`,
+  `:sync_method`, `:compute_checksums`, and `:max_entries` are also honored;
+  `normalize_config/1` resolves both styles to the canonical `wal_*` keys.
   """
   @spec start_link(map()) :: GenServer.on_start()
   def start_link(%{names: %{wal: name}} = config) do
     GenServer.start_link(__MODULE__, config, name: name)
+  end
+
+  @doc """
+  Resolve a WAL config to its canonical `wal_*` keys.
+
+  Accepts both the canonical keys (`:wal_sync_method`,
+  `:wal_compute_checksums`, `:wal_max_batch_size`, `:wal_max_size_bytes`,
+  `:wal_max_entries`) and the supervisor-style aliases (`:sync_method`,
+  `:compute_checksums`, `:max_batch_size`, `:max_size_bytes`,
+  `:max_entries`). Canonical keys win when both are present. All other keys
+  (`:names`, `:dir`, `:data_dir`, `:system`, ...) pass through unchanged.
+  """
+  @spec normalize_config(map()) :: map()
+  def normalize_config(config) when is_map(config) do
+    Map.merge(config, %{
+      wal_sync_method:
+        Map.get(config, :wal_sync_method, Map.get(config, :sync_method, :datasync)),
+      wal_compute_checksums:
+        Map.get(config, :wal_compute_checksums, Map.get(config, :compute_checksums, true)),
+      wal_max_batch_size:
+        Map.get(config, :wal_max_batch_size, Map.get(config, :max_batch_size, 8192)),
+      wal_max_size_bytes:
+        Map.get(config, :wal_max_size_bytes, Map.get(config, :max_size_bytes, 256_000_000)),
+      wal_max_entries: Map.get(config, :wal_max_entries, Map.get(config, :max_entries, nil))
+    })
   end
 
   @doc """
@@ -167,6 +200,20 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   @doc """
+  Atomically replace a server's WAL suffix starting at `from_index` with
+  `new_entries`.
+
+  Retains entries with indexes below `from_index` and appends `new_entries`
+  in one temp-write/rename step, so a crash leaves either the complete old
+  file or the complete new file. Used for follower conflict replacement.
+  """
+  @spec replace_from(atom(), term(), RaftEx.Domain.Types.index(), list(), timeout()) ::
+          :ok | {:error, term()}
+  def replace_from(wal_name, uid, from_index, new_entries, timeout \\ 5_000) do
+    GenServer.call(wal_name, {:replace_from, uid, from_index, new_entries}, timeout)
+  end
+
+  @doc """
   Get a server's current WAL state.
 
   Returns `{first_index, last_index, buffer_size}`.
@@ -199,8 +246,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   """
   @spec recover(map()) :: {RaftEx.Domain.Types.index(), RaftEx.Domain.Types.index(), list()}
   def recover(config) do
-    wal_file = recover_file_path(config)
-    do_recover_file(wal_file, Map.get(config, :wal_compute_checksums, true))
+    server_dir = recover_dir_path(config)
+    recover_all_entries(server_dir, compute_checksums?(config))
   end
 
   # ---------------------------------------------------------------------------
@@ -211,11 +258,12 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   def init(config) do
     Process.flag(:trap_exit, true)
 
-    wal_dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
+    normalized = normalize_config(config)
+    wal_dir = Map.get(normalized, :dir, Map.get(normalized, :data_dir, "."))
     :ok = File.mkdir_p!(wal_dir)
 
     state = %__MODULE__{
-      config: config,
+      config: normalized,
       files: %{},
       flush_timer: start_flush_timer()
     }
@@ -266,17 +314,19 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   def handle_call({:truncate, uid, index}, _from, state) do
-    state =
-      case Map.fetch(state.files, uid) do
-        {:ok, file} ->
-          file = do_truncate(index, file)
-          put_file(uid, file, state)
+    case Map.fetch(state.files, uid) do
+      {:ok, file} ->
+        case apply_truncate_prefix(file, index, state.config) do
+          {:ok, file} ->
+            {:reply, :ok, put_file(uid, file, state)}
 
-        :error ->
-          state
-      end
+          {:error, reason, file} ->
+            {:reply, {:error, reason}, put_file(uid, file, state)}
+        end
 
-    {:reply, :ok, state}
+      :error ->
+        {:reply, :ok, state}
+    end
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.Nesting
@@ -293,6 +343,18 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
       :error ->
         {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:replace_from, uid, from_index, new_entries}, _from, state) do
+    {file, state} = ensure_file(uid, state)
+
+    case apply_replace_from(file, from_index, new_entries, state.config) do
+      {:ok, file} ->
+        {:reply, :ok, put_file(uid, file, state)}
+
+      {:error, reason, file} ->
+        {:reply, {:error, reason}, put_file(uid, file, state)}
     end
   end
 
@@ -402,11 +464,12 @@ defmodule RaftEx.Infra.Persistence.LogWal do
 
       :error ->
         dir = Map.get(state.config, :dir, Map.get(state.config, :data_dir, "."))
-        path = Path.join([dir, to_string(uid), "wal.dat"])
+        server_dir = Path.join(dir, to_string(uid))
+        path = Path.join(server_dir, "wal.dat")
         :ok = File.mkdir_p!(Path.dirname(path))
 
-        checksums = Map.get(state.config, :wal_compute_checksums, true)
-        {first_index, last_index, _entries} = do_recover_file(path, checksums)
+        checksums = compute_checksums?(state.config)
+        {first_index, last_index, _entries} = recover_all_entries(server_dir, checksums)
 
         # Entries already in the file must not be buffered again: they are
         # recovered into the server's log state by `Log.init/1`, and rewriting
@@ -423,7 +486,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
           pending_writes: [],
           first_index: first_index,
           last_index: last_index,
-          file_size: file_size
+          file_size: file_size,
+          rotation_seq: next_rotation_seq(server_dir)
         }
 
         {file, %{state | files: Map.put(state.files, uid, file)}}
@@ -466,19 +530,20 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     end
   end
 
-  defp max_batch_size(config), do: Map.get(config, :wal_max_batch_size, 8192)
+  defp max_batch_size(config),
+    do: Map.get(config, :wal_max_batch_size, Map.get(config, :max_batch_size, 8192))
 
+  defp compute_checksums?(config),
+    do: Map.get(config, :wal_compute_checksums, Map.get(config, :compute_checksums, true))
+
+  # True when other messages are already waiting: another append is
+  # likely queued behind this one, so defer the sync and let the scheduled
+  # flush group them. Uses the O(1) queue-length counter instead of copying
+  # and scanning the whole mailbox on every append (11.5).
   defp queued_appends? do
-    case Process.info(self(), :messages) do
-      {:messages, msgs} ->
-        Enum.any?(msgs, fn
-          {:call, _from, {:append, _, _}} -> true
-          {:append, _, _} -> true
-          _ -> false
-        end)
-
-      _ ->
-        false
+    case Process.info(self(), :message_queue_len) do
+      {:message_queue_len, n} -> n > 0
+      _ -> false
     end
   end
 
@@ -557,7 +622,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
             Metrics.inc(:wal_segment_writes)
             Metrics.observe(:wal_flush_latency_ms, latency)
 
-            {:ok, %{file | buffer: [], buffer_size: 0}}
+            {:ok, maybe_rotate(%{file | buffer: [], buffer_size: 0}, config)}
 
           {:error, reason} ->
             {:error, reason, file}
@@ -568,13 +633,8 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     end
   end
 
-  defp write_entries_to_wal(entries, file, config) do
-    entries_binary = :erlang.term_to_binary(entries)
-    write_entries_binary(entries_binary, length(entries), file, config)
-  end
-
   defp write_entries_binary(entries_binary, count, file, config) do
-    compute_checksums = Map.get(config, :wal_compute_checksums, true)
+    compute_checksums = compute_checksums?(config)
 
     # Build WAL record from the already-serialized batch.
     blob_size = byte_size(entries_binary)
@@ -608,7 +668,7 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   defp sync_wal(file, config) do
-    sync_method = Map.get(config, :wal_sync_method, :datasync)
+    sync_method = Map.get(config, :wal_sync_method, Map.get(config, :sync_method, :datasync))
 
     case sync_method do
       :fsync ->
@@ -634,70 +694,216 @@ defmodule RaftEx.Infra.Persistence.LogWal do
     end)
   end
 
-  defp do_truncate(index, file) do
-    # Remove entries up to and including index
-    new_buffer = Enum.reject(file.buffer, fn {idx, _, _} -> idx <= index end)
+  defp apply_truncate_prefix(file, index, config) do
+    compute_checksums = compute_checksums?(config)
+    _ = sync_wal(file, config)
+    server_dir = Path.dirname(file.path)
+    {_first, _last, disk_entries} = recover_all_entries(server_dir, compute_checksums)
 
-    new_first_index =
-      case new_buffer do
-        [] -> index + 1
-        _ -> new_buffer |> List.last() |> elem(0)
-      end
-
-    # Truncate WAL file
-    :ok = :file.truncate(file.fd)
-    {:ok, 0} = :file.position(file.fd, :bof)
+    retained =
+      Enum.reject(
+        disk_entries ++ Enum.reverse(file.buffer),
+        fn {idx, _, _} -> idx <= index end
+      )
 
     Logger.info(
       "RaftEx.Infra.Persistence.LogWal: truncated to index #{index}, " <>
-        "new first_index=#{new_first_index}"
+        "retaining #{length(retained)} entries"
     )
 
-    %{
-      file
-      | buffer: new_buffer,
-        buffer_size: length(new_buffer),
-        first_index: new_first_index,
-        file_size: 0
-    }
+    case rewrite_wal_file_atomic(file, retained, config) do
+      {:ok, file} ->
+        :ok = delete_rotated_files(server_dir)
+
+        {first, last} =
+          case retained do
+            [] -> {index + 1, index}
+            _ -> {hd(retained) |> elem(0), List.last(retained) |> elem(0)}
+          end
+
+        file = %{file | first_index: first, last_index: last}
+        ack_sync(file, :ok)
+        notify_pending_writes(file)
+        {:ok, %{file | pending_sync: [], pending_writes: []}}
+
+      {:error, reason, file} ->
+        {:error, reason, file}
+    end
   end
 
   defp apply_truncate_from(file, from_index, config) do
-    compute_checksums = Map.get(config, :wal_compute_checksums, true)
+    compute_checksums = compute_checksums?(config)
     _ = sync_wal(file, config)
-    {_first, _last, disk_entries} = do_recover_file(file.path, compute_checksums)
+    server_dir = Path.dirname(file.path)
+    {_first, _last, disk_entries} = recover_all_entries(server_dir, compute_checksums)
 
-    entries =
+    retained =
       Enum.reject(
         disk_entries ++ Enum.reverse(file.buffer),
         fn {idx, _, _} -> idx >= from_index end
       )
 
-    :ok = :file.close(file.fd)
-    {:ok, fd} = :file.open(file.path, [:write, :binary, :raw, :truncate])
+    case rewrite_wal_file_atomic(file, retained, config) do
+      {:ok, file} ->
+        :ok = delete_rotated_files(server_dir)
 
-    file = %{
-      file
-      | fd: fd,
-        file_size: 0,
-        buffer: [],
-        buffer_size: 0,
-        pending_sync: [],
-        pending_writes: []
-    }
+        {first, last} =
+          case retained do
+            [] -> {from_index, from_index - 1}
+            _ -> {hd(retained) |> elem(0), List.last(retained) |> elem(0)}
+          end
 
-    with {:ok, file} <- write_entries_to_wal(entries, file, config),
-         :ok <- sync_wal(file, config) do
-      {first, last} =
-        case entries do
-          [] -> {from_index, from_index - 1}
-          _ -> {hd(entries) |> elem(0), List.last(entries) |> elem(0)}
-        end
+        file = %{file | first_index: first, last_index: last}
+        ack_sync(file, :ok)
+        notify_pending_writes(file)
+        {:ok, %{file | pending_sync: [], pending_writes: []}}
 
-      {:ok, %{file | first_index: first, last_index: last}}
+      {:error, reason, file} ->
+        {:error, reason, file}
+    end
+  end
+
+  defp apply_replace_from(file, from_index, new_entries, config) do
+    compute_checksums = compute_checksums?(config)
+    _ = sync_wal(file, config)
+    server_dir = Path.dirname(file.path)
+    {_first, _last, disk_entries} = recover_all_entries(server_dir, compute_checksums)
+
+    retained =
+      Enum.reject(
+        disk_entries ++ Enum.reverse(file.buffer),
+        fn {idx, _, _} -> idx >= from_index end
+      )
+
+    combined = retained ++ new_entries
+
+    case rewrite_wal_file_atomic(file, combined, config) do
+      {:ok, file} ->
+        :ok = delete_rotated_files(server_dir)
+
+        {first, last} =
+          case combined do
+            [] -> {from_index, from_index - 1}
+            _ -> {hd(combined) |> elem(0), List.last(combined) |> elem(0)}
+          end
+
+        file = %{file | first_index: first, last_index: last}
+        ack_sync(file, :ok)
+        notify_pending_writes(file)
+        {:ok, %{file | pending_sync: [], pending_writes: []}}
+
+      {:error, reason, file} ->
+        {:error, reason, file}
+    end
+  end
+
+  # Write `entries` to a temp file, sync it, atomically rename it over the
+  # live WAL, and sync the containing directory. The original fd is kept open
+  # until the rename succeeds, so a crash leaves either the complete old file
+  # or the complete new file. Returns `{:ok, new_file}` with a reopened
+  # append-mode fd, or `{:error, reason, file}` with the original untouched.
+  defp rewrite_wal_file_atomic(file, entries, config) do
+    compute_checksums = compute_checksums?(config)
+    temp_path = file.path <> ".tmp"
+
+    with {:ok, temp_fd} <- :file.open(temp_path, [:write, :binary, :raw]),
+         {:ok, bytes_written} <- write_entries_to_fd(entries, temp_fd, compute_checksums),
+         :ok <- sync_fd(temp_fd),
+         :ok <- :file.close(temp_fd),
+         :ok <- :file.rename(temp_path, file.path),
+         :ok <- sync_dir(file.path),
+         :ok <- close_original_fd(file.fd),
+         {:ok, fd} <- :file.open(file.path, [:append, :binary, :raw]),
+         {:ok, file_size} <- :file.position(fd, :eof) do
+      Metrics.inc(:wal_flushes)
+      Metrics.inc(:wal_bytes_written, bytes_written)
+
+      {:ok,
+       %{
+         file
+         | fd: fd,
+           file_size: file_size,
+           buffer: [],
+           buffer_size: 0
+       }}
     else
-      {:error, reason, file} -> {:error, reason, file}
-      {:error, reason} -> {:error, reason, file}
+      {:error, reason} ->
+        _ = File.rm(temp_path)
+        {:error, reason, file}
+
+      _other ->
+        _ = File.rm(temp_path)
+        {:error, :rewrite_failed, file}
+    end
+  end
+
+  defp write_entries_to_fd(entries, fd, compute_checksums) do
+    entries_binary = :erlang.term_to_binary(entries)
+    blob_size = byte_size(entries_binary)
+    count = length(entries)
+
+    header =
+      <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned, blob_size::32-unsigned>>
+
+    data =
+      if compute_checksums do
+        crc = :erlang.crc32([header, entries_binary])
+        [header, entries_binary, <<crc::32-unsigned>>]
+      else
+        [header, entries_binary]
+      end
+
+    case :file.write(fd, data) do
+      :ok -> {:ok, :erlang.iolist_size(data)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_fd(fd) do
+    case :file.sync(fd) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  catch
+    _, reason -> {:error, reason}
+  end
+
+  defp close_original_fd(nil), do: :ok
+
+  defp close_original_fd(fd) do
+    try do
+      case :file.close(fd) do
+        :ok -> :ok
+        # Already closed (e.g. after an fd-level I/O failure): nothing to leak.
+        {:error, :einval} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    catch
+      _, reason -> {:error, reason}
+    end
+  end
+
+  defp sync_dir(file_path) do
+    dir = Path.dirname(file_path)
+
+    try do
+      case :file.open(dir, [:read, :binary, :raw]) do
+        {:ok, dir_fd} ->
+          result = :file.sync(dir_fd)
+          :file.close(dir_fd)
+          result
+
+        {:error, :eisdir} ->
+          # OTP's file driver refuses to open directories, so a portable
+          # directory fsync is unavailable. The rename itself remains atomic;
+          # only the rename's durability across power loss is best-effort.
+          :ok
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    catch
+      _, reason -> {:error, reason}
     end
   end
 
@@ -705,15 +911,156 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # Recovery
   # ---------------------------------------------------------------------------
 
-  defp recover_file_path(%{uid: uid} = config) do
-    # Full WAL config: a uid selects the server's file under the base dir.
+  defp recover_dir_path(%{uid: uid} = config) do
     dir = Map.get(config, :dir, Map.get(config, :data_dir, "."))
-    Path.join([dir, to_string(uid), "wal.dat"])
+    Path.join(dir, to_string(uid))
   end
 
-  defp recover_file_path(config) do
-    # Server directory, as passed by `Log.init/1`.
-    Path.join(Map.fetch!(config, :data_dir), "wal.dat")
+  defp recover_dir_path(config) do
+    Map.fetch!(config, :data_dir)
+  end
+
+  @doc false
+  def max_size_bytes(config) do
+    Map.get(config, :wal_max_size_bytes, Map.get(config, :max_size_bytes, 256_000_000))
+  end
+
+  defp rotated_seq(path) do
+    base = Path.basename(path)
+
+    case Regex.run(~r/^wal\.(\d+)\.dat$/, base, capture: :all_but_first) do
+      [seq] ->
+        case Integer.parse(seq) do
+          {n, ""} -> {:ok, n}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp list_wal_files(server_dir) do
+    case File.ls(server_dir) do
+      {:ok, names} ->
+        rotated =
+          names
+          |> Enum.map(&Path.join(server_dir, &1))
+          |> Enum.filter(&(rotated_seq(&1) != :error))
+          |> Enum.sort_by(fn path ->
+            {:ok, n} = rotated_seq(path)
+            n
+          end)
+
+        active = Path.join(server_dir, "wal.dat")
+
+        paths =
+          if File.exists?(active) do
+            rotated ++ [active]
+          else
+            rotated
+          end
+
+        {:ok, paths}
+
+      {:error, _} ->
+        {:ok, []}
+    end
+  end
+
+  defp next_rotation_seq(server_dir) do
+    {:ok, paths} = list_wal_files(server_dir)
+
+    seqs =
+      for path <- paths,
+          {:ok, n} <- [rotated_seq(path)],
+          do: n
+
+    case seqs do
+      [] -> 1
+      _ -> Enum.max(seqs) + 1
+    end
+  end
+
+  defp recover_all_entries(server_dir, compute_checksums) do
+    case list_wal_files(server_dir) do
+      {:ok, []} ->
+        {0, 0, []}
+
+      {:ok, paths} ->
+        all =
+          Enum.flat_map(paths, fn path ->
+            {_f, _l, entries} = do_recover_file(path, compute_checksums)
+            entries
+          end)
+
+        recovered_range(all)
+    end
+  end
+
+  defp delete_rotated_files(server_dir) do
+    {:ok, paths} = list_wal_files(server_dir)
+
+    Enum.each(paths, fn path ->
+      if rotated_seq(path) != :error, do: File.rm(path)
+    end)
+
+    :ok
+  end
+
+  defp maybe_rotate(file, config) do
+    max = max_size_bytes(config)
+
+    if is_integer(max) and max > 0 and file.file_size >= max do
+      rotate_active_file(file)
+    else
+      file
+    end
+  end
+
+  defp rotate_active_file(%{path: path, fd: fd} = file) do
+    seq = Map.get(file, :rotation_seq, 1)
+    server_dir = Path.dirname(path)
+    rotated_path = Path.join(server_dir, "wal.#{seq}.dat")
+
+    with :ok <- sync_fd(fd),
+         :ok <- close_original_fd(fd),
+         :ok <- File.rename(path, rotated_path),
+         :ok <- sync_dir(path),
+         {:ok, new_fd} <- :file.open(path, [:append, :binary, :raw]),
+         {:ok, file_size} <- :file.position(new_fd, :eof) do
+      Logger.info("RaftEx.Infra.Persistence.LogWal: rotated to #{Path.basename(rotated_path)}")
+
+      %{
+        file
+        | fd: new_fd,
+          file_size: file_size,
+          buffer: [],
+          buffer_size: 0,
+          rotation_seq: seq + 1
+      }
+    else
+      {:error, reason} ->
+        Metrics.inc(:wal_rotation_errors)
+        Logger.error("RaftEx.Infra.Persistence.LogWal: rotation failed: #{inspect(reason)}")
+        reopen_after_failed_rotate(file)
+    end
+  catch
+    _, reason ->
+      Metrics.inc(:wal_rotation_errors)
+      Logger.error("RaftEx.Infra.Persistence.LogWal: rotation failed: #{inspect(reason)}")
+      reopen_after_failed_rotate(file)
+  end
+
+  defp reopen_after_failed_rotate(%{path: path} = file) do
+    case :file.open(path, [:append, :binary, :raw]) do
+      {:ok, fd} ->
+        {:ok, size} = :file.position(fd, :eof)
+        %{file | fd: fd, file_size: size}
+
+      _ ->
+        file
+    end
   end
 
   defp do_recover_file(wal_file, compute_checksums) do
@@ -758,12 +1105,30 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   end
 
   defp do_recover_records(fd, @version, compute_checksums, acc) do
-    case :file.read(fd, 8) do
-      {:ok, <<_count::32-unsigned, blob_size::32-unsigned>>} ->
-        {:ok, entries_binary} = :file.read(fd, blob_size)
-        recover_records_with_footer(fd, compute_checksums, entries_binary, acc)
+    case read_exact(fd, 8) do
+      {:ok, <<count::32-unsigned, blob_size::32-unsigned>>} ->
+        cond do
+          blob_size > @max_blob_size ->
+            # Implausible length: stop instead of allocating.
+            acc
+
+          true ->
+            header =
+              <<@magic::32-unsigned, @version::8-unsigned, count::32-unsigned,
+                blob_size::32-unsigned>>
+
+            case read_exact(fd, blob_size) do
+              {:ok, entries_binary} ->
+                recover_verified_record(fd, compute_checksums, header, entries_binary, acc)
+
+              _ ->
+                # Truncated payload (:eof or short read): stop, keep prior records.
+                acc
+            end
+        end
 
       _ ->
+        # Truncated header: stop.
         acc
     end
   end
@@ -773,27 +1138,74 @@ defmodule RaftEx.Infra.Persistence.LogWal do
   # decode those files; stop instead of returning half a log.
   defp do_recover_records(_fd, _version, _compute_checksums, acc), do: acc
 
-  # Records are accumulated newest-first so each batch is a single prepend;
-  # `do_recover_file/2` reverses once at the end. Appending to the accumulator
-  # made recovery quadratic in the number of records.
-  defp recover_records_with_footer(fd, compute_checksums, entries_binary, acc) do
+  defp recover_verified_record(fd, compute_checksums, header, entries_binary, acc) do
     if compute_checksums do
-      case :file.read(fd, @footer_size) do
-        {:ok, <<_crc::32-unsigned>>} ->
-          do_recover(fd, compute_checksums, Enum.reverse(decode(entries_binary), acc))
+      case read_exact(fd, @footer_size) do
+        {:ok, <<expected_crc::32-unsigned>>} ->
+          actual_crc = :erlang.crc32([header, entries_binary])
+
+          if actual_crc == expected_crc do
+            case decode(entries_binary) do
+              {:ok, decoded} -> do_recover(fd, compute_checksums, Enum.reverse(decoded, acc))
+              :error -> acc
+            end
+          else
+            # Checksum mismatch: stop at the last valid record.
+            acc
+          end
 
         _ ->
           acc
       end
     else
-      do_recover(fd, compute_checksums, Enum.reverse(decode(entries_binary), acc))
+      case decode(entries_binary) do
+        {:ok, decoded} -> do_recover(fd, compute_checksums, Enum.reverse(decoded, acc))
+        :error -> acc
+      end
     end
   end
 
   defp decode(binary) do
-    :erlang.binary_to_term(binary)
+    {:ok, :erlang.binary_to_term(binary, [:safe])}
   rescue
-    ArgumentError -> []
+    ArgumentError -> :error
+  catch
+    _, _ -> :error
+  end
+
+  # Read exactly `n` bytes unless the file ends first. Returns
+  # `{:ok, binary}` only when all `n` bytes were read; `:eof` and short
+  # reads stop recovery. `n = 0` returns an empty binary without reading.
+  defp read_exact(_fd, 0), do: {:ok, <<>>}
+
+  defp read_exact(fd, n) when is_integer(n) and n > 0 do
+    read_exact(fd, n, [])
+  end
+
+  defp read_exact(_fd, 0, acc), do: {:ok, :erlang.iolist_to_binary(Enum.reverse(acc))}
+
+  defp read_exact(fd, remaining, acc) when remaining > 0 do
+    case :file.read(fd, remaining) do
+      {:ok, bin} when is_binary(bin) ->
+        got = byte_size(bin)
+
+        cond do
+          got == remaining ->
+            {:ok, :erlang.iolist_to_binary(Enum.reverse([bin | acc]))}
+
+          got > 0 ->
+            read_exact(fd, remaining - got, [bin | acc])
+
+          true ->
+            :eof
+        end
+
+      :eof ->
+        :eof
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   defp start_flush_timer do

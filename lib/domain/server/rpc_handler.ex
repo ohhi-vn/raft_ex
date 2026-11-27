@@ -38,7 +38,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
   alias RaftEx.Domain.Server.{Cluster, Config}
   alias RaftEx.Domain.Types
   alias RaftEx.Infra.Filesystem
-  alias RaftEx.Infra.Observability.Metrics
+  alias RaftEx.Infra.Observability.{Counters, Metrics}
   alias RaftEx.Infra.Persistence.{Log, LogMeta, LogSnapshot}
 
   # ---------------------------------------------------------------------------
@@ -115,18 +115,29 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       {log, append_effects} = append_entries(entries, state.log, state)
       state = %{state | log: log}
 
-      # Update commit index
-      {state, commit_effects} = update_commit_index(leader_commit, state)
+      if Enum.any?(append_effects, &match?({:append_failed, _}, &1)) do
+        # Durability failure: keep the old log and reject so the leader
+        # retries instead of believing the entries are stored.
+        {next_index, state} = find_next_index(state)
 
-      # Build success reply
-      {last_index, last_term} = Log.last_index_term(log)
-      reply = build_append_entries_reply(state.current_term, true, state, last_index, last_term)
+        reply =
+          build_append_entries_reply(state.current_term, false, state, nil, nil, next_index)
 
-      effects =
-        [{:send_rpc, leader_id, reply}, {:reset_election_timeout}] ++
-          append_effects ++ commit_effects
+        {:follower, state, [{:send_rpc, leader_id, reply}]}
+      else
+        # Update commit index
+        {state, commit_effects} = update_commit_index(leader_commit, state)
 
-      {:follower, state, effects}
+        # Build success reply
+        {last_index, last_term} = Log.last_index_term(log)
+        reply = build_append_entries_reply(state.current_term, true, state, last_index, last_term)
+
+        effects =
+          [{:send_rpc, leader_id, reply}, {:reset_election_timeout}] ++
+            append_effects ++ commit_effects
+
+        {:follower, state, effects}
+      end
     else
       # Log inconsistency - reject
       {next_index, state} = find_next_index(state)
@@ -166,66 +177,89 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       reply_term == current_term ->
         peer_id = state.rpc_from
 
-        Metrics.inc(:append_entries_acked)
+        if is_nil(peer_id) or not is_map_key(cluster0, peer_id) do
+          # Stale reply from an unknown or removed peer: acknowledge nothing
+          # and, crucially, do not re-add it to the membership.
+          {state, []}
+        else
+          now_ms = System.monotonic_time(:millisecond)
 
-        lag =
-          case state do
-            %{log: log} ->
-              {li, _} = Log.last_index_term(log)
-              max(li - last_index, 0)
+          Metrics.inc(:append_entries_acked)
 
-            _ ->
-              0
-          end
+          lag =
+            case state do
+              %{log: log} ->
+                {li, _} = Log.last_index_term(log)
+                max(li - last_index, 0)
 
-        Metrics.set({:replication_lag_ms, peer_id}, lag)
+              _ ->
+                0
+            end
 
-        peer0 = Map.get(cluster0, peer_id, %{})
-        in_flight = Map.get(peer0, :in_flight, [])
-        acked0 = Map.get(peer0, :acked_in_flight, [])
+          Metrics.set({:replication_lag, peer_id}, lag)
 
-        acked =
-          if last_index in acked0, do: acked0, else: acked0 ++ [last_index]
+          peer0 = Map.get(cluster0, peer_id, %{})
+          in_flight = Map.get(peer0, :in_flight, :queue.new())
+          acked0 = Map.get(peer0, :acked_in_flight, MapSet.new())
+          acked0 = if is_struct(acked0, MapSet), do: acked0, else: MapSet.new(acked0)
 
-        {match_index, new_in_flight} =
-          if in_flight == [] do
-            {max(Map.get(peer0, :match_index, 0), last_index), []}
-          else
-            # Advance over contiguous acknowledged prefixes only.
-            m0 = Map.get(peer0, :match_index, 0)
-            {m, remaining} =
-              advance_contiguous(m0, in_flight, acked)
+          # Track this acknowledgement; the set is pruned to the in-flight
+          # window below so long-lived peers stay bounded (9.3).
+          acked = MapSet.put(acked0, last_index)
 
-            # Fallback when no exact in-flight match was found.
-            m =
-              if m == m0 and not Enum.any?(in_flight, fn {_p, l} -> l == last_index end) do
-                max(m0, last_index)
-              else
-                m
-              end
+          {match_index, new_in_flight, acked} =
+            advance_match(Map.get(peer0, :match_index, 0), in_flight, acked, last_index)
 
-            {m, remaining}
-          end
+          # Clamp the follower's hint: it may only confirm what the leader
+          # actually holds, never reach past the leader's log (9.8).
+          leader_next =
+            case state do
+              %{log: log} -> Log.next_index(log)
+              _ -> match_index + 1
+            end
 
-        cluster =
-          Cluster.update_peer(
-            peer_id,
-            %{
-              match_index: match_index,
-              next_index: max(next_index || (match_index + 1), match_index + 1),
-              status: :normal,
-              in_flight: new_in_flight,
-              acked_in_flight: acked
-            },
-            cluster0
-          )
+          hinted =
+            if is_integer(next_index) and next_index > 0 do
+              min(max(next_index, match_index + 1), leader_next)
+            else
+              min(match_index + 1, leader_next)
+            end
 
-        state = %{state | cluster: cluster}
+          cluster =
+            Cluster.update_peer(
+              peer_id,
+              %{
+                match_index: match_index,
+                next_index: hinted,
+                status: :normal,
+                in_flight: new_in_flight,
+                acked_in_flight: acked,
+                last_ack: now_ms
+              },
+              cluster0
+            )
 
-        # Try to advance commit index
-        {state, effects} = maybe_advance_commit_index(state)
+          state = %{state | cluster: cluster}
 
-        {state, effects}
+          # Try to advance commit index
+          {state, effects} = maybe_advance_commit_index(state)
+
+          # An acknowledgement that still leaves the peer behind (or freed
+          # pipeline capacity) schedules another replication pass so a
+          # lagging follower catches up without waiting for client
+          # traffic or the next tick (9.2).
+          peer1 = Map.get(state.cluster, peer_id, %{})
+          next_ni = Map.get(peer1, :next_index, hinted)
+
+          effects =
+            if next_ni < leader_next do
+              effects ++ [{:next_event, :info, :pipeline_rpcs}]
+            else
+              effects
+            end
+
+          {state, effects}
+        end
 
       # Reply term is behind - ignore
       reply_term < current_term ->
@@ -252,32 +286,48 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       reply_term == current_term ->
         peer_id = state.rpc_from
 
-        # Use next_index hint if provided, otherwise decrement
-        new_next_index =
-          if next_index && next_index > 0 do
-            next_index
-          else
-            max(1, state.cluster[peer_id].next_index - 1)
-          end
+        if is_nil(peer_id) or not is_map_key(state.cluster, peer_id) do
+          # Stale reply from an unknown or removed peer: ignore it instead
+          # of crashing on a missing peer or re-adding it to the cluster.
+          {state, []}
+        else
+          now_ms = System.monotonic_time(:millisecond)
 
-        cluster =
-          Cluster.update_peer(
-            peer_id,
-            %{
-              next_index: new_next_index,
-              status: :normal,
-              in_flight: [],
-              acked_in_flight: []
-            },
-            state.cluster
-          )
+          # Backtracking hints only ever move next_index backward: clamp
+          # the follower's hint to the current value and ignore hints at
+          # or above it; with no usable hint, step back by one (9.8).
+          current_ni = Map.get(state.cluster[peer_id], :next_index, 1)
 
-        state = %{state | cluster: cluster}
+          new_next_index =
+            cond do
+              is_integer(next_index) and next_index > 0 and next_index < current_ni ->
+                next_index
 
-        # Schedule retry
-        effects = [{:send_append_entries, peer_id}]
+              is_integer(next_index) and next_index > 0 ->
+                current_ni
 
-        {state, effects}
+              true ->
+                max(1, current_ni - 1)
+            end
+
+          cluster =
+            Cluster.update_peer(
+              peer_id,
+              %{
+                next_index: new_next_index,
+                status: :normal,
+                in_flight: :queue.new(),
+                acked_in_flight: MapSet.new(),
+                last_ack: now_ms
+              },
+              state.cluster
+            )
+
+          state = %{state | cluster: cluster}
+
+          # Schedule retry
+          {state, [{:send_append_entries, peer_id}]}
+        end
 
       # Reply term is behind - ignore
       reply_term < current_term ->
@@ -311,17 +361,43 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       leader_term < current_term ->
         reply = build_install_snapshot_reply(current_term, state, 0, 0)
 
-        case snapshot_dir(state) do
-          dir -> File.rm(Path.join(dir, "snapshot.dat"))
-        end
+        # Never delete the last valid snapshot: only discard an in-flight
+        # partial transfer, if any.
+        state =
+          case Map.get(state, :snapshot_state) do
+            accept when is_tuple(accept) ->
+              LogSnapshot.abort(accept)
+              state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
 
-        state = state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
+            _ ->
+              state
+          end
+
         effects = [{:send_rpc, leader_id, reply}]
         {:follower, state, effects}
 
-      # Leader's term is ahead or equal - process snapshot
-      leader_term >= current_term ->
-        state = update_term(state, leader_term)
+      # Leader's term is ahead - adopt it, then process snapshot
+      leader_term > current_term ->
+        state = adopt_term(state, leader_term)
+        state = %{state | leader_id: leader_id}
+
+        case chunk_state do
+          :first ->
+            handle_first_snapshot_chunk(meta, data, leader_id, state)
+
+          :middle ->
+            handle_middle_snapshot_chunk(data, leader_id, state)
+
+          :last ->
+            handle_last_snapshot_chunk(data, leader_id, state)
+
+          :full ->
+            handle_full_snapshot(meta, data, leader_id, state)
+        end
+
+      # Same term - observe leader without touching term/vote
+      leader_term == current_term ->
+        state = observe_term(state, leader_term)
         state = %{state | leader_id: leader_id}
 
         case chunk_state do
@@ -344,11 +420,11 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
 
-    # Close any in-flight partial transfer being superseded.
+    # Close any in-flight partial transfer being superseded. Only the
+    # temporary file is removed; a previously installed snapshot survives.
     case Map.get(state, :snapshot_state) do
       prev when is_tuple(prev) ->
-        fd = elem(prev, tuple_size(prev) - 1)
-        if is_port(fd) or is_pid(fd), do: :file.close(fd)
+        LogSnapshot.abort(prev)
 
       _ ->
         :ok
@@ -391,11 +467,8 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     Metrics.inc(:snapshot_chunks_received)
     snap_dir = snapshot_dir(state)
 
-    data =
-      if byte_size(data) >= 4,
-        do: binary_part(data, 4, byte_size(data) - 4),
-        else: data
-
+    # Framing (`<<crc::32, payload>>`) is stripped uniformly inside
+    # `complete_accept/2`; pass the wire bytes through unchanged.
     case LogSnapshot.complete_accept(data, accept_state) do
       {:ok, _bytes} ->
         case LogSnapshot.recover(snap_dir) do
@@ -435,6 +508,17 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     old_mac_state = Map.get(state, :machine_state)
     {:ok, log, _} = Log.install_snapshot({snap_idx, snap_term}, nil, [], state.log)
 
+    # Make the installed snapshot self-consistent: the log's term tracking
+    # and snapshot state must reflect the snapshot, and the reply must
+    # carry the snapshot term so the leader resumes from the right index.
+    # The snapshot also becomes this server's future send source.
+    log = %{
+      log
+      | last_term: snap_term,
+        last_written_index_term: {snap_idx, snap_term},
+        snapshot_state: mac_state
+    }
+
     state =
       state
       |> Map.put(:log, log)
@@ -443,6 +527,7 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       |> Map.put(:snapshot_meta, nil)
       |> Map.put(:last_applied, max(Map.get(state, :last_applied, 0), snap_idx))
       |> Map.put(:commit_index, max(Map.get(state, :commit_index, 0), snap_idx))
+      |> adopt_snapshot_cluster(meta)
 
     if is_map(state.cfg) && state.cfg.effective_machine_module do
       Machine.snapshot_installed(
@@ -459,13 +544,61 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     {:follower, state, [{:send_rpc, leader_id, reply}]}
   end
 
+  # Adopt the membership recorded in the snapshot when it is a well-formed
+  # member map; the snapshot reflects the cluster at its index, which a
+  # lagging follower has not yet replicated. Progress fields are reset to
+  # defaults while membership roles (and uids) are preserved.
+  defp adopt_snapshot_cluster(state, meta) do
+    case Map.get(meta, :cluster) do
+      cluster when is_map(cluster) and map_size(cluster) > 0 ->
+        self_id =
+          case state do
+            %{cfg: %{id: id}} -> id
+            _ -> nil
+          end
+
+        peers =
+          Map.new(cluster, fn {id, peer} ->
+            membership =
+              case peer do
+                %{voter_status: %{membership: m}} -> m
+                _ -> :voter
+              end
+
+            uid =
+              case peer do
+                %{voter_status: %{uid: u}} -> u
+                _ -> nil
+              end
+
+            {id,
+             Cluster.new_peer() |> Map.put(:voter_status, %{membership: membership, uid: uid})}
+          end)
+
+        peers =
+          if self_id != nil and not Map.has_key?(peers, self_id) do
+            Map.put(peers, self_id, Cluster.new_peer())
+          else
+            peers
+          end
+
+        Map.put(state, :cluster, peers)
+
+      _ ->
+        state
+    end
+  end
+
   defp snapshot_failure(leader_id, state, reason) do
     Metrics.inc(:snapshot_chunks_failed)
     Logger.error("RaftEx.RpcHandler: snapshot transfer failed: #{inspect(reason)}")
     reply = build_install_snapshot_reply(state.current_term, state, 0, 0)
 
-    case snapshot_dir(state) do
-      dir -> File.rm(Path.join(dir, "snapshot.dat"))
+    # Discard only the partial transfer; a previously installed snapshot
+    # must survive a failed replacement.
+    case Map.get(state, :snapshot_state) do
+      accept when is_tuple(accept) -> LogSnapshot.abort(accept)
+      _ -> :ok
     end
 
     state = state |> Map.put(:snapshot_state, nil) |> Map.put(:snapshot_meta, nil)
@@ -504,19 +637,27 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       reply_term == current_term ->
         peer_id = state.rpc_from
 
-        cluster =
-          Cluster.update_peer(
-            peer_id,
-            %{
-              match_index: last_index,
-              next_index: last_index + 1,
-              status: :normal
-            },
-            state.cluster
-          )
+        if is_nil(peer_id) or not is_map_key(state.cluster, peer_id) do
+          # Stale reply from an unknown or removed peer: ignore it instead
+          # of re-adding the peer to the membership.
+          {state, []}
+        else
+          now_ms = System.monotonic_time(:millisecond)
 
-        state = %{state | cluster: cluster}
-        {state, []}
+          cluster =
+            Cluster.update_peer(
+              peer_id,
+              %{
+                match_index: last_index,
+                next_index: last_index + 1,
+                status: :normal,
+                last_ack: now_ms
+              },
+              state.cluster
+            )
+
+          {%{state | cluster: cluster}, []}
+        end
 
       reply_term < current_term ->
         {state, []}
@@ -552,13 +693,33 @@ defmodule RaftEx.Domain.Server.RpcHandler do
         effects = [{:send_rpc, leader_id, reply}]
         {state, effects}
 
-      leader_term >= current_term ->
+      leader_term > current_term ->
         old_commit = Map.get(state, :commit_index, 0)
         new_commit = max(old_commit, commit_index || 0)
 
         state =
           state
-          |> update_term(leader_term)
+          |> adopt_term(leader_term)
+          |> Map.put(:leader_id, leader_id)
+          |> Map.put(:commit_index, new_commit)
+
+        reply = %Types.HeartbeatReply{
+          query_index: query_index,
+          term: leader_term
+        }
+
+        apply_effects =
+          if new_commit > old_commit, do: [{:apply_committed, new_commit}], else: []
+
+        {state, [{:send_rpc, leader_id, reply}, {:reset_election_timeout} | apply_effects]}
+
+      leader_term == current_term ->
+        old_commit = Map.get(state, :commit_index, 0)
+        new_commit = max(old_commit, commit_index || 0)
+
+        state =
+          state
+          |> observe_term(leader_term)
           |> Map.put(:leader_id, leader_id)
           |> Map.put(:commit_index, new_commit)
 
@@ -595,17 +756,25 @@ defmodule RaftEx.Domain.Server.RpcHandler do
       reply_term == current_term ->
         peer_id = state.rpc_from
 
-        cluster =
-          Cluster.update_peer(
-            peer_id,
-            %{
-              query_index: query_index
-            },
-            cluster0
-          )
+        if is_nil(peer_id) or not is_map_key(cluster0, peer_id) do
+          # Stale reply from an unknown or removed peer: ignore it instead
+          # of re-adding the peer to the membership.
+          {state, []}
+        else
+          now_ms = System.monotonic_time(:millisecond)
 
-        state = %{state | cluster: cluster}
-        {state, []}
+          cluster =
+            Cluster.update_peer(
+              peer_id,
+              %{
+                query_index: query_index,
+                last_ack: now_ms
+              },
+              cluster0
+            )
+
+          {Map.put(state, :cluster, cluster), []}
+        end
 
       reply_term < current_term ->
         {state, []}
@@ -646,19 +815,19 @@ defmodule RaftEx.Domain.Server.RpcHandler do
         {log, []}
 
       {idx, _, _} ->
-        # Everything from the first conflict onward is replaced. Truncate once,
-        # then write the surviving suffix in a single WAL batch.
-        log = Log.truncate(idx, log)
+        # Everything from the first conflict onward is replaced atomically:
+        # retain the prefix and append the surviving suffix in one
+        # temp-write/rename step, so a crash cannot lose durable entries.
         entries_to_write = Enum.drop_while(entries, fn {i, _, _} -> i < idx end)
 
-        case Log.write(entries_to_write, log) do
+        case Log.replace_from(idx, entries_to_write, log) do
           {:ok, new_log} ->
             effects = [{:ra_log_event, {:written, entries_to_write}}]
             {new_log, effects}
 
           {:error, reason} ->
             Logger.error("Failed to write log entries: #{inspect(reason)}")
-            {log, []}
+            {log, [{:append_failed, reason}]}
         end
     end
   end
@@ -696,17 +865,21 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     # Find the highest index replicated on a majority
     new_commit_index = Cluster.agreed_commit(match_indexes)
 
-    if new_commit_index > state.commit_index do
-      state = %{state | commit_index: new_commit_index}
+    # Both commit paths share one helper: only a current-term entry may
+    # commit, and the index never moves backwards (9.7).
+    case Server.advance_commit_index(state, new_commit_index) do
+      {true, state} ->
+        # The commit rides on the next AppendEntries/heartbeat instead of a
+        # dedicated broadcast round (9.6); local application is immediate.
+        effects = [
+          {:apply_committed, new_commit_index},
+          {:next_event, :info, :pipeline_rpcs}
+        ]
 
-      effects = [
-        {:apply_committed, new_commit_index},
-        {:broadcast_commit, new_commit_index}
-      ]
+        {state, effects}
 
-      {state, effects}
-    else
-      {state, []}
+      {false, state} ->
+        {state, []}
     end
   end
 
@@ -716,41 +889,83 @@ defmodule RaftEx.Domain.Server.RpcHandler do
     {next_index, state}
   end
 
-  defp advance_contiguous(match_index, in_flight, acked) do
-    advance_contiguous(match_index, in_flight, acked, in_flight)
+  # Advance `match_index` on a successful acknowledgement. A success reply
+  # for `last_index` confirms the follower's log matches the leader's
+  # through that index (log matching property), so match jumps there
+  # directly instead of walking a contiguous prefix one range at a time.
+  # Confirmed ranges leave the in-flight window and the ack set is pruned
+  # to the remainder, keeping both bounded no matter how acks interleave
+  # with resends and failure backtracks (9.3). Runs in amortized O(1) per
+  # acknowledgement: each queued range is dropped at most once.
+  defp advance_match(match_index, in_flight, acked, last_index) do
+    list =
+      if :queue.is_queue(in_flight) do
+        :queue.to_list(in_flight)
+      else
+        in_flight
+      end
+
+    m = max(match_index, last_index)
+    rest = Enum.reject(list, fn {_p, l} -> l <= m end)
+    pruned = MapSet.filter(acked, &(&1 > m))
+    {m, :queue.from_list(rest), pruned}
   end
 
-  defp advance_contiguous(match_index, [], _acked, _orig), do: {match_index, []}
-
-  defp advance_contiguous(match_index, in_flight, acked, _orig) do
-    case Enum.find(in_flight, fn {p, l} -> p == match_index and l in acked end) do
-      nil ->
-        {match_index, in_flight}
-
-      {p, l} ->
-        remaining = List.delete(in_flight, {p, l})
-        advance_contiguous(l, remaining, acked, remaining)
-    end
-  end
-
-  defp update_term(state, new_term) do
+  @doc """
+  Adopt a strictly greater term: persist it, clear the vote, and clear
+  leader/transfer state. Callers must only invoke this when `new_term` is
+  greater than the current term; same-term traffic must use `observe_term/2`.
+  """
+  def adopt_term(state, new_term) do
     cfg = state.cfg
     uid = cfg.uid
     meta = Server.meta_name(cfg)
 
-    try do
-      LogMeta.store(meta, uid, :current_term, new_term)
-      LogMeta.store_sync(meta, uid, :voted_for, nil)
-    catch
-      _, _ -> :ok
+    _ =
+      try do
+        with :ok <- LogMeta.store_sync(meta, uid, :current_term, new_term),
+             :ok <- LogMeta.store_sync(meta, uid, :voted_for, nil) do
+          :ok
+        else
+          {:error, reason} ->
+            require Logger
+
+            Logger.error(
+              "RaftEx.RpcHandler: failed to persist term #{new_term}: #{inspect(reason)}"
+            )
+
+            {:error, reason}
+        end
+      catch
+        _, reason ->
+          require Logger
+          Logger.error("RaftEx.RpcHandler: term persistence raised: #{inspect(reason)}")
+          {:error, reason}
+      end
+
+    new_state =
+      state
+      |> Map.put(:current_term, new_term)
+      |> Map.put(:voted_for, nil)
+      |> Map.put(:leader_id, nil)
+      |> Map.put(:transfer_leadership, nil)
+
+    case new_state do
+      %{cfg: %{id: id}} -> Counters.set_gauge(id, :term, new_term)
+      _ -> :ok
     end
 
-    state
-    |> Map.put(:current_term, new_term)
-    |> Map.put(:voted_for, nil)
-    |> Map.put(:leader_id, nil)
-    |> Map.put(:transfer_leadership, nil)
+    new_state
   end
+
+  @doc """
+  Observe traffic at the current term without touching durable term/vote
+  state. Returns the state unchanged so a same-term heartbeat or snapshot
+  can never clear `voted_for`.
+  """
+  def observe_term(state, _term), do: state
+
+  defp update_term(state, new_term), do: adopt_term(state, new_term)
 
   defp build_append_entries_reply(
          term,

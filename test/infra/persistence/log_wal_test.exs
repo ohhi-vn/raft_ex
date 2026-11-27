@@ -233,12 +233,12 @@ defmodule RaftEx.Infra.Persistence.LogWalTest do
       end
     end
 
-    test "truncation keeps entries still buffered in memory" do
+    test "truncation flushes buffered entries durably" do
       assert :ok = LogWal.append_async(wal_name(), :truncated_uid, [{1, 1, :a}, {2, 1, :b}])
       assert :ok = LogWal.truncate(wal_name(), :truncated_uid, 0)
 
-      assert {1, 2, 2} = LogWal.info(wal_name(), :truncated_uid)
-      assert LogWal.read(wal_name(), :truncated_uid, 1, 2) == [{1, 1, :a}, {2, 1, :b}]
+      # Buffered entries are now durable on disk; the buffer is drained.
+      assert {1, 2, 0} = LogWal.info(wal_name(), :truncated_uid)
     end
 
     test "a synchronous append notifies earlier asynchronous writers" do

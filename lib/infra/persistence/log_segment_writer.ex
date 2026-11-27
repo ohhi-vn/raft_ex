@@ -49,7 +49,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           size_bytes: non_neg_integer(),
           sealed: boolean(),
           fd: reference() | nil,
-          index: [index_entry()]
+          read_fd: :file.io_device() | nil,
+          index: :array.array(index_entry())
         }
 
   @type t :: %__MODULE__{
@@ -223,45 +224,20 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   end
 
   @impl GenServer
-  def handle_call({:write, entries}, _from, state) when entries == [] do
-    {:reply, :ok, state}
-  end
-
-  @impl GenServer
-  def handle_call({:write, entries}, from, %{active_segment: nil} = state) do
-    {:ok, new_active} = create_new_segment(state)
-    state = %{state | active_segment: new_active}
-    handle_call({:write, entries}, from, state)
-  end
-
-  @impl GenServer
   def handle_call({:write, entries}, _from, state) do
-    %{active_segment: active, max_entries: max_entries, max_size_bytes: max_size_bytes} = state
-
-    state =
-      if active.entry_count + length(entries) > max_entries or
-           active.size_bytes >= max_size_bytes do
-        {:ok, sealed} = seal_segment(active)
-        {:ok, new_active} = create_new_segment(%{state | segments: state.segments ++ [sealed]})
-        %{state | segments: state.segments ++ [sealed], active_segment: new_active}
-      else
-        state
-      end
-
-    case append_entries(state.active_segment, entries) do
-      {:ok, updated_active} ->
-        state = %{state | active_segment: updated_active}
-        {:reply, :ok, state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+    case append_spanning(state, entries) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
+  # NOTE: `segments` is stored newest-first (prepend on seal) so sealing
+  # never traverses the list; range queries use min/max and entry reads
+  # re-sort, so no caller depends on list order.
+
   @impl GenServer
   def handle_call({:read, from_index, to_index}, _from, state) do
-    entries = read_entries_in_range(state, from_index, to_index)
-    {:reply, {:ok, entries}, state}
+    {:reply, read_entries_in_range(state, from_index, to_index), state}
   end
 
   @impl GenServer
@@ -283,7 +259,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
 
     case seal_segment(active) do
       {:ok, sealed} ->
-        state = %{state | segments: state.segments ++ [sealed], active_segment: nil}
+        state = %{state | segments: [sealed | state.segments], active_segment: nil}
         {:reply, :ok, state}
     end
   end
@@ -331,6 +307,60 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   def handle_call(:index_range, _from, state) do
     range = compute_index_range(state)
     {:reply, range, state}
+  end
+
+  # Append entries, sealing the active segment and opening new ones as
+  # needed so every sealed segment's range exactly covers its entries.
+  # Batches that overflow the active segment are split at the boundary
+  # instead of being mislabeled under the next range (13.1/13.3).
+  defp append_spanning(%{active_segment: nil} = state, entries) do
+    {:ok, new_active} = create_new_segment(state)
+    append_spanning(%{state | active_segment: new_active}, entries)
+  end
+
+  defp append_spanning(
+         %{active_segment: active, max_entries: max_entries, max_size_bytes: max_size_bytes} =
+           state,
+         entries
+       ) do
+    room = max(max_entries - active.entry_count, 0)
+    room = if active.size_bytes >= max_size_bytes, do: 0, else: room
+    {head, tail} = Enum.split(entries, max(room, 0))
+
+    with {:ok, state} <- append_to_active(state, head) do
+      case tail do
+        [] ->
+          {:ok, state}
+
+        _ when active.entry_count + length(head) == 0 ->
+          # Active segment is empty but cannot fit the batch: widening a
+          # single segment beyond the limit is safer than sealing an empty
+          # one and mislabeling ranges.
+          append_to_active(state, tail)
+
+        _ ->
+          {:ok, sealed} = seal_segment(state.active_segment)
+
+          state = %{state | segments: [sealed | state.segments], active_segment: nil}
+          append_spanning(state, tail)
+      end
+    end
+  end
+
+  defp append_to_active(state, []) do
+    {:ok, state}
+  end
+
+  defp append_to_active(%{active_segment: nil} = state, entries) do
+    {:ok, new_active} = create_new_segment(state)
+    append_to_active(%{state | active_segment: new_active}, entries)
+  end
+
+  defp append_to_active(%{active_segment: active} = state, entries) do
+    case append_entries(active, entries) do
+      {:ok, updated_active} -> {:ok, %{state | active_segment: updated_active}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @impl GenServer
@@ -383,7 +413,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
       size_bytes: @header_size,
       sealed: false,
       fd: nil,
-      index: []
+      index: :array.new()
     }
 
     {:ok, segment}
@@ -391,7 +421,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
 
   defp seal_segment(
          %{path: path, range: {first, last}, entry_count: count, index: index} = segment
-       ) do
+       )
+       when is_tuple(index) do
     header = build_header(first, last, count)
 
     {:ok, fd} = File.open(path, [:read, :write])
@@ -411,13 +442,13 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
        ) do
     binaries = Enum.map(entries, &serialize_entry/1)
 
-    {rev_new_index, _} =
-      Enum.reduce(Enum.zip(entries, binaries), {[], size}, fn {{entry_index, _, _}, bin},
-                                                              {acc, off} ->
-        {[{entry_index, off, byte_size(bin)} | acc], off + byte_size(bin)}
+    {new_index, _} =
+      Enum.reduce(Enum.zip(entries, binaries), {idx, size}, fn {{entry_index, _, _}, bin},
+                                                               {arr, off} ->
+        {:array.set(:array.size(arr), {entry_index, off, byte_size(bin)}, arr),
+         off + byte_size(bin)}
       end)
 
-    new_index_entries = rev_new_index
     data = IO.iodata_to_binary(binaries)
 
     case File.open(path, [:append, :binary]) do
@@ -435,7 +466,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           | range: {first, new_last},
             entry_count: new_count,
             size_bytes: new_size,
-            index: new_index_entries ++ idx
+            index: new_index
         }
 
         {:ok, updated_segment}
@@ -446,20 +477,27 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   end
 
   defp read_entries_in_range(state, from_index, to_index) do
-    active_entries =
+    readers =
       if state.active_segment && overlaps?(state.active_segment, from_index, to_index) do
-        read_from_segment(state.active_segment, from_index, to_index)
+        [state.active_segment]
       else
         []
+      end ++
+        Enum.filter(state.segments, &overlaps?(&1, from_index, to_index))
+
+    Enum.reduce_while(readers, {:ok, []}, fn seg, {:ok, acc} ->
+      case read_from_segment(seg, from_index, to_index) do
+        {:ok, entries} -> {:cont, {:ok, acc ++ entries}}
+        {:error, _} = err -> {:halt, err}
       end
+    end)
+    |> case do
+      {:ok, entries} ->
+        {:ok, Enum.sort(entries, fn {idx1, _, _}, {idx2, _, _} -> idx1 <= idx2 end)}
 
-    segment_entries =
-      state.segments
-      |> Enum.filter(&overlaps?(&1, from_index, to_index))
-      |> Enum.flat_map(&read_from_segment(&1, from_index, to_index))
-
-    (segment_entries ++ active_entries)
-    |> Enum.sort(fn {idx1, _, _}, {idx2, _, _} -> idx1 <= idx2 end)
+      err ->
+        err
+    end
   end
 
   defp find_entry(state, index) do
@@ -473,63 +511,127 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     end
   end
 
-  defp read_from_segment(segment, from_index, to_index) do
-    index_list = Map.get(segment, :index, [])
+  defp read_from_segment(%{sealed: true} = segment, from_index, to_index) do
+    index_array = Map.get(segment, :index, :array.new())
 
-    if index_list == [] do
+    if :array.size(index_array) == 0 do
       read_from_segment_full(segment, from_index, to_index)
     else
-      read_from_segment_indexed(segment, index_list, from_index, to_index)
+      read_from_segment_indexed(segment, index_array, from_index, to_index)
     end
+  end
+
+  # The active segment is still growing: return what is there without
+  # treating the unwritten tail as corruption.
+  defp read_from_segment(segment, from_index, to_index) do
+    index_array = Map.get(segment, :index, :array.new())
+
+    entries =
+      if :array.size(index_array) == 0 do
+        case read_from_segment_full(segment, from_index, to_index) do
+          {:ok, es} -> es
+          {:error, _} -> []
+        end
+      else
+        case read_from_segment_indexed(segment, index_array, from_index, to_index) do
+          {:ok, es} -> es
+          {:error, _} -> []
+        end
+      end
+
+    {:ok, entries}
   end
 
   defp read_from_segment_full(segment, from_index, to_index) do
     case File.read(segment.path) do
       {:ok, data} ->
-        data
-        |> parse_entries()
-        |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
+        case parse_entries(data) do
+          {:ok, parsed} ->
+            entries =
+              Enum.filter(parsed, fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
 
-      {:error, _} ->
-        []
+            missing = missing_requested(segment, from_index, to_index, entries)
+
+            if missing == [] do
+              {:ok, entries}
+            else
+              {:error, {:segment_corrupt, segment.path, missing}}
+            end
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, reason} ->
+        {:error, {:segment_missing, segment.path, reason}}
     end
   end
 
-  defp read_from_segment_indexed(segment, index_list, from_index, to_index) do
-    index_list
-    |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
-    |> Enum.reduce([], fn {_idx, offset, length}, acc ->
-      read_indexed_entry(segment.path, offset, length, acc)
-    end)
+  # Indexes covered by the segment's range that did not decode.
+  defp missing_requested(segment, from_index, to_index, entries) do
+    %{range: {first, last}} = segment
+    lo = max(from_index, first)
+    hi = min(to_index, last)
+
+    if hi < lo do
+      []
+    else
+      have = MapSet.new(entries, fn {idx, _, _} -> idx end)
+      for idx <- lo..hi//1, not MapSet.member?(have, idx), do: idx
+    end
   end
 
-  defp read_indexed_entry(path, offset, length, acc) do
-    case read_bytes(path, offset, length) do
-      {:ok, bin} ->
-        case decode_entry(bin) do
-          {:ok, entry} -> [entry | acc]
-          :error -> acc
+  defp read_from_segment_indexed(segment, index_array, from_index, to_index) do
+    wanted =
+      index_array
+      |> :array.to_list()
+      |> Enum.filter(fn {idx, _, _} -> idx >= from_index and idx <= to_index end)
+
+    case File.open(segment.path, [:read, :binary, :raw]) do
+      {:ok, fd} ->
+        try do
+          {entries, missing} =
+            Enum.reduce(wanted, {[], []}, fn {idx, offset, length}, {es, ms} ->
+              case :file.pread(fd, offset, length) do
+                {:ok, bin} ->
+                  case decode_entry(bin) do
+                    {:ok, entry} -> {[entry | es], ms}
+                    :error -> {es, [idx | ms]}
+                  end
+
+                _ ->
+                  {es, [idx | ms]}
+              end
+            end)
+
+          if missing == [] do
+            {:ok, entries}
+          else
+            {:error, {:segment_corrupt, segment.path, Enum.sort(missing)}}
+          end
+        after
+          File.close(fd)
         end
 
-      _ ->
-        acc
+      {:error, reason} ->
+        {:error, {:segment_missing, segment.path, reason}}
     end
   end
 
   defp read_single_entry(segment, index) do
-    index_list = Map.get(segment, :index, [])
+    index_array = Map.get(segment, :index, :array.new())
 
-    if index_list == [] do
+    if :array.size(index_array) == 0 do
       fallback_read_single(segment, index)
     else
-      read_single_entry_indexed(segment, index_list, index)
+      read_single_entry_indexed(segment, index_array, index)
     end
   end
 
-  defp read_single_entry_indexed(segment, index_list, index) do
-    case binary_search_index(index_list, index) do
+  defp read_single_entry_indexed(segment, index_array, index) do
+    case binary_search_index(index_array, index) do
       {:found, mid} ->
-        {_i, offset, length} = Enum.at(index_list, mid)
+        {_i, offset, length} = :array.get(mid, index_array)
         read_single_entry_bytes(segment, index, offset, length)
 
       :not_found ->
@@ -553,16 +655,21 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   defp fallback_read_single(segment, index) do
     case File.read(segment.path) do
       {:ok, data} ->
-        data
-        |> parse_entries()
-        |> Enum.find(fn {idx, _, _} -> idx == index end)
-        |> case do
-          nil -> {:error, :not_found}
-          entry -> {:ok, entry}
+        case parse_entries(data) do
+          {:ok, entries} ->
+            entries
+            |> Enum.find(fn {idx, _, _} -> idx == index end)
+            |> case do
+              nil -> {:error, :not_found}
+              entry -> {:ok, entry}
+            end
+
+          {:error, reason} ->
+            {:error, {:segment_corrupt, segment.path, reason}}
         end
 
-      {:error, _} ->
-        {:error, :not_found}
+      {:error, reason} ->
+        {:error, {:segment_missing, segment.path, reason}}
     end
   end
 
@@ -579,10 +686,23 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   end
 
   defp decode_entry(<<index::64, term::64, cmd_size::32, cmd_data::binary-size(cmd_size)>>) do
-    {:ok, {index, term, :erlang.binary_to_term(cmd_data)}}
+    case safe_command(cmd_data) do
+      {:ok, command} -> {:ok, {index, term, command}}
+      :error -> :error
+    end
   end
 
   defp decode_entry(_), do: :error
+
+  defp safe_command(cmd_data) do
+    try do
+      {:ok, :erlang.binary_to_term(cmd_data, [:safe])}
+    rescue
+      _ -> :error
+    catch
+      _, _ -> :error
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Serialization
@@ -610,20 +730,22 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   defp parse_entries(
          <<@magic_bytes::binary, _version::32, _first::64, _last::64, _count::32, rest::binary>>
        ) do
-    parse_entries_rest(rest, [])
+    {:ok, parse_entries_list(rest, [])}
   end
 
-  defp parse_entries(_), do: []
+  defp parse_entries(_), do: {:error, :corrupt_header}
 
-  defp parse_entries_rest(
+  defp parse_entries_list(
          <<index::64, term::64, cmd_size::32, cmd_data::binary-size(cmd_size), rest::binary>>,
          acc
        ) do
-    command = :erlang.binary_to_term(cmd_data)
-    parse_entries_rest(rest, [{index, term, command} | acc])
+    case safe_command(cmd_data) do
+      {:ok, command} -> parse_entries_list(rest, [{index, term, command} | acc])
+      :error -> Enum.reverse(acc)
+    end
   end
 
-  defp parse_entries_rest(_, acc), do: Enum.reverse(acc)
+  defp parse_entries_list(_, acc), do: Enum.reverse(acc)
 
   # ---------------------------------------------------------------------------
   # Recovery
@@ -640,18 +762,27 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         with {:ok, header_data} <- header_result,
              {:ok, size} <- size_result,
              %{first: first, last: last, count: count} <- parse_header(header_data) do
-          index = load_segment_index(path, count)
+          case load_segment_index(path, count, first, last) do
+            {:ok, {range, count, index}} ->
+              %{
+                id: System.unique_integer([:positive]),
+                path: path,
+                range: range,
+                entry_count: count,
+                size_bytes: size,
+                sealed: true,
+                fd: nil,
+                read_fd: nil,
+                index: :array.from_list(index)
+              }
 
-          %{
-            id: System.unique_integer([:positive]),
-            path: path,
-            range: {first, last},
-            entry_count: count,
-            size_bytes: size,
-            sealed: true,
-            fd: nil,
-            index: index
-          }
+            {:error, reason} ->
+              Logger.warning(
+                "RaftEx.Infra.Persistence.LogSegmentWriter: skipping unrecoverable segment #{path}: #{inspect(reason)}"
+              )
+
+              nil
+          end
         else
           _ -> nil
         end
@@ -661,22 +792,36 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     end
   end
 
-  defp load_segment_index(path, count) do
+  # Recover a segment's range, count, and index. A valid sidecar is
+  # trusted; otherwise the file is parsed and the range/count are derived
+  # from the actual content so a crash during sealing (stale header) or an
+  # interrupted active segment still recovers exactly what is on disk.
+  # Files with no recoverable entries are reported as corrupt.
+  defp load_segment_index(path, count, first, last) do
     case load_sidecar(path, count) do
       {:ok, idx} ->
-        idx
+        {:ok, {{first, last}, count, idx}}
 
       :error ->
         case File.read(path) do
           {:ok, data} ->
             {_entries, idx} = parse_segment_with_index(data)
             write_sidecar(path, idx)
-            idx
+            derive_range(path, idx)
 
           _ ->
-            []
+            {:error, :unreadable}
         end
     end
+  end
+
+  defp derive_range(_path, []) do
+    {:error, :no_entries}
+  end
+
+  defp derive_range(_path, idx) do
+    indexes = Enum.map(idx, fn {i, _, _} -> i end)
+    {:ok, {{Enum.min(indexes), Enum.max(indexes)}, length(idx), idx}}
   end
 
   defp parse_segment_with_index(
@@ -688,7 +833,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
   defp parse_segment_with_index(_), do: {[], []}
 
   defp parse_segment_entries(<<>>, entries_acc, index_acc, _off) do
-    {Enum.reverse(entries_acc), index_acc}
+    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
   end
 
   defp parse_segment_entries(
@@ -697,19 +842,24 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
          index_acc,
          off
        ) do
-    command = :erlang.binary_to_term(cmd_data)
-    len = 8 + 8 + 4 + cmd_size
+    case safe_command(cmd_data) do
+      {:ok, command} ->
+        len = 8 + 8 + 4 + cmd_size
 
-    parse_segment_entries(
-      rest,
-      [{index, term, command} | entries_acc],
-      [{index, off, len} | index_acc],
-      off + len
-    )
+        parse_segment_entries(
+          rest,
+          [{index, term, command} | entries_acc],
+          [{index, off, len} | index_acc],
+          off + len
+        )
+
+      :error ->
+        {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
+    end
   end
 
   defp parse_segment_entries(_, entries_acc, index_acc, _off) do
-    {Enum.reverse(entries_acc), index_acc}
+    {Enum.reverse(entries_acc), Enum.reverse(index_acc)}
   end
 
   # ---------------------------------------------------------------------------
@@ -763,16 +913,23 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
 
   defp parse_sidecar_entries(_, _acc), do: :error
 
-  defp write_sidecar(_path, []) do
-    :ok
+  defp write_sidecar(_path, []), do: :ok
+
+  defp write_sidecar(path, index) when is_tuple(index) do
+    if :array.size(index) == 0 do
+      :ok
+    else
+      write_sidecar(path, :array.to_list(index))
+    end
   end
 
-  defp write_sidecar(path, index) do
-    entries_bin =
-      Enum.reduce(index, <<>>, fn {index, offset, length}, acc ->
-        <<acc::binary, index::64, offset::64, length::32>>
+  defp write_sidecar(path, index) when is_list(index) do
+    entries_iovec =
+      Enum.map(index, fn {idx, offset, length} ->
+        <<idx::64, offset::64, length::32>>
       end)
 
+    entries_bin = IO.iodata_to_binary(entries_iovec)
     checksum = :erlang.crc32(entries_bin)
 
     data =
@@ -795,7 +952,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
         first_index =
           case segments do
             [] -> 1
-            segs -> elem(List.last(segs).range, 1) + 1
+            segs -> segs |> Enum.map(&elem(&1.range, 1)) |> Enum.max() |> Kernel.+(1)
           end
 
         path = Path.join(segment_dir(data_dir), segment_filename(first_index, first_index))
@@ -809,7 +966,7 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
           size_bytes: @header_size,
           sealed: false,
           fd: nil,
-          index: []
+          index: :array.new()
         }
 
       active ->
@@ -851,20 +1008,20 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriter do
     end
   end
 
-  defp binary_search_index(index_list, target) do
-    do_binary_search(index_list, target, 0, length(index_list) - 1)
+  defp binary_search_index(index_array, target) do
+    do_binary_search(index_array, target, 0, :array.size(index_array) - 1)
   end
 
-  defp do_binary_search(_list, _target, lo, hi) when lo > hi, do: :not_found
+  defp do_binary_search(_array, _target, lo, hi) when lo > hi, do: :not_found
 
-  defp do_binary_search(list, target, lo, hi) do
+  defp do_binary_search(array, target, lo, hi) do
     mid = div(lo + hi, 2)
-    {idx, _off, _len} = Enum.at(list, mid)
+    {idx, _off, _len} = :array.get(mid, array)
 
     cond do
       idx == target -> {:found, mid}
-      target > idx -> do_binary_search(list, target, lo, mid - 1)
-      true -> do_binary_search(list, target, mid + 1, hi)
+      target > idx -> do_binary_search(array, target, mid + 1, hi)
+      true -> do_binary_search(array, target, lo, mid - 1)
     end
   end
 end

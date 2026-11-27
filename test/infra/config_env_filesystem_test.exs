@@ -9,7 +9,7 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
       assert Env.data_dir() |> Path.basename() == node() |> Atom.to_string()
     end
 
-    test "data_dir prefers the raft_ex environment over the legacy ra key" do
+    test "data_dir ignores the legacy ra key" do
       original_raft_ex = Application.get_env(:raft_ex, :data_dir)
       original_ra = Application.get_env(:ra, :data_dir)
 
@@ -30,7 +30,9 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
       assert Path.dirname(Env.data_dir()) == "/tmp/raft_ex_current"
 
       Application.delete_env(:raft_ex, :data_dir)
-      assert Path.dirname(Env.data_dir()) == "/tmp/raft_legacy"
+      # Legacy `:ra` values are ignored; falls back to cwd.
+      {:ok, cwd} = File.cwd()
+      assert Env.data_dir() == Path.join(cwd, Atom.to_string(node()))
     end
 
     test "server_data_dir uses the stored system config" do
@@ -42,9 +44,8 @@ defmodule RaftEx.Infra.ConfigEnvFilesystemTest do
       assert Env.server_data_dir(system, :uid2) == "/tmp/raft_env_test/uid2"
     end
 
-    test "configure_logger stores the module" do
-      Env.configure_logger(RaftEx.Infra.Observability.Monitor)
-      assert :persistent_term.get(:"$ra_logger") == RaftEx.Infra.Observability.Monitor
+    test "configure_logger is a no-op (legacy hook removed)" do
+      assert :ok = Env.configure_logger(RaftEx.Infra.Observability.Monitor)
     end
   end
 

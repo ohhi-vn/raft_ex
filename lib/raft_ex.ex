@@ -41,13 +41,15 @@ defmodule RaftEx do
   # ---- startup / teardown -------------------------------------------
 
   def start(params \\ []) do
-    # Stop any previously running default system so new parameters take effect.
-    _ = RaftEx.App.System.stop_default()
-
     Enum.each(params, fn {key, val} -> Application.put_env(:raft_ex, key, val) end)
 
     case Application.ensure_all_started(:raft_ex) do
       {:ok, _} ->
+        # The application is running, so stopping any previous default
+        # system is safe; `stop_default/0` itself never raises when the
+        # supervisor is absent.
+        _ = RaftEx.App.System.stop_default()
+
         case RaftEx.App.System.start_default() do
           {:ok, _} -> :ok
           {:error, _} = err -> err
@@ -69,7 +71,7 @@ defmodule RaftEx do
       when is_atom(system) do
     configs =
       Enum.map(server_ids, fn id ->
-        uid = new_uid(Utils.to_binary(cluster_name))
+        uid = server_uid(cluster_name, id)
 
         %{
           id: id,
@@ -84,8 +86,32 @@ defmodule RaftEx do
     start_cluster(system, configs, timeout)
   end
 
-  def start_cluster(system, [%{cluster_name: cluster_name} | _] = configs, timeout)
+  def start_cluster(system, [%{cluster_name: _cluster_name} | _] = configs, timeout)
       when is_atom(system) do
+    case check_uid_collision(configs) do
+      :ok -> do_start_cluster(system, configs, timeout)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp check_uid_collision(configs) do
+    dupes =
+      configs
+      |> Enum.reject(&(Map.get(&1, :uid) == nil))
+      |> Enum.group_by(&Map.get(&1, :uid))
+      |> Enum.filter(fn {_uid, grouped} -> length(grouped) > 1 end)
+
+    case dupes do
+      [] ->
+        :ok
+
+      [{uid, grouped} | _] ->
+        {:error, {:uid_collision, uid, Enum.map(grouped, & &1.id)}}
+    end
+  end
+
+  defp do_start_cluster(system, [%{cluster_name: cluster_name} | _] = configs, timeout)
+       when is_atom(system) do
     result =
       Utils.partition_parallel(
         fn c ->
@@ -193,7 +219,7 @@ defmodule RaftEx do
 
   def start_server(system, cluster_name, %{id: {_, _}} = conf0, machine, server_ids)
       when is_atom(system) do
-    uid = Map.get(conf0, :uid, new_uid(Utils.to_binary(cluster_name)))
+    uid = Map.get(conf0, :uid, server_uid(cluster_name, conf0.id))
 
     conf =
       Map.merge(conf0, %{
@@ -417,7 +443,11 @@ defmodule RaftEx do
       :term
     ]
 
-    counters = Counters.counters(server_id, fields)
+    counters =
+      server_id
+      |> Counters.counters(fields)
+      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+      |> Map.new()
 
     case Process.whereis(name) do
       nil ->
@@ -542,6 +572,33 @@ defmodule RaftEx do
       |> binary_part(0, 12)
 
     String.upcase(prefix) <> digest
+  end
+
+  @doc """
+  Derives a stable, per-server uid from the cluster name and server id.
+
+  Unlike `new_uid/1` (which hashes a single source), this mixes the server
+  id into the digest so every member of one cluster owns an independent WAL
+  file, metadata row, data directory, and registry entry -- including
+  several servers on the same node. The derivation is deterministic: the
+  same cluster name and server id always yield the same uid, so restarts
+  recover the existing log. An explicitly configured `:uid` always wins
+  over the derived one; use that to migrate a legacy single-uid directory.
+
+  ## Examples
+
+      iex> RaftEx.server_uid(:my_cluster, {:s1, node()}) ==
+      ...>   RaftEx.server_uid("my_cluster", {:s1, node()})
+      true
+
+      iex> RaftEx.server_uid(:my_cluster, {:s1, node()}) !=
+      ...>   RaftEx.server_uid(:my_cluster, {:s2, node()})
+      true
+
+  """
+  @spec server_uid(atom() | binary(), RaftEx.Domain.Types.server_id()) :: binary()
+  def server_uid(cluster_name, server_id) do
+    new_uid(Utils.to_binary(cluster_name) <> ":" <> inspect(server_id))
   end
 
   # ---- internal ----------------------------------------------------

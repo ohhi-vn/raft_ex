@@ -35,10 +35,21 @@ throughput figure drops or a latency figure rises beyond the threshold.
 | `wal_append_10uids` | Concurrent WAL appends across 10 servers (5 appenders each) | 500 appends |
 | `wal_append_group` | Concurrent synchronous appends to one server (10 appenders) | 1,000 appends |
 | `wal_recovery` | Recovering a WAL from disk | 10,000 records |
+| `wal_truncate` | Prefix-truncating a WAL, verifying the file shrinks and recovery returns only the retained range | 2,000 records |
 | `log_fold` | Reading a 100-entry range from a large log | 100,000 entries |
 | `apply_committed` | Applying a committed batch to the state machine | 100 entries |
 | `replication_batch` | Building AppendEntries RPCs for three peers | 100,000 entries |
+| `follower_catchup` | Idle-leader catch-up rounds for a lagging follower (asserts full configured batches) | 500 entries |
+| `snapshot_transfer` | Multi-chunk snapshot write → transfer → install round-trip, verified byte-identical | 200,000 bytes |
+| `command_single` | End-to-end client→leader→WAL→commit→reply on one server | 20 commands |
+| `command_cluster` | End-to-end commands on three servers (sequential then concurrent) | 20 commands |
 | `query` | Local query handling against an applied state machine | 1,000 queries |
+
+Every scenario asserts its own inputs (batch sizes, retained ranges,
+chunk counts, reply correctness), so a misconfigured run fails instead of
+printing a misleading number. The `command_*` scenarios include cluster
+formation and leader election in the measured time; divide by the command
+count only for a rough per-command figure.
 
 ## Baseline
 
@@ -112,3 +123,37 @@ Recorded after the `optimize-performance` change, with
   numbers vary with CPU, filesystem, and background load.
 - The suite is intentionally dependency-free so it can run in CI and on a
   developer laptop without extra tooling.
+
+## Hardened-implementation baseline
+
+Recorded after the `raft-core-hardening-and-performance` change with
+`mix run scripts/bench.exs --record`. The `command_*` scenarios measure
+full client→leader→WAL→replication→commit→reply round trips including
+cluster formation; `wal_truncate` measures the atomic rewrite path.
+
+| Scenario | Iterations | Input | Elapsed | Throughput / latency | Sync |
+|----------|-----------:|------:|--------:|----------------------|------|
+| `apply_committed` | 5 | 100 | 0.57 ms | 883392.2 entries/s | none |
+| `command_cluster` | 5 | 20 | 417.31 ms | 239.6 cmds/s | datasync |
+| `command_single` | 5 | 20 | 57.60 ms | 1736.0 cmds/s | datasync |
+| `follower_catchup` | 5 | 516 | 1.09 ms | 2364802.9 entries/s | none |
+| `log_fold` | 5 | 100 | 0.64 ms | 780031.2 entries/s | none |
+| `query` | 5 | 1000 | 0.27 ms | 18450184.5 queries/s | none |
+| `replication_batch` | 5 | 30 | 0.56 ms | 268817.2 entries/s | none |
+| `snapshot_transfer` | 5 | 200042 | 12.03 ms | 83163715.0 bytes/s | datasync |
+| `wal_append_10uids` | 5 | 500 | 159.16 ms | 15707.8 appends/s | datasync |
+| `wal_append_1uid` | 5 | 1000 | 1115.02 ms | 4484.2 appends/s | datasync |
+| `wal_append_group` | 5 | 1000 | 117.77 ms | 42456.4 appends/s | datasync |
+| `wal_recovery` | 5 | 10000 | 21.35 ms | 4269.6 us | none |
+| `wal_truncate` | 5 | 2000 | 8.14 ms | 1628.2 us | datasync |
+
+To reproduce the comparison gate:
+
+```sh
+mix run scripts/bench.exs --compare bench/baseline.json --threshold 10
+```
+
+New scenarios report `new (not in baseline)` on their first run against an
+older baseline; the gate exits non-zero only on a real regression beyond
+the threshold (a synthetic regression check lives in
+`test/bench_test.exs`).

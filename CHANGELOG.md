@@ -5,7 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-27
+
+### Added
+- **Server configuration persistence**: `start_server` atomically persists the server config (`Log.write_config_to_dir/2`); `restart_server` recovers from disk and reports `:name_not_registered` for unknown names.
+- **Application-environment tuning**: WAL sync method, snapshot chunk size, pipeline depth, and replication batch size are read from `Application.get_env(:raft_ex, ...)` into the system and per-server configs.
+- **Phase 1 gate tests**: crash/restart, multi-chunk snapshot catch-up, duplicate-RPC resilience, and concurrent membership-change coverage (`test/integration/phase1_gate_test.exs`); hard-kill/restart recovery tests (`test/integration/server_recovery_config_test.exs`).
+- **Command batching**: user commands queue in a bounded pending queue (`max_pending_commands`, backpressure on overflow) and flush as one `Log.write/2` per batch; per-caller replies correlate after durability.
+- **Replication batching**: configured batch sizes, ack-triggered pipelined catch-up, MapSet/queue-bounded acknowledgement tracking, commit broadcast coalesced into AppendEntries.
+- **Transport and identity**: non-blocking `:nosuspend` remote sends, `{:rpc, sender, ...}` envelopes with a pid-to-server-id cache, seed validation, join error propagation, node-up/down reconciliation.
+- **Metrics and observability**: per-server counters, `last_applied`/`commit_index`/`term` gauges, `replication_lag` index-gap metric, async `last_applied` persistence with sync on shutdown.
+- **End-to-end benchmarks**: `command_single`, `command_cluster`, `follower_catchup`, `wal_truncate`, and `snapshot_transfer` scenarios with input assertions (`docs/performance.md`).
+- **Segment-backed storage (opt-in)**: `:array` indexes with binary search, single-fd range reads, iodata sidecars, safe term decoding, explicit missing/corrupt errors (`test/infra/persistence/log_segment_storage_test.exs`).
+- **Automatic compaction**: applied-entry, WAL-byte, and time thresholds with transfer deferral and an operator override; segment sealing plus retention on snapshot (`test/integration/auto_compaction_test.exs`).
+- **Feature-status matrix**: `README.md` maps every capability to its tests/benchmarks.
+
+### Changed
+- **BREAKING (correctness)**: durable-write failures now return errors instead of success; startup no longer reads `:ra` application environment (`RaftEx.Infra.Config.Env` ignores legacy `:ra` keys; `configure_logger/1` is a no-op).
+- **Startup ordering**: `RaftEx.start/1` ensures the application is running before replacing the default system; `stop_default/0` is safe when no supervisor exists.
+- **Reply routing**: 4-tuple replies unwrap exactly once; direct replies leave a stripped marker so `ensure_call_replied/3` never double-replies and never leaks actions to `gen_statem`; commands awaiting consensus are exempt from the unsupported-call fast-fail.
+
+### Fixed
+- **Multi-server commands**: `await_consensus` commands no longer fail fast with `:unsupported` while waiting for quorum acks.
+- **Cast commands**: 3-tuple `:$usr` casts are normalized to the 4-tuple shape so they append and apply identically to calls (pipeline notifications now delivered).
+- **Cluster delete**: `delete_cluster` terminates with `{:stop, :normal, _}` and removes on-disk data; the server name poll in tests accounts for async unregistration.
+- **Leader tick routing**: the `tick_timeout` clause matched the atom `:_` instead of the `{:timeout, :tick}` event, so ticks were silently dropped by the domain catch-all; heartbeats, check-quorum step-down, and tick-driven replication now actually run.
+- **Commit safety**: both commit paths share `advance_commit_index/2`, which requires a current-term entry and never moves `commit_index` backwards; follower backtracking hints are clamped so `next_index` only moves backward.
+- **Replication stalls**: eager match-index advancement on success plus stale-range draining keep pipelined catch-up moving after failures and out-of-order acks.
+- **Segment recovery**: sealed ranges and counts derive from parsed content (not stale headers); empty/corrupt segments are skipped with a warning; batch appends split at segment boundaries instead of mislabeling ranges.
 
 ## [0.6.0] - 2026-11-26
 
@@ -18,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Benchmarks**: added a dependency-free benchmark suite (`scripts/bench.exs`, `bench/`) with JSON output, `--record`/`--compare`/`--threshold`, and `docs/performance.md` with before/after numbers.
 
 ### Fixed
-- **RPC error mapping**: `RaftEx.App.ServerRuntime.safe_call/3` now converts `:erpc` exceptions such as `{:erpc, :noconnection}` into `{:error, reason}` instead of letting a bare `ErlangError` escape to callers.
+- **RPC error mapping**: the RPC error mapping in `RaftEx.App.ServerRuntime` now converts `:erpc` exceptions such as `{:erpc, :noconnection}` into `{:error, reason}` instead of letting a bare `ErlangError` escape to callers.
 - **Cluster formation and joins**: `Cluster.form_cluster/4` no longer waits for local servers before starting them, removing a timeout that only passed when leftovers from earlier tests were still running. `Cluster.join_cluster/5` treats a missing seed server as a fresh cluster and no longer fails when the joining node hosts no servers.
 - **Distribution handshake**: cookie changes are no longer applied to an already-running node (which broke EPMD handshakes for later peers), and network test helpers now adapt peer names to short/long-name mode so `--sname` distributed runs work.
 

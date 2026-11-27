@@ -44,7 +44,8 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriterTest do
     LogSegmentWriter.write(writer, [{1, 1, :a}, {2, 1, :b}, {3, 1, :c}])
 
     assert {:ok, [{3, 1, :c}]} = LogSegmentWriter.read(writer, 3, 3)
-    assert {1, 4} = LogSegmentWriter.index_range(writer)
+    # Batches split at the boundary so every sealed range is exact.
+    assert {1, 3} = LogSegmentWriter.index_range(writer)
   end
 
   test "seal_active_segment, truncate_from and delete_up_to" do
@@ -148,23 +149,25 @@ defmodule RaftEx.Infra.Persistence.LogSegmentWriterTest do
   end
 
   describe "unreadable segment data" do
-    test "missing segment files are skipped when reading ranges and single entries" do
+    test "missing segment files are reported, not silently skipped (13.4)" do
       writer = name()
       LogSegmentWriter.write(writer, [{1, 1, :a}])
       assert :ok = LogSegmentWriter.seal_active_segment(writer)
       File.rm!(segment_path("1-1.segment"))
 
-      assert {:ok, []} = LogSegmentWriter.read(writer, 1, 1)
-      assert {:error, :not_found} = LogSegmentWriter.read_entry(writer, 1)
+      assert {:error, {:segment_missing, _, :enoent}} = LogSegmentWriter.read(writer, 1, 1)
+      assert {:error, {:segment_missing, _, _}} = LogSegmentWriter.read_entry(writer, 1)
     end
 
-    test "segment files with an invalid header contain no entries" do
+    test "segment files with an invalid header report corruption (13.4)" do
       writer = name()
       LogSegmentWriter.write(writer, [{1, 1, :a}])
+      assert :ok = LogSegmentWriter.seal_active_segment(writer)
       File.write!(segment_path("1-1.segment"), "garbage")
 
-      assert {:ok, []} = LogSegmentWriter.read(writer, 1, 1)
-      assert {:error, :not_found} = LogSegmentWriter.read_entry(writer, 1)
+      # The sealed segment promises index 1 but the file is unreadable.
+      assert {:error, _} = LogSegmentWriter.read(writer, 1, 1)
+      assert {:error, _} = LogSegmentWriter.read_entry(writer, 1)
     end
 
     test "an entry missing from an in-range segment is not found" do

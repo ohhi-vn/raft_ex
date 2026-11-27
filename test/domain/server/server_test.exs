@@ -190,9 +190,17 @@ defmodule RaftEx.Domain.ServerTest do
   end
 
   describe "membership helpers" do
-    test "get_membership/1 uses the state's default" do
+    test "get_membership/1 consults the cluster map, ignoring a stale local field" do
       assert Server.get_membership(state()) == :voter
-      assert Server.get_membership(%{state() | membership: :promotable}) == :promotable
+
+      # A stale :promotable field does not override a voter cluster entry.
+      assert Server.get_membership(%{state() | membership: :promotable}) == :voter
+
+      non_voter_cluster = %{
+        @self_id => %{voter_status: %{uid: "server-test-uid", membership: :non_voter}}
+      }
+
+      assert Server.get_membership(%{state() | cluster: non_voter_cluster}) == :non_voter
     end
 
     test "get_membership/2 accepts an explicit cluster" do
@@ -550,10 +558,12 @@ defmodule RaftEx.Domain.ServerTest do
     end
 
     test "TimeoutNowRpc starts an immediate candidate election" do
-      {:candidate, s2, effects} =
-        Server.handle_follower(%Types.TimeoutNowRpc{term: 3, leader_id: @peer2}, state())
+      follower = %{state() | leader_id: @peer2}
 
-      assert s2.current_term == 3
+      {:candidate, s2, effects} =
+        Server.handle_follower(%Types.TimeoutNowRpc{term: 2, leader_id: @peer2}, follower)
+
+      assert s2.current_term == 2
       assert s2.leader_id == nil
       assert effects == []
     end

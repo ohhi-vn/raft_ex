@@ -160,7 +160,7 @@ defmodule RaftEx.Domain.DecisionTableTest do
         assert Cluster.get_membership(cluster, peer, uid, :voter) == unquote(membership)
       end
 
-      test "get_membership/4 falls back to the default for #{membership}" do
+      test "get_membership/4 reports #{membership} regardless of uid" do
         peer = {:s2, node()}
 
         cluster =
@@ -170,7 +170,8 @@ defmodule RaftEx.Domain.DecisionTableTest do
             Cluster.new({:s1, node()}, [peer])
           )
 
-        assert Cluster.get_membership(cluster, peer, :missing, :voter) == :voter
+        assert Cluster.get_membership(cluster, peer, :missing, :voter) == unquote(membership)
+        assert Cluster.get_membership(cluster, peer, :other, :voter) == unquote(membership)
       end
     end
 

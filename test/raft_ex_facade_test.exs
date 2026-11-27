@@ -47,8 +47,8 @@ defmodule RaftExFacadeTest do
   test "key_metrics reports an unregistered server without raising" do
     name = :"missing_server_#{System.unique_integer([:positive])}"
 
-    # Counters.counters/2 returns :undefined for an unregistered server; the
-    # facade normalizes that to an empty map so metrics queries stay safe.
+    # Counters.counters/2 returns nils for an unregistered server; the
+    # facade drops them so metrics queries stay safe.
     assert RaftEx.key_metrics({name, node()}) == %{
              state: :noproc,
              membership: :unknown

@@ -2,7 +2,7 @@ defmodule RaftEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/ohhi-vn/raft_ex"
-  @version "0.6.0"
+  @version "0.7.0"
 
   def project do
     [
@@ -100,7 +100,14 @@ defmodule RaftEx.MixProject do
 
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "docs/metrics.md"] ++ guides,
+      extras:
+        [
+          "README.md",
+          "CHANGELOG.md",
+          "docs/metrics.md",
+          "docs/persistence-invariants.md",
+          "docs/quality-baseline.md"
+        ] ++ guides,
       groups_for_extras: [
         Guides: guides
       ],

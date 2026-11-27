@@ -134,6 +134,26 @@ defmodule RaftEx.App.ClusterTest do
                Cluster.join_cluster(:join_no_seed, machine(), [remote], :"seed@invalid.host")
     end
 
+    test "rejects a seed outside the node set (10.5)" do
+      assert {:error, {:seed_not_in_nodes, :"other@invalid.host"}} =
+               Cluster.join_cluster(
+                 :join_bad_seed,
+                 machine(),
+                 [node()],
+                 :"other@invalid.host",
+                 timeout: 1_000
+               )
+    end
+
+    test "rejects an unreachable seed (10.5)" do
+      seed = :"join_seed_#{System.unique_integer([:positive])}@invalid.host"
+
+      assert {:error, :seed_unreachable} =
+               Cluster.join_cluster(:join_unreachable, machine(), [node(), seed], seed,
+                 timeout: 1_000
+               )
+    end
+
     test "adds local servers to a cluster through a seed server" do
       cluster_name = :"cluster_join_success_#{System.unique_integer([:positive])}"
       start_single_server_cluster(cluster_name)

@@ -29,3 +29,54 @@ operation and crash/recovery:
 6. Assert all invariants via `RaftEx.Domain.Invariant.check_recovery!/1`.
 
 Re-running recovery on the same data directory yields identical state (idempotent).
+
+## Atomic truncation and replacement
+
+Prefix truncation (snapshot compaction), suffix truncation, and suffix
+replacement (follower conflict) all rewrite through a temporary file:
+write retained entries to `<wal>.tmp`, sync the file, atomically rename it
+over the live WAL, sync the containing directory (best-effort on platforms
+where the file driver refuses directories), then reopen the WAL. The
+original file descriptor is kept open until the rename succeeds, so a crash
+leaves either the complete old file or the complete new file — never a
+torn WAL. A failed rewrite reports `{:error, reason}` and leaves the
+original file, the in-memory log, and all pending acknowledgements
+untouched.
+
+## Rotation
+
+When the active WAL reaches `wal_max_size_bytes` (or its
+`max_size_bytes` alias, default 256 MB), it is renamed to `wal.<seq>.dat`
+and a fresh `wal.dat` is started. Recovery reads every `wal.<seq>.dat`
+file in numeric order followed by `wal.dat`, so entries are returned once
+in ascending index order across rotations. Truncation and replacement
+consolidate all retained entries into `wal.dat` and delete superseded
+rotated files.
+
+## Recovery validation
+
+Recovery reads each record's header, rejects implausible blob lengths
+without allocating, verifies the CRC32 over header and payload when
+checksums are enabled, decodes with `binary_to_term(..., [:safe])`, and
+stops at the first invalid record — a torn tail, an empty payload, a
+checksum mismatch, or an undecodable blob. Only the last valid prefix is
+returned, and recovery never raises on corrupt input.
+
+## Segments and compaction
+
+- Sealed segments are immutable; the active segment is the only writer.
+  Sealing writes the new header, syncs, then writes the sidecar index, so
+  a crash lands on either the complete old segment or a recoverable new
+  one (the sidecar checksum decides; a mismatch falls back to a full
+  parse, and the range is derived from actual content).
+- `Log.seal_oldest/2` writes entries to segments and syncs *before*
+  evicting them from memory. A crash between the two leaves duplicates
+  that deduplicate by index — never a gap.
+- `LogSegmentWriter.read/3` returns `{:error, {:segment_missing, ...}}`
+  for deleted files and `{:error, {:segment_corrupt, ...}}` for
+  undecodable entries; the active (unsealed) segment never reports
+  corruption for its not-yet-written tail.
+- Automatic compaction fires on entry count, WAL bytes, or elapsed time
+  (see `guides/configuration.md`), defers while a snapshot transfer is
+  in flight, and produces exactly one snapshot per trigger; the operator
+  override `RaftEx.trigger_compaction/1` always works.

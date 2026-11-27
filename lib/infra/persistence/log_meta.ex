@@ -46,9 +46,14 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
   end
 
   @doc "Synchronously store `{uid, key, value}`, fsyncing DETS before returning."
-  @spec store_sync(atom(), binary(), :current_term | :voted_for | :last_applied, term()) :: :ok
+  @spec store_sync(atom(), binary(), :current_term | :voted_for | :last_applied, term()) ::
+          :ok | {:error, term()}
   def store_sync(name, uid, key, value) do
-    GenServer.call(name, {:store, uid, key, value}, @timeout)
+    try do
+      GenServer.call(name, {:store, uid, key, value}, @timeout)
+    catch
+      :exit, reason -> {:error, reason}
+    end
   end
 
   @doc "Asynchronously delete all metadata for `uid`."
@@ -58,9 +63,13 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
   end
 
   @doc "Synchronously delete all metadata for `uid`, fsyncing DETS before returning."
-  @spec delete_sync(atom(), binary()) :: :ok
+  @spec delete_sync(atom(), binary()) :: :ok | {:error, term()}
   def delete_sync(name, uid) do
-    GenServer.call(name, {:delete, uid}, @timeout)
+    try do
+      GenServer.call(name, {:delete, uid}, @timeout)
+    catch
+      :exit, reason -> {:error, reason}
+    end
   end
 
   @doc "Fetch a single metadata field, returning `nil` if absent."
@@ -108,28 +117,27 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
 
   @impl GenServer
   def handle_call({:store, uid, key, value}, from, %{table: tbl} = state) do
-    row =
-      case :ets.lookup(tbl, uid) do
-        [] -> {uid, nil, nil, nil}
-        [r] -> r
-      end
+    case write_ets_dets(tbl, uid, key, value) do
+      :ok ->
+        state = %{state | pending_sync: [{from} | state.pending_sync]}
+        state = schedule_sync(state)
+        {:noreply, state}
 
-    updated = set_field(key, value, row)
-    :ets.insert(tbl, updated)
-    :dets.insert(tbl, updated)
-
-    state = %{state | pending_sync: [{from} | state.pending_sync]}
-    state = schedule_sync(state)
-    {:noreply, state}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:delete, uid}, from, %{table: tbl} = state) do
-    :dets.delete(tbl, uid)
-    :ets.delete(tbl, uid)
+    case delete_ets_dets(tbl, uid) do
+      :ok ->
+        state = %{state | pending_sync: [{from} | state.pending_sync]}
+        state = schedule_sync(state)
+        {:noreply, state}
 
-    state = %{state | pending_sync: [{from} | state.pending_sync]}
-    state = schedule_sync(state)
-    {:noreply, state}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   @impl GenServer
@@ -145,10 +153,24 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
 
   @impl GenServer
   def handle_info(:sync_commit, %{table: tbl} = state) do
-    :dets.sync(tbl)
+    result =
+      try do
+        case :dets.sync(tbl) do
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+      catch
+        _, reason -> {:error, reason}
+      end
+
+    reply =
+      case result do
+        :ok -> :ok
+        {:error, _} = err -> err
+      end
 
     Enum.each(state.pending_sync, fn
-      {from} -> GenServer.reply(from, :ok)
+      {from} -> GenServer.reply(from, reply)
     end)
 
     {:noreply, %{state | pending_sync: [], sync_scheduled?: false}}
@@ -175,24 +197,90 @@ defmodule RaftEx.Infra.Persistence.LogMeta do
   end
 
   defp write_meta(tbl, uid, key, value, sync) do
-    current =
-      case :ets.lookup(tbl, uid) do
-        [] -> {uid, nil, nil, nil}
-        [row] -> row
-      end
+    case write_ets_dets(tbl, uid, key, value) do
+      :ok ->
+        if sync do
+          case sync_dets(tbl) do
+            :ok -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          :ok
+        end
 
-    updated = set_field(key, value, current)
-    :ets.insert(tbl, updated)
-    :dets.insert(tbl, updated)
-    if sync, do: :dets.sync(tbl)
-    :ok
+      {:error, reason} ->
+        Logger.error("RaftEx.Infra.Persistence.LogMeta: write failed: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   defp delete_uid(tbl, uid, sync) do
-    :dets.delete(tbl, uid)
-    :ets.delete(tbl, uid)
-    if sync, do: :dets.sync(tbl)
-    :ok
+    case delete_ets_dets(tbl, uid) do
+      :ok ->
+        if sync do
+          case sync_dets(tbl) do
+            :ok -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          :ok
+        end
+
+      {:error, reason} ->
+        Logger.error("RaftEx.Infra.Persistence.LogMeta: delete failed: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp write_ets_dets(tbl, uid, key, value) do
+    row =
+      case :ets.lookup(tbl, uid) do
+        [] -> {uid, nil, nil, nil}
+        [r] -> r
+      end
+
+    updated = set_field(key, value, row)
+
+    try do
+      true = :ets.insert(tbl, updated)
+
+      case :dets.insert(tbl, updated) do
+        :ok -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    rescue
+      e -> {:error, e}
+    catch
+      _, reason -> {:error, reason}
+    end
+  end
+
+  defp delete_ets_dets(tbl, uid) do
+    try do
+      true = :ets.delete(tbl, uid)
+
+      case :dets.delete(tbl, uid) do
+        :ok -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    rescue
+      e -> {:error, e}
+    catch
+      _, reason -> {:error, reason}
+    end
+  end
+
+  defp sync_dets(tbl) do
+    try do
+      case :dets.sync(tbl) do
+        :ok -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    rescue
+      e -> {:error, e}
+    catch
+      _, reason -> {:error, reason}
+    end
   end
 
   # Resetting the term clears voted_for per Raft spec §5.1.

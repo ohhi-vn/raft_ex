@@ -35,14 +35,33 @@ defmodule RaftEx.App.ServerRuntimeTest do
       s = state()
 
       for fun <- [
-            &ServerRuntime.receive_snapshot/3,
-            &ServerRuntime.await_condition/3,
             &ServerRuntime.terminating_leader/3,
             &ServerRuntime.terminating_follower/3
           ] do
         assert {:keep_state, ^s, []} = fun.(:enter, :old, s)
         assert {:keep_state, ^s, []} = fun.(:info, :anything, s)
       end
+
+      # await_condition arms a bounded deadline on enter so a waiter can
+      # never park the server forever (task 5.1).
+      assert {:keep_state, _s, [{:state_timeout, _, :await_condition_timeout}]} =
+               ServerRuntime.await_condition(:enter, :old, s)
+
+      assert {:keep_state, ^s, []} = ServerRuntime.await_condition(:info, :anything, s)
+    end
+
+    test "receive_snapshot arms a transfer timeout on enter" do
+      s = state()
+
+      assert {:keep_state, _s, [{:state_timeout, _, :snapshot_transfer_timeout}]} =
+               ServerRuntime.receive_snapshot(:enter, :old, s)
+
+      # An unexpected message aborts the (absent) partial transfer and leaves
+      # the receiving state for follower.
+      assert {:next_state, :follower, s1, _actions} =
+               ServerRuntime.receive_snapshot(:info, :anything, s)
+
+      assert is_nil(s1.server_state.snapshot_state)
     end
 
     test "handle_event falls back to next_state" do
@@ -69,13 +88,13 @@ defmodule RaftEx.App.ServerRuntimeTest do
       assert {:keep_state, _state, _actions} = ServerRuntime.follower(:info, :unknown, state())
     end
 
-    test "pre_vote transitions to follower for unknown messages" do
-      assert {:next_state, :follower, _state, _actions} =
+    test "pre_vote keeps the state for unknown messages" do
+      assert {:keep_state, _state, _actions} =
                ServerRuntime.pre_vote(:info, :unknown, state())
     end
 
-    test "candidate transitions to follower for unknown messages" do
-      assert {:next_state, :follower, _state, _actions} =
+    test "candidate keeps the state for unknown messages" do
+      assert {:keep_state, _state, _actions} =
                ServerRuntime.candidate(:info, :unknown, state())
     end
   end

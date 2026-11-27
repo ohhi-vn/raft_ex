@@ -34,7 +34,7 @@ defmodule RaftEx.App.System do
   def default_config do
     data_dir = Env.data_dir()
 
-    %{
+    base = %{
       name: :default,
       data_dir: data_dir,
       wal_data_dir: data_dir,
@@ -46,6 +46,11 @@ defmodule RaftEx.App.System do
       segment_max_entries: 4096,
       segment_max_size_bytes: 64_000_000,
       segment_compute_checksums: true,
+      segment_storage: false,
+      log_window_size: 8192,
+      compaction_entry_threshold: 8192,
+      compaction_wal_bytes: 134_217_728,
+      compaction_interval_ms: 120_000,
       default_max_pipeline_count: 4096,
       default_max_append_entries_rpc_batch_size: 128,
       machine_upgrade_strategy: :all,
@@ -55,8 +60,23 @@ defmodule RaftEx.App.System do
       election_timeout_min: 500,
       election_timeout_max: 2000,
       heartbeat_interval: 100,
+      snapshot_chunk_size: 65_536,
+      max_pipeline_count: 4096,
+      max_append_entries_rpc_batch_size: 128,
+      max_pending_commands: 1024,
+      command_batch_linger_ms: 0,
+      node_suspect_timeout_ms: 30_000,
       names: default_names()
     }
+
+    # Application environment overrides the compiled defaults so
+    # operators can tune the write path without changing code.
+    Enum.reduce(Map.keys(base) -- [:name, :names, :data_dir, :wal_data_dir], base, fn key, acc ->
+      case Application.get_env(:raft_ex, key) do
+        nil -> acc
+        val -> Map.put(acc, key, val)
+      end
+    end)
   end
 
   def default_names do

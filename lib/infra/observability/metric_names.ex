@@ -10,6 +10,8 @@ defmodule RaftEx.Infra.Observability.MetricNames do
   @metrics [
     # WAL
     {:wal_flushes, :counter},
+    {:wal_flush_errors, :counter},
+    {:wal_rotation_errors, :counter},
     {:wal_flush_latency_ms, :histogram},
     {:wal_bytes_written, :counter},
     {:wal_segment_writes, :counter},
@@ -28,7 +30,7 @@ defmodule RaftEx.Infra.Observability.MetricNames do
     {:replication_backpressure, :counter},
     {:append_entries_sent, :counter},
     {:append_entries_acked, :counter},
-    {:replication_lag_ms, :gauge},
+    {:replication_lag, :gauge},
     # Snapshots
     {:snapshot_chunks_sent, :counter},
     {:snapshot_chunks_received, :counter},

@@ -6,9 +6,7 @@ defmodule RaftEx.Infra.Supervisor.Root do
 
   use Supervisor
 
-  alias RaftEx.Infra.Config.Env
-
-  @tables [:ra_state, :ra_open_file_metrics, :ra_io_metrics]
+  @tables [:ra_state, :ra_open_file_metrics, :ra_io_metrics, :ra_pid_to_server_id]
 
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
@@ -19,9 +17,6 @@ defmodule RaftEx.Infra.Supervisor.Root do
     for table <- @tables do
       :ets.new(table, [:named_table, :public, {:write_concurrency, true}])
     end
-
-    logger = Application.get_env(:ra, :logger_module, Logger)
-    Env.configure_logger(logger)
 
     children = [
       RaftEx.Infra.Process.MachineEts,

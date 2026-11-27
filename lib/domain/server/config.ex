@@ -37,6 +37,9 @@ defmodule RaftEx.Domain.Server.Config do
     max_pipeline_count: 4096,
     max_append_entries_rpc_batch_size: 128,
     min_recovery_checkpoint_interval: 0,
+    compaction_entry_threshold: 8192,
+    compaction_wal_bytes: 134_217_728,
+    compaction_interval_ms: 120_000,
     command_plugs: [],
     rpc_plugs: []
   ]
@@ -56,6 +59,9 @@ defmodule RaftEx.Domain.Server.Config do
           max_pipeline_count: pos_integer(),
           max_append_entries_rpc_batch_size: pos_integer(),
           min_recovery_checkpoint_interval: non_neg_integer(),
+          compaction_entry_threshold: pos_integer() | nil,
+          compaction_wal_bytes: pos_integer() | nil,
+          compaction_interval_ms: pos_integer() | nil,
           counter: term(),
           system_config: map(),
           command_plugs: [term()],

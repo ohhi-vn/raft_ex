@@ -62,13 +62,30 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
         spec = %{
           id: uid,
           start: {RaftEx.Infra.Supervisor.ServerSupervisor, :start_link, [config]},
-          type: :supervisor
+          type: :supervisor,
+          # Transient: crashes restart, but a clean stop (e.g. after a
+          # committed cluster delete removes the server) does not.
+          restart: :transient
         }
 
         result = DynamicSupervisor.start_child(sup_name, spec)
 
         if match?({:ok, _}, result) or match?({:ok, _, _}, result) do
           Counters.new(config.id, Counters.counter_fields())
+
+          # Persist the server configuration atomically so a restarted
+          # node can recover this server (task 6.1). A write failure is
+          # logged but does not fail startup: the in-memory server is
+          # authoritative until the next successful persist.
+          data_dir = Env.server_data_dir(system, uid)
+
+          case Log.write_config_to_dir(data_dir, Map.put(config, :uid, uid)) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.warning("Failed to persist server config: #{inspect(reason)}")
+          end
         end
 
         result
@@ -100,7 +117,9 @@ defmodule RaftEx.Infra.Supervisor.ServerSupSupervisor do
           spec = %{
             id: config.uid,
             start: {RaftEx.Infra.Supervisor.ServerSupervisor, :start_link, [config]},
-            type: :supervisor
+            type: :supervisor,
+            # Transient: see start_server_rpc/3.
+            restart: :transient
           }
 
           result = DynamicSupervisor.start_child(sup_name, spec)

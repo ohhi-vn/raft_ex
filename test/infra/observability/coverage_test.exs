@@ -47,7 +47,7 @@ defmodule RaftEx.Infra.Observability.CoverageTest do
       assert :ok = Counters.new(:legacy, [], :ignored)
       assert nil == Counters.fetch(:legacy)
       assert :ok = Counters.delete(:legacy)
-      assert %{} == Counters.counters(:legacy, [:count])
+      assert %{count: nil} == Counters.counters(:legacy, [:count])
     end
 
     test "overview/0 and overview/1 read the shared ETS store" do
@@ -71,22 +71,33 @@ defmodule RaftEx.Infra.Observability.CoverageTest do
       assert Enum.map(fields, &elem(&1, 1)) == Enum.to_list(1..length(fields))
     end
 
-    test "inc/2 and inc/3 increment the same counter" do
+    test "inc/2 writes a global counter and inc/3 writes per-server" do
       assert :ok = Counters.inc(:shared, 2)
       assert :ok = Counters.inc(:server1, :shared, 3)
-      assert Metrics.get(:shared) == 5
+      assert Metrics.get(:shared) == 2
+      assert Metrics.get({:server1, :shared}) == 3
     end
 
     test "observe/2 and observe/3 record histograms" do
       assert :ok = Counters.observe(:latency, 10)
       assert :ok = Counters.observe(:server1, :latency, 20)
-      assert %{count: 2, sum: 30, min: 10, max: 20} = Metrics.get(:latency)
+      assert %{count: 1, sum: 10, min: 10, max: 10} = Metrics.get(:latency)
+      assert %{count: 1, sum: 20, min: 20, max: 20} = Metrics.get({:server1, :latency})
     end
 
     test "set_gauge/2 and set_gauge/3 write gauges" do
       assert :ok = Counters.set_gauge(:commit_index, 7)
       assert :ok = Counters.set_gauge(:server1, :commit_index, 9)
-      assert Metrics.get(:commit_index) == 9
+      assert Metrics.get(:commit_index) == 7
+      assert Metrics.get({:server1, :commit_index}) == 9
+    end
+
+    test "counters/2 returns live per-server values (11.6)" do
+      assert :ok = Counters.inc(:server9, :commands, 4)
+      assert :ok = Counters.set_gauge(:server9, :commit_index, 12)
+
+      assert %{commands: 4, commit_index: 12, missing: nil} =
+               Counters.counters(:server9, [:commands, :commit_index, :missing])
     end
   end
 

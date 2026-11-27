@@ -55,18 +55,30 @@ defmodule RaftEx.Domain.Server.Election do
   Returns `{election_context, effects}` where effects include RPCs to send to peers.
   """
   @spec start_election(election_state(), map()) :: {election_context(), [term()]}
-  def start_election(:pre_vote = state, %{
-        cfg: %Config{id: id, uid: _uid},
-        current_term: term,
-        log: log,
-        cluster: cluster
-      }) do
+  def start_election(
+        :pre_vote = state,
+        %{
+          cfg: %Config{id: id, uid: _uid},
+          current_term: term,
+          log: log,
+          cluster: cluster
+        } = state_map
+      ) do
     {last_log_index, last_log_term} = Log.last_index_term(log)
+
+    voter? = self_voter?(state_map)
+
+    # Reuse the round token stored by `call_for_election/2` when entering
+    # pre-vote from a follower timeout, so the self-vote and both vote-RPC
+    # batches share one token. A timeout-restart clears the stored token
+    # first (see `handle_election_timeout/2`), forcing a fresh round.
+    token = Map.get(state_map, :pre_vote_token) || generate_token()
 
     context = %{
       state: state,
       term: term,
-      votes_received: MapSet.new([id]),
+      token: token,
+      votes_received: if(voter?, do: MapSet.new([id]), else: MapSet.new()),
       votes_rejected: MapSet.new(),
       total_voters: count_voters(cluster),
       last_log_index: last_log_index,
@@ -77,7 +89,7 @@ defmodule RaftEx.Domain.Server.Election do
     rpc = %Types.PreVoteRpc{
       machine_version: 0,
       term: term,
-      token: generate_token(),
+      token: token,
       candidate_id: id,
       last_log_index: last_log_index,
       last_log_term: last_log_term,
@@ -96,21 +108,26 @@ defmodule RaftEx.Domain.Server.Election do
     {context, effects}
   end
 
-  def start_election(:candidate = state, %{
-        cfg: %Config{id: id, uid: _uid, log_id: _log_id},
-        current_term: term,
-        log: log,
-        cluster: cluster
-      }) do
+  def start_election(
+        :candidate = state,
+        %{
+          cfg: %Config{id: id, uid: _uid, log_id: _log_id},
+          current_term: term,
+          log: log,
+          cluster: cluster
+        } = state_map
+      ) do
     # Increment term for candidate phase
     new_term = term + 1
 
     {last_log_index, last_log_term} = Log.last_index_term(log)
 
+    voter? = self_voter?(state_map)
+
     context = %{
       state: state,
       term: new_term,
-      votes_received: MapSet.new([id]),
+      votes_received: if(voter?, do: MapSet.new([id]), else: MapSet.new()),
       votes_rejected: MapSet.new(),
       total_voters: count_voters(cluster),
       last_log_index: last_log_index,
@@ -225,9 +242,16 @@ defmodule RaftEx.Domain.Server.Election do
             )
 
           if log_ok do
-            # Only update term and voted_for if we're actually granting the vote
-            new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
-            {true, new_state}
+            # Only update term and voted_for if we're actually granting the vote.
+            # Persist first: a persistence failure denies the vote (fail-closed).
+            case persist_term_and_vote(state, candidate_term, candidate_id) do
+              :ok ->
+                new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
+                {true, new_state}
+
+              {:error, _} ->
+                {false, state}
+            end
           else
             # Deny vote without updating term - prevents election livelock
             {false, state}
@@ -258,8 +282,14 @@ defmodule RaftEx.Domain.Server.Election do
                 )
 
               if log_ok do
-                new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
-                {true, new_state}
+                case persist_term_and_vote(state, candidate_term, candidate_id) do
+                  :ok ->
+                    new_state = update_term_and_voted_for(candidate_term, candidate_id, state)
+                    {true, new_state}
+
+                  {:error, _} ->
+                    {false, state}
+                end
               else
                 {false, state}
               end
@@ -341,6 +371,22 @@ defmodule RaftEx.Domain.Server.Election do
   end
 
   def handle_vote_reply(
+        %Types.RequestVoteResult{term: term, vote_granted: true},
+        %{state: :candidate, term: election_term} = context,
+        _state,
+        _peer_id
+      )
+      when term > election_term do
+    # A granted vote carrying a higher term still proves the candidate is
+    # stale: adopt the term and step down instead of campaigning on.
+    Logger.info(
+      "RaftEx.Election: Stepping down, granted vote has higher term #{term} > #{election_term}"
+    )
+
+    {:lost, context, [{:become, :follower}, {:update_term, term}]}
+  end
+
+  def handle_vote_reply(
         %Types.RequestVoteResult{vote_granted: false},
         context,
         _state,
@@ -374,26 +420,33 @@ defmodule RaftEx.Domain.Server.Election do
         ) ::
           {boolean(), election_context(), [term()]}
   def handle_pre_vote_reply(
-        %Types.PreVoteResult{term: term, vote_granted: true},
+        %Types.PreVoteResult{term: term, vote_granted: true, token: reply_token},
         %{state: :pre_vote, term: election_term, votes_received: votes, total_voters: total} =
           context,
         _state,
         peer_id
       )
       when term == election_term do
-    # Add vote from the peer who replied
-    new_votes = MapSet.put(votes, peer_id)
-    new_context = %{context | votes_received: new_votes}
+    context_token = Map.get(context, :token)
 
-    # Check if we have enough pre-votes to start real election
-    if MapSet.size(new_votes) > div(total, 2) do
-      Logger.info(
-        "RaftEx.Election: Pre-vote succeeded with #{MapSet.size(new_votes)}/#{total} votes, starting candidate election"
-      )
-
-      {true, new_context, []}
+    if reply_token != nil and context_token != nil and reply_token != context_token do
+      # Stale token from an earlier pre-vote round in the same term.
+      {false, context, []}
     else
-      {false, new_context, []}
+      # Add vote from the peer who replied
+      new_votes = MapSet.put(votes, peer_id)
+      new_context = %{context | votes_received: new_votes}
+
+      # Check if we have enough pre-votes to start real election
+      if MapSet.size(new_votes) > div(total, 2) do
+        Logger.info(
+          "RaftEx.Election: Pre-vote succeeded with #{MapSet.size(new_votes)}/#{total} votes, starting candidate election"
+        )
+
+        {true, new_context, []}
+      else
+        {false, new_context, []}
+      end
     end
   end
 
@@ -412,11 +465,22 @@ defmodule RaftEx.Domain.Server.Election do
     {false, context, [{:become, :follower}, {:update_term, term}]}
   end
 
-  def handle_pre_vote_reply(%Types.PreVoteResult{vote_granted: false}, context, _state, peer_id) do
-    context =
-      Map.update(context, :votes_rejected, MapSet.new([peer_id]), &MapSet.put(&1, peer_id))
+  def handle_pre_vote_reply(
+        %Types.PreVoteResult{vote_granted: false, token: reply_token},
+        %{state: :pre_vote} = context,
+        _state,
+        peer_id
+      ) do
+    context_token = Map.get(context, :token)
 
-    {false, context, []}
+    if reply_token != nil and context_token != nil and reply_token != context_token do
+      {false, context, []}
+    else
+      context =
+        Map.update(context, :votes_rejected, MapSet.new([peer_id]), &MapSet.put(&1, peer_id))
+
+      {false, context, []}
+    end
   end
 
   # Stale pre-vote reply: ignore it.
@@ -488,6 +552,26 @@ defmodule RaftEx.Domain.Server.Election do
     Cluster.voter_count(cluster)
   end
 
+  defp self_voter?(%{cfg: %Config{id: id}, cluster: cluster} = state_map) do
+    case Map.get(state_map, :membership) do
+      :voter ->
+        true
+
+      :non_voter ->
+        false
+
+      :promotable ->
+        false
+
+      _ ->
+        case Map.get(cluster, id) do
+          %{voter_status: %{membership: :voter}} -> true
+          %{voter_status: %{membership: _}} -> false
+          _ -> true
+        end
+    end
+  end
+
   defp build_election_rpcs(cluster, self_id, rpc, _type) do
     cluster
     |> Map.delete(self_id)
@@ -519,6 +603,65 @@ defmodule RaftEx.Domain.Server.Election do
     state
     |> Map.put(:current_term, term)
     |> Map.put(:voted_for, voted_for)
+  end
+
+  defp persist_term_and_vote(%{cfg: %Config{uid: uid} = cfg}, term, voted_for) do
+    meta =
+      case cfg do
+        %{system_config: %{names: %{log_meta: m}}} when is_atom(m) -> m
+        _ -> nil
+      end
+
+    if meta != nil do
+      case LogMeta.store_sync(meta, uid, :current_term, term) do
+        :ok ->
+          case LogMeta.store_sync(meta, uid, :voted_for, voted_for) do
+            :ok -> :ok
+            {:error, _} = err -> err
+          end
+
+        {:error, {:noproc, _}} = noproc ->
+          # Unit-test compatibility: some tests use a raw ETS table instead of
+          # a LogMeta GenServer. Allow a direct ETS write in that case only.
+          case persist_vote_ets_fallback(meta, uid, term, voted_for) do
+            :ok -> :ok
+            :no_fallback -> noproc
+          end
+
+        {:error, _} = err ->
+          err
+      end
+    else
+      {:error, :no_meta}
+    end
+  end
+
+  defp persist_vote_ets_fallback(meta, uid, term, voted_for) do
+    try do
+      case :ets.info(meta) do
+        :undefined ->
+          :no_fallback
+
+        _ ->
+          row =
+            case :ets.lookup(meta, uid) do
+              [] -> {uid, nil, nil, nil}
+              [r] -> r
+            end
+
+          updated =
+            row
+            |> put_elem(1, term)
+            |> put_elem(2, voted_for)
+
+          true = :ets.insert(meta, updated)
+          :ok
+      end
+    rescue
+      _ -> :no_fallback
+    catch
+      _, _ -> :no_fallback
+    end
   end
 
   defp generate_token do

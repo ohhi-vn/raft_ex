@@ -419,12 +419,16 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       s = %{base | server_state: %{base.server_state | log: log}}
       from = {self(), make_ref()}
 
-      assert {:next_state, :await_condition, _s, _actions} =
+      # Commands batch first; the WAL failure surfaces on flush.
+      assert {:keep_state, s1, []} =
                ServerRuntime.leader(
                  {:call, from},
                  {:leader_call, {:command, {:"$usr", :probe, :await_consensus}}},
                  s
                )
+
+      assert {:next_state, :await_condition, _s, _actions} =
+               ServerRuntime.leader(:info, :flush_commands, s1)
     end
 
     test "machine release_cursor and bg_work effects are executed" do
@@ -468,7 +472,7 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       log = %{ss.log | entries: entries, range: {1, 2}, next_index: 3}
       ss = %{ss | log: log, cluster: %{@self_id => Map.fetch!(ss.cluster, @self_id)}}
 
-      assert {:next_state, :delete_and_terminate, _s, _actions} =
+      assert {:stop, :normal, _s} =
                ServerRuntime.leader(:info, {:ra_log_event, {:written, [], []}}, %{
                  base
                  | server_state: ss
@@ -501,7 +505,9 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
     test "pre_vote handles a pid sender, a result struct and follower-driven transitions" do
       base = state()
 
-      assert {:next_state, :follower, _s, _actions} =
+      # Unknown messages do not demote a pre-vote server; only genuine
+      # leader traffic, a higher term, or voting away ends the round.
+      assert {:keep_state, _s, _actions} =
                ServerRuntime.pre_vote(:info, {self(), {:gen_cast, :unknown}}, base)
 
       assert {:keep_state, _s, _actions} =
@@ -514,7 +520,9 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       assert {:keep_state, _s, _actions} =
                ServerRuntime.pre_vote(:info, :election_timeout, base)
 
-      assert {:next_state, :candidate, _s, _actions} =
+      # TimeoutNow without a recognized leader is ignored, like any other
+      # non-leader traffic, instead of demoting the pre-vote server.
+      assert {:keep_state, _s, _actions} =
                ServerRuntime.pre_vote(:info, %Types.TimeoutNowRpc{term: 2}, base)
     end
 
@@ -536,9 +544,90 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
                ServerRuntime.candidate(:info, rpc, base)
     end
 
+    test "receive_snapshot dispatches middle and last chunks" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
+      {crc, _} = read_state
+      {:ok, first, {:next, inner1}} = LogSnapshot.read_chunk(read_state, 24, dir)
+      {:ok, middle, {:next, inner2}} = LogSnapshot.read_chunk({crc, inner1}, 24, dir)
+      {:ok, last, :last} = LogSnapshot.read_chunk({crc, inner2}, 1_000_000, dir)
+
+      first_rpc = %Types.InstallSnapshotRpc{
+        term: 2,
+        leader_id: @peer2,
+        meta: %{index: 3, term: 2},
+        chunk_state: :first,
+        data: first
+      }
+
+      assert {:next_state, :receive_snapshot, s1, _actions} =
+               ServerRuntime.follower(:info, first_rpc, base)
+
+      assert is_tuple(s1.server_state.snapshot_state)
+
+      middle_rpc = %{first_rpc | chunk_state: :middle, data: middle}
+
+      assert {:keep_state, s2, _actions} =
+               ServerRuntime.receive_snapshot(:info, middle_rpc, s1)
+
+      assert is_tuple(s2.server_state.snapshot_state)
+
+      last_rpc = %{first_rpc | chunk_state: :last, data: <<0::32>>}
+
+      assert {:next_state, :follower, s3, _actions} =
+               ServerRuntime.receive_snapshot(:info, last_rpc, s2)
+
+      assert is_nil(s3.server_state.snapshot_state)
+    end
+
+    test "receive_snapshot timeout abandons the partial transfer" do
+      {base, dir, _meta} = state_with_snapshot()
+      {:ok, accept_state} = LogSnapshot.begin_accept(dir, %{index: 3, term: 2})
+      ss = Map.put(base.server_state, :snapshot_state, accept_state)
+      ss = Map.put(ss, :snapshot_meta, %{index: 3, term: 2})
+      s = %{base | server_state: ss}
+
+      assert {:next_state, :follower, s1, []} =
+               ServerRuntime.receive_snapshot(
+                 :state_timeout,
+                 :snapshot_transfer_timeout,
+                 s
+               )
+
+      assert is_nil(s1.server_state.snapshot_state)
+      assert is_nil(s1.server_state.snapshot_meta)
+    end
+
+    test "snapshot send timeout clears the send and retries on the next pass" do
+      s = Map.put(state(), :snapshot_sends, %{@peer2 => send_state({0, 0, nil})})
+
+      assert {:keep_state, s1, actions} =
+               ServerRuntime.leader(
+                 :state_timeout,
+                 {:snapshot_send_timeout, @peer2},
+                 s
+               )
+
+      refute Map.has_key?(s1.snapshot_sends, @peer2)
+
+      assert Enum.any?(actions, &match?({:next_event, :info, :pipeline_rpcs}, &1))
+
+      assert {:keep_state, ^s, []} =
+               ServerRuntime.leader(:state_timeout, {:snapshot_send_timeout, :unknown}, s)
+    end
+
+    test "entering follower abandons in-flight snapshot sends" do
+      s = Map.put(state(), :snapshot_sends, %{@peer2 => send_state({0, 0, nil})})
+
+      assert {:keep_state, s1, _actions} = ServerRuntime.follower(:enter, :leader, s)
+      refute Map.has_key?(s1.snapshot_sends, @peer2)
+    end
+
     test "candidate handles follower-driven candidate and pre_vote transitions" do
       base = state()
 
+      # TimeoutNow without a recognized leader is ignored, not demoting:
+      # read-only and non-leader traffic must not abort the campaign.
       assert {:keep_state, _s, _actions} =
                ServerRuntime.candidate(:info, %Types.TimeoutNowRpc{term: 2}, base)
 
@@ -585,17 +674,25 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
     test "tick starts a snapshot transfer for a lagging peer" do
       {base, _dir, _meta} = state_with_snapshot()
 
-      assert {:keep_state, _s, actions} = ServerRuntime.leader(:_, :tick_timeout, base)
-      assert Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+      assert {:keep_state, _s, actions} =
+               ServerRuntime.leader({:timeout, :tick}, :tick_timeout, base)
+
+      # A new transfer arms its send timeout; the chunk itself is sent via
+      # the RPC side effect, not as a gen_statem action.
+      assert Enum.any?(actions, &match?({:state_timeout, _, {:snapshot_send_timeout, _}}, &1))
     end
 
     test "tick resumes a snapshot transfer already in progress" do
       {base, dir, _meta} = state_with_snapshot()
       {:ok, _meta, read_state} = LogSnapshot.begin_read(dir, %{can_accept_full_file: false})
-      s = Map.put(base, :snapshot_sends, %{@peer2 => send_state(read_state)})
+      s = %{base | conf: Map.put(base.conf, :snapshot_chunk_size, 20)}
+      s = Map.put(s, :snapshot_sends, %{@peer2 => send_state(read_state)})
 
-      assert {:keep_state, _s, actions} = ServerRuntime.leader(:_, :tick_timeout, s)
-      assert Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+      assert {:keep_state, s1, actions} =
+               ServerRuntime.leader({:timeout, :tick}, :tick_timeout, s)
+
+      assert Enum.any?(actions, &match?({:next_event, :info, {:send_snapshot_chunk, _}}, &1))
+      assert Map.has_key?(s1.snapshot_sends, @peer2)
     end
 
     test "tick with no snapshot file does not emit an rpc" do
@@ -610,7 +707,8 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       assert {:keep_state, _s, actions} =
                ServerRuntime.leader(:_, :tick_timeout, %{base | server_state: ss})
 
-      refute Enum.any?(actions, &match?(%Types.InstallSnapshotRpc{}, &1))
+      refute Enum.any?(actions, &match?({:state_timeout, _, {:snapshot_send_timeout, _}}, &1))
+      refute Enum.any?(actions, &match?({:next_event, :info, {:send_snapshot_chunk, _}}, &1))
     end
 
     test "multi-chunk snapshot sends cover first, middle and last chunks" do
@@ -619,26 +717,24 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       s = %{base | conf: Map.put(base.conf, :snapshot_chunk_size, 20)}
       s = Map.put(s, :snapshot_sends, %{@peer2 => send_state(read_state)})
 
-      assert {:keep_state, s1, [rpc, {:next_event, :info, {:send_snapshot_chunk, @peer2}}]} =
+      assert {:keep_state, s1, [{:next_event, :info, {:send_snapshot_chunk, @peer2}}]} =
                ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, s)
 
-      assert %Types.InstallSnapshotRpc{chunk_state: :first} = rpc
       assert %{offset: 20} = s1.snapshot_sends[@peer2]
 
-      {final_state, last_rpc} =
-        Enum.reduce_while(2..50, {s1, nil}, fn _, {current, _} ->
+      {final_state, chunk_count} =
+        Enum.reduce_while(2..50, {s1, 1}, fn _, {current, count} ->
           case ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, current) do
-            {:keep_state, next, [next_rpc]} ->
-              assert %Types.InstallSnapshotRpc{chunk_state: :last} = next_rpc
-              {:halt, {next, next_rpc}}
+            {:keep_state, next, [{:next_event, :info, {:send_snapshot_chunk, @peer2}}]} ->
+              {:cont, {next, count + 1}}
 
-            {:keep_state, next, [next_rpc, {:next_event, :info, {:send_snapshot_chunk, @peer2}}]} ->
-              assert %Types.InstallSnapshotRpc{chunk_state: :middle} = next_rpc
-              {:cont, {next, next_rpc}}
+            {:keep_state, next, []} ->
+              {:halt, {next, count + 1}}
           end
         end)
 
-      assert %Types.InstallSnapshotRpc{chunk_state: :last} = last_rpc
+      # First plus at least one middle plus last.
+      assert chunk_count >= 3
       assert map_size(final_state.snapshot_sends) == 0
     end
 
@@ -651,10 +747,8 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       s = %{base | conf: Map.put(base.conf, :snapshot_chunk_size, 20)}
       s = Map.put(s, :snapshot_sends, %{@peer2 => send_state(read_state)})
 
-      assert {:keep_state, _s, [rpc, _next]} =
+      assert {:keep_state, _s, [{:next_event, :info, {:send_snapshot_chunk, @peer2}}]} =
                ServerRuntime.leader(:info, {:send_snapshot_chunk, @peer2}, s)
-
-      assert %Types.InstallSnapshotRpc{chunk_state: :first} = rpc
     end
 
     test "a failed chunk read clears the snapshot send" do
@@ -676,10 +770,16 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
       local_peer = {name, node()}
       s = Map.put(base, :snapshot_sends, %{local_peer => send_state(read_state)})
 
-      assert {:keep_state, _s, [_rpc]} =
+      # Single-chunk snapshot completes immediately; delivery is asserted
+      # via the side effect, not the actions.
+      assert {:keep_state, s1, []} =
                ServerRuntime.leader(:info, {:send_snapshot_chunk, local_peer}, s)
 
-      assert_receive {:"$gen_cast", {_from, {:rpc, %Types.InstallSnapshotRpc{}}}}
+      refute Map.has_key?(s1.snapshot_sends, local_peer)
+
+      # The envelope carries the sender id so the receiver can attribute
+      # the RPC without a remote lookup (10.3).
+      assert_receive {:"$gen_cast", {_from, {:rpc, @self_id, %Types.InstallSnapshotRpc{}}}}
 
       Process.unregister(name)
 
@@ -690,8 +790,10 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
 
       s = Map.put(base, :snapshot_sends, %{remote_peer => send_state(remote_read_state)})
 
-      assert {:keep_state, _s, [_rpc]} =
+      assert {:keep_state, s1, []} =
                ServerRuntime.leader(:info, {:send_snapshot_chunk, remote_peer}, s)
+
+      refute Map.has_key?(s1.snapshot_sends, remote_peer)
     end
 
     test "snapshot chunk info for an unknown peer is ignored" do
@@ -708,8 +810,12 @@ defmodule RaftEx.App.ServerRuntimeCallbacksTest do
 
       s = Map.put(base, :snapshot_sends, %{peer => send_state(read_state)})
 
-      assert {:keep_state, _s, [_rpc]} =
+      # Single-chunk snapshot completes in one shot; the send itself is a
+      # side effect (no-op without a registered process).
+      assert {:keep_state, s1, []} =
                ServerRuntime.leader(:info, {:send_snapshot_chunk, peer}, s)
+
+      refute Map.has_key?(s1.snapshot_sends, peer)
     end
 
     test "a follower reply to a remote rpc sender goes through the transport" do

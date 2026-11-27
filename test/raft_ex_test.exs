@@ -252,7 +252,7 @@ defmodule RaftExTest do
         )
 
       assert Cluster.get_membership(cluster, peer1, "abc123", :unknown) == :voter
-      assert Cluster.get_membership(cluster, peer1, "wrong_uid", :unknown) == :unknown
+      assert Cluster.get_membership(cluster, peer1, "wrong_uid", :unknown) == :voter
 
       assert Cluster.get_membership(cluster, {:nonexistent, :node@host}, "uid", :unknown) ==
                :unknown
@@ -742,7 +742,9 @@ defmodule RaftExTest do
       refute Map.has_key?(new_log.entries, 1)
       refute Map.has_key?(new_log.entries, 2)
       refute Map.has_key?(new_log.entries, 3)
-      assert new_log.next_index == 4
+      assert new_log.next_index == 6
+      assert new_log.last_term == 2
+      assert new_log.last_written_index_term == {5, 2}
     end
 
     test "snapshot_state/1 and set_snapshot_state/2 work correctly", %{conf: conf} do
@@ -1178,7 +1180,7 @@ defmodule RaftExTest do
 
       assert log.current_snapshot == {5, 1}
       assert map_size(log.entries) == 5
-      assert log.next_index == 6
+      assert log.next_index == 11
 
       # Verify old entries are gone
       {old_entries, _} = Log.sparse_read([1, 2, 3], log)

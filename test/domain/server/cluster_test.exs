@@ -44,12 +44,14 @@ defmodule RaftEx.Domain.Server.ClusterTest do
     assert peer.voter_status == %{membership: :voter, uid: nil}
   end
 
-  test "get_membership uses the stored role and respects uid matching" do
+  test "get_membership uses the stored role by server id" do
     cluster = %{
       @peer2 => %{Cluster.new_peer() | voter_status: %{membership: :non_voter, uid: "uid2"}}
     }
 
     assert Cluster.get_membership(cluster, @peer2, "uid2", :unknown) == :non_voter
-    assert Cluster.get_membership(cluster, @peer2, "other", :unknown) == :unknown
+    # Identity is the server id; a stale uid never hides the committed role.
+    assert Cluster.get_membership(cluster, @peer2, "other", :unknown) == :non_voter
+    assert Cluster.get_membership(%{}, @peer2, "uid2", :unknown) == :unknown
   end
 end

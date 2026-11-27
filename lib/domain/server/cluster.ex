@@ -58,17 +58,17 @@ defmodule RaftEx.Domain.Server.Cluster do
   # Membership
   # ---------------------------------------------------------------------------
 
-  @doc "Determine the membership role of `id`/`uid` within `cluster`."
+  @doc "Determine the membership role of `id` within `cluster`."
   @spec get_membership(
           cluster(),
           server_id(),
-          RaftEx.Domain.Types.uid(),
+          RaftEx.Domain.Types.uid() | nil,
           RaftEx.Domain.Types.membership()
         ) ::
           RaftEx.Domain.Types.membership()
-  def get_membership(cluster, peer_id, uid, default) do
+  def get_membership(cluster, peer_id, _uid, default) do
     case cluster do
-      %{^peer_id => %{voter_status: %{uid: ^uid} = vs}} ->
+      %{^peer_id => %{voter_status: vs}} ->
         Map.get(vs, :membership, default)
 
       _ ->
@@ -89,7 +89,15 @@ defmodule RaftEx.Domain.Server.Cluster do
   @spec voter_match_indexes(server_id(), cluster(), RaftEx.Domain.Types.index()) ::
           [RaftEx.Domain.Types.index()]
   def voter_match_indexes(self, cluster, leader_last_written) do
-    Enum.reduce(cluster, [leader_last_written], fn
+    self_membership =
+      case Map.get(cluster, self) do
+        %{voter_status: %{membership: m}} -> m
+        _ -> :voter
+      end
+
+    initial = if self_membership == :voter, do: [leader_last_written], else: []
+
+    Enum.reduce(cluster, initial, fn
       {^self, _}, acc ->
         acc
 

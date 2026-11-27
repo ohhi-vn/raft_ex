@@ -113,6 +113,8 @@ defmodule RaftEx.Domain.ServerCoverageTest do
       machine_versions: Keyword.get(opts, :machine_versions, [{0, 0}]),
       counter: Keyword.get(opts, :counter, nil),
       max_pipeline_count: Keyword.get(opts, :max_pipeline_count, 4096),
+      max_append_entries_rpc_batch_size:
+        Keyword.get(opts, :max_append_entries_rpc_batch_size, 128),
       system_config: %{names: %{log_meta: Process.get(:server_cov_meta_name)}}
     )
   end
@@ -535,15 +537,30 @@ defmodule RaftEx.Domain.ServerCoverageTest do
       assert {:reply, {:error, :not_caught_up}} in effects
     end
 
-    test "get_membership falls back when membership is nil" do
-      assert Server.get_membership(%{state() | membership: nil}) == nil
+    test "get_membership falls back when the server is absent from the cluster" do
+      clusterless = Map.put(state(), :cluster, %{})
+      assert Server.get_membership(%{clusterless | membership: nil}) == nil
+      assert Server.get_membership(state()) == :voter
     end
 
-    test "persist_last_applied stores an advanced value" do
+    test "persist_last_applied stores once the interval is reached" do
       l = log([{1, 2, :cmd}, {5, 2, :cmd}], last_written: {5, 2})
       s = %{state(log: l) | last_applied: 5, persisted_last_applied: 1}
 
-      assert %{persisted_last_applied: 5} = Server.persist_last_applied(s)
+      # A small advance rides the WAL replay and is not stored yet (11.1).
+      assert %{persisted_last_applied: 1} = Server.persist_last_applied(s)
+
+      many = Enum.map(1..70, &{&1, 2, :cmd})
+      l70 = log(many, last_written: {70, 2})
+      big = %{state(log: l70) | last_applied: 70, persisted_last_applied: 1}
+      assert %{persisted_last_applied: 70} = Server.persist_last_applied(big)
+    end
+
+    test "persist_last_applied! forces a store regardless of interval" do
+      l = log([{1, 2, :cmd}, {5, 2, :cmd}], last_written: {5, 2})
+      s = %{state(log: l) | last_applied: 5, persisted_last_applied: 1}
+
+      assert %{persisted_last_applied: 5} = Server.persist_last_applied!(s)
     end
 
     test "persist_last_applied is capped by the last written index" do
@@ -847,7 +864,19 @@ defmodule RaftEx.Domain.ServerCoverageTest do
       l = log([{1, 1, :a}, {2, 1, :b}, {3, 1, :c}])
       cluster = Map.put(default_cluster(), @peer2, %{default_cluster()[@peer2] | next_index: 2})
 
+      # The default batch size covers the whole suffix.
       {_state, effects} = Server.make_rpcs(state(log: l, cluster: cluster))
+
+      assert [{:send_rpc, @peer2, %Types.AppendEntriesRpc{} = rpc}] = effects
+      assert rpc.entries == [{2, 1, :b}, {3, 1, :c}]
+    end
+
+    test "AppendEntries batch size follows max_append_entries_rpc_batch_size (9.1)" do
+      l = log([{1, 1, :a}, {2, 1, :b}, {3, 1, :c}])
+      cluster = Map.put(default_cluster(), @peer2, %{default_cluster()[@peer2] | next_index: 2})
+
+      {_state, effects} =
+        Server.make_rpcs(state(log: l, cluster: cluster, max_append_entries_rpc_batch_size: 1))
 
       assert [{:send_rpc, @peer2, %Types.AppendEntriesRpc{} = rpc}] = effects
       assert rpc.entries == [{2, 1, :b}]

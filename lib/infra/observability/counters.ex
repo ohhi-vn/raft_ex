@@ -59,10 +59,18 @@ defmodule RaftEx.Infra.Observability.Counters do
     Metrics.all()
   end
 
+  @doc """
+  Read per-server metric values for `fields` from the metrics store.
+  Counter, gauge, and histogram values written via `inc/3`, `set_gauge/3`,
+  and `observe/3` are returned keyed by field name; missing fields read
+  as `nil`.
+  """
   @spec counters(term(), [atom()]) :: map()
-  def counters(_name, _fields) do
-    %{}
+  def counters(server_id, fields) when is_list(fields) do
+    Map.new(fields, fn field -> {field, Metrics.get({server_id, field})} end)
   end
+
+  def counters(_server_id, _fields), do: %{}
 
   # ---------------------------------------------------------------------------
   # Counter fields
@@ -96,19 +104,19 @@ defmodule RaftEx.Infra.Observability.Counters do
     Metrics.set(name, value)
   end
 
-  # Per-server helpers (ETS is flat/global; server_id kept for API compat)
+  # Per-server helpers (keys are namespaced by server id in Metrics)
   @spec inc(term(), term(), number()) :: :ok
-  def inc(_server_id, name, amount) do
-    Metrics.inc(name, amount)
+  def inc(server_id, name, amount) do
+    Metrics.inc({server_id, name}, amount)
   end
 
   @spec observe(term(), term(), number()) :: :ok
-  def observe(_server_id, name, value) do
-    Metrics.observe(name, value)
+  def observe(server_id, name, value) do
+    Metrics.observe({server_id, name}, value)
   end
 
   @spec set_gauge(term(), term(), number()) :: :ok
-  def set_gauge(_server_id, name, value) do
-    Metrics.set(name, value)
+  def set_gauge(server_id, name, value) do
+    Metrics.set({server_id, name}, value)
   end
 end

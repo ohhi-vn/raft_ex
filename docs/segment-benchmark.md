@@ -5,18 +5,25 @@
 `LogSegmentWriter.read_entry/2` and `read/3` loaded the entire segment file with
 `File.read/1`, parsed every entry via `parse_entries/1`, and filtered in Elixir.
 Cost per read: `O(segment_size)` time and memory, regardless of how many entries
-were requested.
+were requested. The per-batch index was also built by prepending and
+concatenating lists (`new ++ old`), and the binary search had inverted
+branches.
 
 ## After
 
-Each segment now keeps an in-memory index of `{entry_index, byte_offset, byte_length}`.
-`read_entry/2` performs a binary search (`O(log n)`) followed by a single
-`:file.pread/3` of `byte_length` bytes. `read/3` filters the index by range and
-preads only the requested entries. Recovery rebuilds (or loads from a sidecar
-`.idx` file) the index once.
+Each segment keeps an in-memory index as an Erlang `:array` of
+`{entry_index, byte_offset, byte_length}` tuples. `read_entry/2` performs a
+binary search (`O(log n)`, direct element access) followed by a single
+`:file.pread/3` of `byte_length` bytes. `read/3` opens one fd per pass,
+preads only the requested entries, and closes it. Batch appends extend the
+array in place instead of rebuilding lists, and the sidecar (`.idx`) is
+serialized from a single iodata. Entry payloads decode with
+`binary_to_term/2, [:safe]`, and unreadable or checksum-failing segments
+report explicit `{:error, ...}` tuples instead of being silently skipped.
 
 Cost per read: `O(log n + k)` where `k` is the number of entries returned, plus
-one `pread` per entry. Memory is `O(n)` for the index (~24 bytes per entry).
+one `pread` per entry (one open fd per range read). Memory is `O(n)` for the
+index (~24 bytes per entry).
 
 ## Methodology
 

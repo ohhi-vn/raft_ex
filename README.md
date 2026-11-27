@@ -1,7 +1,5 @@
 # RaftEx
 
-> ⚠️ **EXPERIMENTAL / UNDER ACTIVE DEVELOPMENT** ⚠️
-
 Raft consensus algorithm implementation in Elixir.
 
 ## Overview
@@ -23,6 +21,26 @@ pluggable state machines. See `docs/metrics.md` and `guides/` for details.
 - Pipelined AppendEntries with backpressure
 - Observability and metrics
 - Performance benchmark suite
+
+## Feature status
+
+Every row is backed by an automated test or benchmark; see
+`test/`, `bench/`, and `openspec/changes/raft-core-hardening-and-performance/`.
+
+| Capability | Status | Evidence |
+|------------|--------|----------|
+| Term/vote persistence, fail-closed voting | done | `test/domain/server/election_persistence_test.exs` |
+| Unique per-server WAL identity | done | `test/integration/server_uid_isolation_test.exs` |
+| Voter-only elections, leader step-down, check-quorum | done | `test/domain/server/check_quorum_test.exs`, `test/domain/server/leader_stepdown_test.exs` |
+| CRC-verified WAL recovery, atomic truncation, rotation | done | `test/infra/persistence/log_wal_*_test.exs` |
+| Atomic snapshots, multi-chunk transfer with timeouts | done | `test/domain/server/snapshot_hardening_test.exs`, `test/integration/distributed_snapshot_transfer_test.exs` |
+| Command batching with backpressure | done | `test/domain/server/command_batch_test.exs`, `test/app/server_runtime_batch_test.exs`, `bench` `command_*` |
+| Bounded replication (batch sizing, ack tracking, no transport sleeps) | done | `test/domain/server/replication_batching_test.exs` |
+| Sender-identity envelopes, non-blocking transport, seed validation, network events | done | `test/app/transport_identity_test.exs` |
+| Metrics store, per-server counters, lag/apply gauges | done | `test/infra/observability/coverage_test.exs`, `test/integration/apply_metrics_test.exs` |
+| End-to-end benchmarks with input assertions | done | `bench/scenarios.ex`, `test/bench_test.exs`, `docs/performance.md` |
+| Segment-backed storage (opt-in) | done | `test/infra/persistence/log_segment_storage_test.exs` |
+| Automatic compaction with deferral + operator override | done | `test/integration/auto_compaction_test.exs` |
 
 ## Installation
 

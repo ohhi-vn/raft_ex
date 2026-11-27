@@ -28,7 +28,7 @@ The canonical list of metric names and kinds lives in
 | `:replication_backpressure` | counter | count | Number of replication backpressure events |
 | `:append_entries_sent` | counter | count | Number of AppendEntries RPCs sent |
 | `:append_entries_acked` | counter | count | Number of AppendEntries RPCs acknowledged |
-| `:replication_lag_ms` | gauge | ms | Per-follower replication lag (keyed by follower id) |
+| `:replication_lag` | gauge | entries | Per-follower replication lag as an entry-index gap (keyed by follower id) |
 | `:snapshot_chunks_sent` | counter | count | Snapshot chunks sent |
 | `:snapshot_chunks_received` | counter | count | Snapshot chunks received |
 | `:snapshot_chunks_installed` | counter | count | Snapshots installed |

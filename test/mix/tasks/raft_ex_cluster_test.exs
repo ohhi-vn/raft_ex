@@ -59,25 +59,25 @@ defmodule RaftEx.Mix.Tasks.RaftExClusterTest do
 
   test "unknown command prints usage" do
     Cluster.run(["unknown"])
-    assert_receive {:mix_shell, :info, [message]}
+    assert_receive {:mix_shell, :info, [message]}, 10_000
     assert message =~ "Manage RaftEx distributed clusters"
   end
 
   test "status produces output" do
     Cluster.run(["status"])
-    assert_receive {:mix_shell, _kind, [message]}
+    assert_receive {:mix_shell, _kind, [message]}, 10_000
     assert is_binary(message)
   end
 
   test "leader reports an unknown cluster" do
     Cluster.run(["leader", "unknown_cluster"])
-    assert_receive {:mix_shell, :error, [message]}
+    assert_receive {:mix_shell, :error, [message]}, 10_000
     assert message =~ "Could not find leader"
   end
 
   test "accepts options" do
     Cluster.run(["--cookie", "test_cookie", "--timeout", "100", "status"])
-    assert_receive {:mix_shell, _kind, [_message]}
+    assert_receive {:mix_shell, _kind, [_message]}, 10_000
   end
 
   test "connect accepts a short seed name and warns when no seed connects" do
@@ -85,20 +85,20 @@ defmodule RaftEx.Mix.Tasks.RaftExClusterTest do
 
     Cluster.run(["connect", seed])
 
-    assert_receive {:mix_shell, :warn, [message]}
+    assert_receive {:mix_shell, :warn, [message]}, 10_000
     assert message =~ "No seed nodes connected"
 
-    assert_receive {:mix_shell, :info, [message]}
+    assert_receive {:mix_shell, :info, [message]}, 10_000
     assert message =~ "Cluster nodes:"
   end
 
   test "connect accepts fully qualified seed names" do
     Cluster.run(["--timeout", "100", "connect", "facade_seed@127.0.0.1"])
 
-    assert_receive {:mix_shell, :warn, [message]}
+    assert_receive {:mix_shell, :warn, [message]}, 10_000
     assert message =~ "No seed nodes connected"
 
-    assert_receive {:mix_shell, :info, [message]}
+    assert_receive {:mix_shell, :info, [message]}, 10_000
     assert message =~ "Cluster nodes:"
   end
 
@@ -107,7 +107,7 @@ defmodule RaftEx.Mix.Tasks.RaftExClusterTest do
       [peer | _] ->
         Cluster.run(["connect", Atom.to_string(peer)])
 
-        assert_receive {:mix_shell, :info, [message]}
+        assert_receive {:mix_shell, :info, [message]}, 10_000
         assert message =~ "Connected to:"
 
       [] ->

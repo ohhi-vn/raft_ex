@@ -38,8 +38,10 @@ defmodule RaftEx.App.Cluster do
     if local_servers == [] do
       {:error, :no_local_servers}
     else
-      ensure_distribution_started!()
-      do_form(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout)
+      with :ok <- validate_seed(seed_node, nodes) do
+        ensure_distribution_started!()
+        do_form(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout)
+      end
     end
   end
 
@@ -63,9 +65,23 @@ defmodule RaftEx.App.Cluster do
       Logger.warning("RaftEx.App.Cluster: no local servers to join cluster")
       {:ok, []}
     else
-      do_join(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout)
+      with :ok <- validate_seed(seed_node, all_nodes) do
+        do_join(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout)
+      end
     end
   end
+
+  # A seed outside the node set can never confirm membership; reject it
+  # instead of forming a divergent cluster.
+  defp validate_seed(seed_node, nodes) when is_atom(seed_node) do
+    if seed_node in nodes do
+      :ok
+    else
+      {:error, {:seed_not_in_nodes, seed_node}}
+    end
+  end
+
+  defp validate_seed(_seed_node, _nodes), do: {:error, :invalid_seed_node}
 
   defp do_join(system, cluster_name, machine, server_ids, local_servers, seed_node, timeout) do
     seed_leader = find_any_server_on(seed_node, server_ids)
@@ -85,11 +101,38 @@ defmodule RaftEx.App.Cluster do
         Logger.warning("RaftEx.App.Cluster: no server found on seed node #{inspect(seed_node)}")
         {:ok, local_servers}
       else
-        add_local_members(seed_leader, local_servers, timeout)
-        wait_for_membership(seed_leader, local_servers, timeout)
-        {:ok, local_servers}
+        # A fresh seed may have no leader yet (a new server never arms its
+        # own election timeout); trigger one so adds and confirmation can
+        # proceed. Best-effort: existing clusters already have a leader.
+        _ = trigger_local_election(local_servers, timeout)
+
+        # Adds are best-effort within the budget (the seed may still be
+        # electing); the membership confirmation below is authoritative.
+        add_result = add_local_members(seed_leader, local_servers, timeout)
+
+        case wait_for_membership(seed_leader, local_servers, timeout) do
+          :ok ->
+            {:ok, local_servers}
+
+          {:error, _} = confirm_err ->
+            case add_result do
+              {:error, _} = add_err -> add_err
+              _ -> confirm_err
+            end
+        end
       end
     end
+  end
+
+  defp trigger_local_election([], _timeout), do: :ok
+
+  defp trigger_local_election([sid | _], timeout) do
+    case RaftEx.trigger_election(sid, timeout) do
+      :ok -> :ok
+      _ -> :ok
+    end
+  catch
+    _, _ -> :ok
   end
 
   defp server_reachable?(server_id) do
@@ -112,9 +155,17 @@ defmodule RaftEx.App.Cluster do
   defp wait_for_membership(_seed_leader, [], _timeout), do: :ok
 
   defp wait_for_membership(seed_leader, local_servers, timeout) when timeout <= 0 do
-    _ = seed_leader
-    _ = local_servers
-    :ok
+    case RaftEx.members(seed_leader, 2_000) do
+      {:ok, members, _} when is_list(members) ->
+        if Enum.all?(local_servers, &(&1 in members)) do
+          :ok
+        else
+          {:error, {:membership_not_confirmed, local_servers -- members}}
+        end
+
+      _ ->
+        {:error, {:membership_not_confirmed, local_servers}}
+    end
   end
 
   defp wait_for_membership(seed_leader, local_servers, timeout) do
@@ -134,16 +185,73 @@ defmodule RaftEx.App.Cluster do
   end
 
   defp add_local_members(seed_leader, local_servers, timeout) do
-    for sid <- local_servers do
-      case RaftEx.add_member(seed_leader, sid, timeout) do
-        {:ok, _, leader} ->
-          Logger.info(
-            "RaftEx.App.Cluster: joined cluster as #{inspect(sid)}, leader: #{inspect(leader)}"
-          )
+    deadline = System.monotonic_time(:millisecond) + timeout
+    retry_add_local_members(seed_leader, local_servers, deadline)
+  end
 
-        {:error, reason} ->
-          Logger.warning("RaftEx.App.Cluster: failed to add #{inspect(sid)}: #{inspect(reason)}")
+  defp retry_add_local_members(_seed_leader, [], _deadline), do: :ok
+
+  defp retry_add_local_members(seed_leader, pending, deadline) do
+    now = System.monotonic_time(:millisecond)
+    budget = max(deadline - now, 0)
+
+    {retryable, failed} =
+      pending
+      |> Enum.map(fn sid -> {sid, try_add_member(seed_leader, sid, budget)} end)
+      |> Enum.split_with(fn
+        {_sid, {:transient, _}} -> true
+        _ -> false
+      end)
+
+    permanent_errors =
+      for {_sid, {:error, reason}} <- failed, do: reason
+
+    if permanent_errors != [] do
+      {:error, {:add_member_failed, permanent_errors}}
+    else
+      case retryable do
+        [] ->
+          :ok
+
+        _ when budget <= 0 ->
+          errors = Enum.map(retryable, fn {_sid, {:transient, reason}} -> reason end)
+          {:error, {:add_member_failed, errors}}
+
+        _ ->
+          Process.sleep(min(200, budget))
+
+          retry_add_local_members(
+            seed_leader,
+            Enum.map(retryable, fn {sid, _} -> sid end),
+            deadline
+          )
       end
+    end
+  end
+
+  defp try_add_member(_seed_leader, _sid, budget) when budget <= 0, do: {:transient, :timeout}
+
+  defp try_add_member(seed_leader, sid, budget) do
+    case RaftEx.add_member(seed_leader, sid, budget) do
+      {:ok, _, leader} ->
+        Logger.info(
+          "RaftEx.App.Cluster: joined cluster as #{inspect(sid)}, leader: #{inspect(leader)}"
+        )
+
+        :ok
+
+      {:error, :already_member} ->
+        :ok
+
+      {:error, reason} when reason in [:no_leader, :timeout, :unsupported] ->
+        {:transient, reason}
+
+      {:timeout, _} ->
+        {:transient, :timeout}
+
+      {:error, reason} ->
+        Logger.warning("RaftEx.App.Cluster: failed to add #{inspect(sid)}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 

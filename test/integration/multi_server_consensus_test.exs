@@ -1,7 +1,7 @@
 defmodule RaftEx.MultiServerConsensusTest do
   use ExUnit.Case, async: false
 
-  alias RaftEx.Domain.{Machine, Utils}
+  alias RaftEx.Domain.Machine
 
   setup do
     data_dir =
@@ -69,7 +69,7 @@ defmodule RaftEx.MultiServerConsensusTest do
     assert is_pid(pid)
     :gen_statem.stop(pid)
 
-    uid = RaftEx.new_uid(Utils.to_binary(name))
+    uid = RaftEx.server_uid(name, follower)
 
     config = %{
       id: follower,
@@ -149,7 +149,7 @@ defmodule RaftEx.MultiServerConsensusTest do
     assert is_pid(pid)
     :gen_statem.stop(pid)
 
-    uid = RaftEx.new_uid(Utils.to_binary(name))
+    uid = RaftEx.server_uid(name, follower)
 
     config = %{
       id: follower,

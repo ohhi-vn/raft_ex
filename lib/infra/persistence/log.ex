@@ -36,6 +36,7 @@ defmodule RaftEx.Infra.Persistence.Log do
   alias RaftEx.Domain.LruCache
   alias RaftEx.Infra.Filesystem
   alias RaftEx.Infra.Persistence.LogMeta
+  alias RaftEx.Infra.Persistence.LogSegmentWriter
   alias RaftEx.Infra.Persistence.LogSnapshot
   alias RaftEx.Infra.Persistence.LogWal
 
@@ -47,6 +48,7 @@ defmodule RaftEx.Infra.Persistence.Log do
     :cfg,
     :range,
     :snapshot_state,
+    :snapshot_cluster,
     :current_snapshot,
     :last_resend_time,
     :last_wal_write,
@@ -55,13 +57,16 @@ defmodule RaftEx.Infra.Persistence.Log do
     :wal_name,
     :meta_name,
     :data_dir,
+    :segment_writer,
     tx: false,
     pending: [],
     live_indexes: [],
     last_term: 0,
     last_written_index_term: {0, 0},
     entries: %{},
-    next_index: 0
+    next_index: 0,
+    segment_enabled?: false,
+    log_window: 8192
   ]
 
   @type t :: %__MODULE__{
@@ -99,7 +104,7 @@ defmodule RaftEx.Infra.Persistence.Log do
   from existing state if present.
   """
   @spec init(map()) :: t()
-  def init(%{uid: uid, system_config: %{data_dir: data_dir, names: names}} = conf) do
+  def init(%{uid: uid, system_config: %{data_dir: data_dir, names: names} = sys_cfg} = conf) do
     dir = server_data_dir(data_dir, uid)
     Filesystem.make_dir(dir)
 
@@ -107,6 +112,24 @@ defmodule RaftEx.Infra.Persistence.Log do
     wal_name = Map.fetch!(names, :wal)
     meta_name = Map.fetch!(names, :log_meta)
     _open_mem_tbls = Map.fetch!(names, :open_mem_tbls)
+
+    # Segment-backed storage is opt-in (13.6); the in-memory log stays the
+    # default until the read/recovery/compaction tests pass with it on.
+    segment_enabled? =
+      Map.get(conf, :segment_storage, Map.get(sys_cfg, :segment_storage, false)) == true
+
+    segment_writer =
+      if segment_enabled? do
+        case Map.fetch(names, :segment_writer) do
+          {:ok, name} -> name
+          :error -> nil
+        end
+      else
+        nil
+      end
+
+    log_window =
+      Map.get(conf, :log_window_size, Map.get(sys_cfg, :log_window_size, 8192))
 
     # Create ETS table for this log's mem table
     mem_table = :ets.new(:"#{uid}_mem_table", [:set, :public, {:read_concurrency, true}])
@@ -117,7 +140,8 @@ defmodule RaftEx.Infra.Persistence.Log do
     _last_applied = LogMeta.fetch(meta_name, uid, :last_applied, 0)
 
     # Recover from snapshot if exists
-    {snapshot_index, snapshot_term, snapshot_state} = recover_snapshot_state(dir)
+    {snapshot_index, snapshot_term, snapshot_state, snapshot_cluster} =
+      recover_snapshot_state(dir)
 
     # Recover WAL entries
     {_wal_first, wal_last, wal_entries} = LogWal.recover(%{data_dir: dir})
@@ -136,6 +160,7 @@ defmodule RaftEx.Infra.Persistence.Log do
       cfg: conf,
       range: range,
       snapshot_state: snapshot_state,
+      snapshot_cluster: snapshot_cluster,
       current_snapshot: if(snapshot_index > 0, do: {snapshot_index, snapshot_term}, else: nil),
       last_resend_time: 0,
       last_wal_write: {nil, make_ref(), -1},
@@ -150,7 +175,10 @@ defmodule RaftEx.Infra.Persistence.Log do
       last_term: last_term,
       last_written_index_term: {wal_last, last_term},
       entries: entries,
-      next_index: next_index
+      next_index: next_index,
+      segment_writer: segment_writer,
+      segment_enabled?: segment_enabled?,
+      log_window: log_window
     }
   end
 
@@ -331,10 +359,16 @@ defmodule RaftEx.Infra.Persistence.Log do
 
   def fold(from, to, fun, acc, %__MODULE__{range: {start, _ending}} = state, :error)
       when to >= from and to >= start do
+    found = entries_in_range(state.entries, from, to)
+    # Cold entries evicted to sealed segments are merged back so a range
+    # spanning memory and segments reads correctly (13.2).
+    all =
+      (found ++ backfill_from_segments(state, from, to, found))
+      |> Enum.sort_by(fn {idx, _, _} -> idx end)
+      |> Enum.uniq_by(fn {idx, _, _} -> idx end)
+
     {final_acc, _} =
-      state.entries
-      |> entries_in_range(from, to)
-      |> Enum.reduce({acc, state}, fn entry, {acc_acc, st} ->
+      Enum.reduce(all, {acc, state}, fn entry, {acc_acc, st} ->
         {fun.(entry, acc_acc), st}
       end)
 
@@ -346,6 +380,40 @@ defmodule RaftEx.Infra.Persistence.Log do
   end
 
   def fold(_from, _to, _fun, acc, state, _strategy), do: {acc, state}
+
+  # Fetch indexes missing from memory from sealed segments. Returns [] when
+  # segment storage is disabled, unavailable, or fails.
+  defp backfill_from_segments(
+         %{segment_enabled?: true, segment_writer: seg} = _state,
+         from,
+         to,
+         found
+       )
+       when not is_nil(seg) do
+    have = MapSet.new(found, fn {idx, _, _} -> idx end)
+    missing = for idx <- from..to//1, not MapSet.member?(have, idx), do: idx
+
+    case missing do
+      [] ->
+        []
+
+      [first | _] ->
+        last = List.last(missing)
+
+        try do
+          case LogSegmentWriter.read(seg, first, last) do
+            {:ok, entries} -> entries
+            _ -> []
+          end
+        rescue
+          _ -> []
+        catch
+          _, _ -> []
+        end
+    end
+  end
+
+  defp backfill_from_segments(_state, _from, _to, _found), do: []
 
   # A short range over a large log is probed index by index, which avoids
   # scanning the whole entries map. A range wider than the map (a sparse log,
@@ -370,15 +438,41 @@ defmodule RaftEx.Infra.Persistence.Log do
   """
   @spec sparse_read([RaftEx.Domain.Types.index()], t()) :: {[term()], t()}
   def sparse_read(indexes, %__MODULE__{} = state) do
-    entries =
-      Enum.flat_map(indexes, fn idx ->
+    {found, missing} =
+      Enum.reduce(indexes, {[], []}, fn idx, {es, ms} ->
         case Map.get(state.entries, idx) do
-          nil -> []
-          entry -> [entry]
+          nil -> {es, [idx | ms]}
+          entry -> {[entry | es], ms}
         end
       end)
 
-    {entries, state}
+    extra =
+      case {missing, state} do
+        {[], _} ->
+          []
+
+        {_, %{segment_enabled?: true, segment_writer: seg}} when not is_nil(seg) ->
+          wanted = MapSet.new(missing)
+
+          try do
+            case LogSegmentWriter.read(seg, Enum.min(missing), Enum.max(missing)) do
+              {:ok, entries} ->
+                Enum.filter(entries, fn {idx, _, _} -> MapSet.member?(wanted, idx) end)
+
+              _ ->
+                []
+            end
+          rescue
+            _ -> []
+          catch
+            _, _ -> []
+          end
+
+        _ ->
+          []
+      end
+
+    {Enum.sort_by(Enum.reverse(found) ++ extra, fn {idx, _, _} -> idx end), state}
   end
 
   @doc """
@@ -498,9 +592,27 @@ defmodule RaftEx.Infra.Persistence.Log do
   def fetch_term(idx, %__MODULE__{} = state) do
     case Map.get(state.entries, idx) do
       {^idx, term, _} -> {term, state}
-      nil -> {nil, state}
+      nil -> fetch_term_from_segment(idx, state)
     end
   end
+
+  # Cold read for entries evicted to sealed segments (13.2). When segment
+  # storage is disabled this is a plain miss.
+  defp fetch_term_from_segment(idx, %{segment_enabled?: true, segment_writer: seg} = state)
+       when not is_nil(seg) do
+    try do
+      case LogSegmentWriter.read_entry(seg, idx) do
+        {:ok, {^idx, term, _}} -> {term, state}
+        _ -> {nil, state}
+      end
+    rescue
+      _ -> {nil, state}
+    catch
+      _, _ -> {nil, state}
+    end
+  end
+
+  defp fetch_term_from_segment(_idx, state), do: {nil, state}
 
   # ---------------------------------------------------------------------------
   # Snapshot Operations
@@ -542,7 +654,7 @@ defmodule RaftEx.Infra.Persistence.Log do
           [RaftEx.Domain.Types.index()],
           t()
         ) :: {:ok, t(), [term()]}
-  def install_snapshot({snap_idx, _snap_term} = idx_term, _mac_mod, live_indexes, state) do
+  def install_snapshot({snap_idx, snap_term} = idx_term, _mac_mod, live_indexes, state) do
     uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
 
     if uid != nil and state.wal_name != nil do
@@ -573,14 +685,24 @@ defmodule RaftEx.Infra.Persistence.Log do
         {snap_idx, snap_idx}
       end
 
+    # The installed snapshot is the new durability floor: term tracking
+    # follows the retained entries, or the snapshot itself when none remain.
+    {last_idx, last_term} =
+      case Enum.max_by(new_entries, fn {i, _} -> i end, fn -> nil end) do
+        {i, {_, t, _}} -> {i, t}
+        nil -> {snap_idx, snap_term}
+      end
+
     new_state = %{
       state
       | current_snapshot: idx_term,
         snapshot_state: nil,
         entries: new_entries,
         range: new_range,
+        last_term: last_term,
+        last_written_index_term: {last_idx, last_term},
         live_indexes: live_indexes,
-        next_index: snap_idx + 1
+        next_index: max(snap_idx, last_idx) + 1
     }
 
     {:ok, new_state, []}
@@ -591,6 +713,12 @@ defmodule RaftEx.Infra.Persistence.Log do
   """
   @spec recover_snapshot(t()) :: term() | nil
   def recover_snapshot(%__MODULE__{snapshot_state: ss}), do: ss
+
+  @doc """
+  Membership recorded in the loaded snapshot, or `nil` for legacy snapshots.
+  """
+  @spec snapshot_cluster(t()) :: map() | nil
+  def snapshot_cluster(%__MODULE__{snapshot_cluster: cluster}), do: cluster
 
   @doc """
   Get the current snapshot index and term.
@@ -635,7 +763,7 @@ defmodule RaftEx.Infra.Persistence.Log do
       when not is_binary(dir),
       do: {state, []}
 
-  def checkpoint(idx, _cluster, {mac_ver, _mac_mod}, mac_state, %__MODULE__{} = state) do
+  def checkpoint(idx, cluster, {mac_ver, _mac_mod}, mac_state, %__MODULE__{} = state) do
     snap_mod = Map.get(state.cfg, :snapshot_module, LogSnapshot)
     snap_dir = Path.join(state.data_dir, "snapshot")
     :ok = Filesystem.make_dir(snap_dir)
@@ -646,7 +774,7 @@ defmodule RaftEx.Infra.Persistence.Log do
     meta = %{
       index: idx,
       term: snap_term,
-      cluster: %{},
+      cluster: storable_cluster(cluster),
       machine_version: mac_ver
     }
 
@@ -661,6 +789,25 @@ defmodule RaftEx.Infra.Persistence.Log do
   end
 
   defp compact_after_snapshot(idx, snap_term, mac_state, state) do
+    # When segment storage is enabled, seal the compacted range first so
+    # cold reads keep working after the in-memory window is evicted; then
+    # drop fully covered segments (retention).
+    state =
+      case state do
+        %{segment_enabled?: true} ->
+          case seal_oldest(state, idx) do
+            {:ok, sealed} ->
+              delete_segments_up_to(sealed, idx)
+              sealed
+
+            {:error, _} ->
+              state
+          end
+
+        _ ->
+          state
+      end
+
     new_entries =
       state.entries
       |> Enum.reject(fn {i, _} -> i <= idx end)
@@ -816,6 +963,72 @@ defmodule RaftEx.Infra.Persistence.Log do
   end
 
   @doc """
+  Atomically replace the log suffix starting at `from_index` with
+  `new_entries`, both in memory and in the WAL.
+
+  The WAL rewrite is temp-write/rename atomic, so a crash leaves either the
+  complete old suffix or the complete new suffix. Returns `{:ok, new_state}`
+  or `{:error, reason}` with the state unchanged.
+  """
+  @spec replace_from(RaftEx.Domain.Types.index(), list(), t()) ::
+          {:ok, t()} | {:error, term()}
+  def replace_from(from_index, new_entries, %__MODULE__{} = state) do
+    uid = if is_map(state.cfg), do: Map.get(state.cfg, :uid), else: nil
+    wal_name = state.wal_name
+
+    wal_result =
+      if wal_name != nil do
+        try do
+          LogWal.replace_from(wal_name, uid, from_index, new_entries)
+        catch
+          _, reason -> {:error, reason}
+        end
+      else
+        :ok
+      end
+
+    case wal_result do
+      :ok ->
+        truncated = truncate_state(state, from_index)
+
+        case new_entries do
+          [] -> {:ok, truncated}
+          _ -> {:ok, apply_entries(new_entries, truncated)}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp truncate_state(%__MODULE__{entries: entries, range: range} = state, from_index) do
+    {new_entries, new_last} = truncate_entries(entries, range, from_index)
+
+    new_range =
+      case new_last do
+        nil -> nil
+        {idx, _, _} -> normalize_range(range, idx)
+      end
+
+    {new_last_index, new_last_term} = last_index_and_term(new_last)
+
+    if state.mem_table do
+      :ets.select_delete(state.mem_table, [
+        {{:"$1", :_, :_}, [{:>=, :"$1", from_index}], [true]}
+      ])
+    end
+
+    %{
+      state
+      | entries: new_entries,
+        range: new_range,
+        last_term: new_last_term,
+        last_written_index_term: {new_last_index, new_last_term},
+        next_index: if(new_last_index > 0, do: new_last_index + 1, else: from_index)
+    }
+  end
+
+  @doc """
   Check if the log can accept writes.
   """
   @spec can_write?(t()) :: boolean()
@@ -861,15 +1074,55 @@ defmodule RaftEx.Infra.Persistence.Log do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Write the cluster configuration to disk.
+  Write the server configuration to disk atomically (temp write, fsync,
+  rename, directory sync) so a crash can never leave a torn config file.
   """
-  @spec write_config(map(), t()) :: :ok
+  @spec write_config(map(), t()) :: :ok | {:error, term()}
   def write_config(config, %__MODULE__{cfg: %{uid: uid} = cfg}) do
     dir = server_data_dir(cfg.system_config.data_dir, uid)
+    write_config_to_dir(dir, config)
+  end
+
+  @doc """
+  Atomically write a server configuration map into `dir/config`.
+  """
+  @spec write_config_to_dir(Path.t(), map()) :: :ok | {:error, term()}
+  def write_config_to_dir(dir, config) when is_binary(dir) and is_map(config) do
     config_path = Path.join(dir, "config")
+    tmp_path = config_path <> ".tmp"
     clean = Map.drop(config, [:parent, :counter, :has_changed, :system_config])
-    # Use :erlang.term_to_binary for reliable serialization
-    Filesystem.write_file(config_path, :erlang.term_to_binary(clean), false)
+    payload = :erlang.term_to_binary(clean)
+
+    with :ok <- File.mkdir_p(dir),
+         :ok <- Filesystem.write_file(tmp_path, payload, true),
+         :ok <- Filesystem.rename(tmp_path, config_path),
+         :ok <- sync_dir(config_path) do
+      :ok
+    else
+      {:error, _} = err -> err
+      other -> {:error, other}
+    end
+  end
+
+  defp sync_dir(file_path) do
+    dir = Path.dirname(file_path)
+
+    try do
+      case :file.open(dir, [:read, :binary, :raw]) do
+        {:ok, dir_fd} ->
+          result = :file.sync(dir_fd)
+          :file.close(dir_fd)
+          result
+
+        {:error, :eisdir} ->
+          :ok
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    catch
+      _, reason -> {:error, reason}
+    end
   end
 
   @doc """
@@ -915,6 +1168,85 @@ defmodule RaftEx.Infra.Persistence.Log do
   end
 
   @doc """
+  Seal the oldest log range up to `through_index` into segments and evict
+  it from the in-memory window.
+
+  The entries are written to sealed segments and synced first; only then
+  are they evicted from memory. A crash between the write and the eviction
+  leaves the data in both places, which recovery deduplicates by index —
+  so sealing is atomic in effect (13.3). Returns `{:ok, log}` or
+  `{:error, reason}` (a gap in the retained range aborts without evicting).
+  """
+  @spec seal_oldest(t(), non_neg_integer()) :: {:ok, t()} | {:error, term()}
+  def seal_oldest(%__MODULE__{segment_writer: nil} = _log, _through_index) do
+    {:error, :no_segment_writer}
+  end
+
+  def seal_oldest(%__MODULE__{entries: entries} = log, through_index) do
+    oldest =
+      case Map.keys(entries) do
+        [] -> nil
+        keys -> Enum.min(keys)
+      end
+
+    cond do
+      is_nil(oldest) or through_index < oldest ->
+        {:ok, log}
+
+      true ->
+        idxs = Enum.to_list(oldest..through_index//1)
+
+        if Enum.all?(idxs, &Map.has_key?(entries, &1)) do
+          to_seal = Enum.map(idxs, &Map.fetch!(entries, &1))
+
+          with :ok <- LogSegmentWriter.write(log.segment_writer, to_seal) do
+            {:ok, evict_range(log, oldest, through_index)}
+          end
+        else
+          {:error, {:gap_in_range, oldest, through_index}}
+        end
+    end
+  end
+
+  # Evict a sealed prefix from the in-memory window and mem table.
+  defp evict_range(%__MODULE__{entries: entries, mem_table: mem_table} = log, from, through) do
+    kept = Map.drop(entries, Enum.to_list(from..through//1))
+
+    if mem_table do
+      try do
+        Enum.each(from..through//1, &:ets.delete(mem_table, &1))
+      rescue
+        _ -> :ok
+      end
+    end
+
+    range =
+      case Map.keys(kept) do
+        [] -> log.range
+        keys -> {Enum.min(keys), Enum.max(keys)}
+      end
+
+    %{log | entries: kept, range: range}
+  end
+
+  @doc """
+  Delete segments at or below `up_to_index`, retaining partially covered
+  segments (13.5). No-op when segment storage is disabled.
+  """
+  @spec delete_segments_up_to(t(), non_neg_integer()) :: :ok | {:error, term()}
+  def delete_segments_up_to(%{segment_writer: nil}, _up_to_index), do: :ok
+
+  def delete_segments_up_to(%{segment_writer: seg}, up_to_index) do
+    try do
+      LogSegmentWriter.delete_up_to(seg, up_to_index)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  @doc """
   Release resources (file handles, etc.).
   """
   @spec release_resources(non_neg_integer(), atom(), t()) :: t()
@@ -941,17 +1273,73 @@ defmodule RaftEx.Infra.Persistence.Log do
     case :prim_file.read_file_info(snapshot_dir) do
       {:ok, _} ->
         case LogSnapshot.recover(snapshot_dir) do
-          {:ok, meta, mac_state} ->
+          {:ok, meta, mac_state} when is_map(meta) ->
             snap_idx = Map.get(meta, :index, 0)
             snap_term = Map.get(meta, :term, 0)
-            {snap_idx, snap_term, mac_state}
+
+            if is_integer(snap_idx) and is_integer(snap_term) and snap_idx >= 0 do
+              {snap_idx, snap_term, mac_state, snapshot_meta_cluster(meta)}
+            else
+              Logger.warning(
+                "RaftEx.Log: ignoring snapshot with invalid metadata, falling back to WAL"
+              )
+
+              {0, 0, nil, nil}
+            end
+
+          {:error, reason} ->
+            Logger.warning(
+              "RaftEx.Log: snapshot unreadable (#{inspect(reason)}), falling back to WAL"
+            )
+
+            {0, 0, nil, nil}
 
           _ ->
-            {0, 0, nil}
+            {0, 0, nil, nil}
         end
 
       _ ->
-        {0, 0, nil}
+        {0, 0, nil, nil}
+    end
+  rescue
+    e ->
+      Logger.warning("RaftEx.Log: snapshot recovery raised #{inspect(e)}, falling back to WAL")
+      {0, 0, nil, nil}
+  catch
+    _, reason ->
+      Logger.warning(
+        "RaftEx.Log: snapshot recovery threw #{inspect(reason)}, falling back to WAL"
+      )
+
+      {0, 0, nil, nil}
+  end
+
+  defp snapshot_meta_cluster(meta) do
+    case Map.get(meta, :cluster) do
+      cluster when is_map(cluster) and map_size(cluster) > 0 -> cluster
+      _ -> nil
     end
   end
+
+  # Membership roles recorded in a snapshot, with voter uids preserved.
+  # Anything else (legacy snapshots, malformed input) records no cluster.
+  defp storable_cluster(cluster) when is_map(cluster) do
+    Map.new(cluster, fn {id, peer} ->
+      {id, %{voter_status: peer_voter_status(peer)}}
+    end)
+  end
+
+  defp storable_cluster(_), do: %{}
+
+  defp peer_voter_status(%{voter_status: %{membership: m, uid: uid}})
+       when m in [:voter, :promotable, :non_voter] do
+    %{membership: m, uid: uid}
+  end
+
+  defp peer_voter_status(%{voter_status: %{membership: m}})
+       when m in [:voter, :promotable, :non_voter] do
+    %{membership: m, uid: nil}
+  end
+
+  defp peer_voter_status(_), do: %{membership: :voter, uid: nil}
 end

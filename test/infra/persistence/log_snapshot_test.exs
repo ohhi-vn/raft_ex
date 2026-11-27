@@ -66,7 +66,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshotTest do
       meta = %{index: 5, term: 3}
       assert {:ok, state} = LogSnapshot.begin_accept(dir, meta)
 
-      {_bytes, _partial_crc, fd} = state
+      {_bytes, _partial_crc, _temp, fd} = state
       :file.close(fd)
 
       assert {:error, _reason} = LogSnapshot.accept_chunk(chunk(meta), state)
@@ -85,7 +85,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshotTest do
       {:ok, state} = LogSnapshot.begin_accept(dir, meta)
       {:ok, later_state} = LogSnapshot.accept_chunk(chunk(meta), state)
 
-      {_bytes, _crc, _partial_crc, fd} = later_state
+      {_bytes, _partial_crc, _crc, _temp, fd} = later_state
       :file.close(fd)
 
       assert {:error, _reason} = LogSnapshot.accept_chunk(<<1, 2, 3>>, later_state)
@@ -97,7 +97,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshotTest do
       {:ok, state} = LogSnapshot.begin_accept(dir, meta)
       {:ok, later_state} = LogSnapshot.accept_chunk(chunk(meta), state)
 
-      {_bytes, _crc, _partial_crc, fd} = later_state
+      {_bytes, _partial_crc, _crc, _temp, fd} = later_state
       :file.close(fd)
 
       assert {:error, _reason} = LogSnapshot.complete_accept(<<>>, later_state)
@@ -150,7 +150,7 @@ defmodule RaftEx.Infra.Persistence.LogSnapshotTest do
     test "read_meta reports a truncated metadata blob" do
       %{dir: dir} = self_dir()
       File.write!(Path.join(dir, "snapshot.dat"), <<"RASN", 1, 0::32, 100::32>>)
-      assert LogSnapshot.read_meta(dir) == :eof
+      assert {:error, _} = LogSnapshot.read_meta(dir)
     end
 
     test "read_meta rejects an invalid version" do

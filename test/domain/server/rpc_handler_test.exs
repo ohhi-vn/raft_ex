@@ -13,7 +13,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
   @peer3 {:server3, node()}
 
   # A WAL that rejects appends with a clean error tuple, used to drive the
-  # {:error, reason} branch of Log.write/2 in RpcHandler.append_entries/3.
+  # {:error, reason} branch of Log.replace_from/3 in RpcHandler.append_entries/3.
   defmodule WalErrorServer do
     use GenServer
 
@@ -21,6 +21,9 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
     def init(:ok), do: {:ok, :ok}
 
     def handle_call({:append, _uid, _entries}, _from, state),
+      do: {:reply, {:error, :wal_down}, state}
+
+    def handle_call({:replace_from, _uid, _from_index, _entries}, _from, state),
       do: {:reply, {:error, :wal_down}, state}
 
     def handle_call(_msg, _from, state), do: {:reply, :ok, state}
@@ -221,7 +224,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert [{:send_rpc, @leader, %Types.AppendEntriesReply{success: false}}] = effects
     end
 
-    test "a WAL write error skips the written-log effect" do
+    test "a WAL write error rejects the batch instead of reporting success" do
       {:ok, wal} = WalErrorServer.start_link()
       current = state()
       log = %{current.log | wal_name: wal}
@@ -234,6 +237,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
       assert next == :follower
       refute Enum.any?(effects, &match?({:ra_log_event, _}, &1))
+      assert [{:send_rpc, @leader, %Types.AppendEntriesReply{success: false}}] = effects
     end
   end
 
@@ -247,12 +251,30 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
     test "updates peer state and may advance the commit index (success)" do
       reply = %Types.AppendEntriesReply{term: 2, success: true, next_index: 3, last_index: 2}
-      {state, effects} = RpcHandler.handle_append_entries_reply(reply, state())
+
+      {state, effects} =
+        RpcHandler.handle_append_entries_reply(
+          reply,
+          state(log: log([{1, 2, :a}, {2, 2, :b}]))
+        )
 
       assert state.cluster[@peer2].match_index == 2
       assert state.cluster[@peer2].next_index == 3
       assert state.cluster[@peer2].status == :normal
       assert is_list(effects)
+    end
+
+    test "a success hint above the leader log is clamped to the log end (9.8)" do
+      reply = %Types.AppendEntriesReply{term: 2, success: true, next_index: 9, last_index: 2}
+
+      {state, _effects} =
+        RpcHandler.handle_append_entries_reply(
+          reply,
+          state(log: log([{1, 2, :a}, {2, 2, :b}]))
+        )
+
+      assert state.cluster[@peer2].match_index == 2
+      assert state.cluster[@peer2].next_index == 3
     end
 
     test "ignores a stale success reply" do
@@ -269,11 +291,26 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert effects == [{:become, :follower}]
     end
 
-    test "uses the failure hint and schedules a retry" do
+    test "a failure hint above the current index is ignored (9.8)" do
+      # peer2's next_index is 1 here; a hint of 4 would jump forward past
+      # entries the leader has not confirmed, so it must be ignored.
       reply = %Types.AppendEntriesReply{term: 2, success: false, next_index: 4}
       {state, effects} = RpcHandler.handle_append_entries_reply(reply, state())
 
-      assert state.cluster[@peer2].next_index == 4
+      assert state.cluster[@peer2].next_index == 1
+      assert effects == [{:send_append_entries, @peer2}]
+    end
+
+    test "a failure hint below the current index steps back (9.8)" do
+      reply = %Types.AppendEntriesReply{term: 2, success: false, next_index: 1}
+
+      {state, effects} =
+        RpcHandler.handle_append_entries_reply(
+          reply,
+          state(cluster: Map.update!(cluster(), @peer2, &Map.put(&1, :next_index, 5)))
+        )
+
+      assert state.cluster[@peer2].next_index == 1
       assert effects == [{:send_append_entries, @peer2}]
     end
 
@@ -379,7 +416,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
         leader_id: @leader,
         meta: meta,
         chunk_state: :last,
-        data: <<>>
+        data: <<0::32>>
       }
 
       {next, state, effects} = RpcHandler.handle_install_snapshot_rpc(last, state)
@@ -388,9 +425,10 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       assert is_nil(state.snapshot_state)
       assert [{:send_rpc, @leader, %Types.InstallSnapshotResult{} = reply}] = effects
       assert reply.last_index == 3
-      # Log.last_index_term/1 uses the log's last_term for its range after
-      # snapshot installation; the fixture log starts at term 0.
-      assert reply.last_term == 0
+      # The reply carries the installed snapshot's term.
+      assert reply.last_term == 2
+      assert state.log.last_term == 2
+      assert state.last_applied == 3
     end
 
     test "rejects a stale-term snapshot and discards partial state" do
@@ -530,7 +568,7 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
       meta = %{index: 3, term: 2}
 
       {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
-      {_bytes, _partial_crc, fd} = accept_state
+      {_bytes, _partial_crc, _temp, fd} = accept_state
       :file.close(fd)
 
       current =
@@ -611,14 +649,14 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
       {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
 
-      {:ok, {bytes, partial_crc, crc, fd}} =
+      {:ok, {bytes, partial_crc, crc, temp, fd}} =
         LogSnapshot.accept_chunk(snapshot_chunk(meta), accept_state)
 
       :file.close(fd)
 
       current =
         state()
-        |> Map.put(:snapshot_state, {bytes, partial_crc, crc, fd})
+        |> Map.put(:snapshot_state, {bytes, partial_crc, crc, temp, fd})
         |> Map.put(:snapshot_meta, meta)
 
       last = %Types.InstallSnapshotRpc{
@@ -645,12 +683,12 @@ defmodule RaftEx.Domain.Server.RpcHandlerTest do
 
       {:ok, accept_state} = LogSnapshot.begin_accept(snap_dir, meta)
 
-      {:ok, {bytes, partial_crc, _crc, fd}} =
+      {:ok, {bytes, partial_crc, _crc, temp, fd}} =
         LogSnapshot.accept_chunk(snapshot_chunk(meta), accept_state)
 
       # complete_accept/2 patches the header crc from the accept state. With a
       # deliberately wrong value recover/1 rejects the file as a checksum error.
-      corrupted = {bytes, partial_crc, 1, fd}
+      corrupted = {bytes, partial_crc, 1, temp, fd}
       current = state() |> Map.put(:snapshot_state, corrupted) |> Map.put(:snapshot_meta, meta)
 
       last = %Types.InstallSnapshotRpc{

@@ -108,7 +108,9 @@ defmodule RaftEx.Infra.Persistence.LogTest do
 
       assert map_size(updated.entries) == 1
       assert updated.current_snapshot == {2, 2}
-      assert updated.next_index == 3
+      assert updated.next_index == 4
+      assert updated.last_term == 2
+      assert updated.last_written_index_term == {3, 2}
       assert effects == []
       assert Log.recover_snapshot(updated) == nil
       assert Log.snapshot_index_term(updated) == {2, 2}
